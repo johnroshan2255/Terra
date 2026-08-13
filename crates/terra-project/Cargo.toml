@@ -1,0 +1,18 @@
+[package]
+name = "terra-project"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+terra-core.workspace = true
+
+serde.workspace = true
+ron.workspace = true
+directories.workspace = true
+memmap2.workspace = true
+zstd.workspace = true
+image.workspace = true
+thiserror.workspace = true
+log.workspace = true

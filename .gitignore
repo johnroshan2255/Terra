@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+
+# Generated tiles are always rebuildable from source/ + params.
+# Never commit these; they are large and machine-specific.
+**/cache/
+
+# Local test worlds
+/worlds/*
+!/worlds/.gitkeep
+
+.DS_Store

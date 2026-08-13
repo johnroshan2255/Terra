@@ -1,0 +1,6 @@
+edition = "2024"
+max_width = 100
+# Keep short struct literals and match arms on one line. Without this, rustfmt
+# breaks `Self { res, data }` across four lines and the data-heavy modules
+# triple in length for no gain.
+use_small_heuristics = "Max"

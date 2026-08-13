@@ -1,0 +1,24 @@
+[package]
+name = "terra-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "terra-runtime"
+path = "src/main.rs"
+
+[dependencies]
+terra-core.workspace = true
+terra-project.workspace = true
+terra-render.workspace = true
+terra-assets.workspace = true
+
+wgpu.workspace = true
+winit.workspace = true
+glam.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+pollster.workspace = true

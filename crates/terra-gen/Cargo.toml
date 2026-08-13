@@ -1,0 +1,19 @@
+[package]
+name = "terra-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+terra-core.workspace = true
+terra-project.workspace = true
+
+wgpu.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+log.workspace = true
+pollster.workspace = true
+rayon.workspace = true

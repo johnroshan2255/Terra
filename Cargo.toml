@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# --- internal ---
+terra-core    = { path = "crates/terra-core" }
+terra-project = { path = "crates/terra-project" }
+terra-gen     = { path = "crates/terra-gen" }
+terra-render  = { path = "crates/terra-render" }
+terra-assets  = { path = "crates/terra-assets" }
+terra-physics = { path = "crates/terra-physics" }
+
+# --- gpu / windowing ---
+wgpu       = "30.0"
+winit      = "0.30.13"
+egui       = "0.36.1"
+egui-wgpu  = "0.36.1"
+egui-winit = "0.36.1"
+
+# --- math / plain data ---
+glam     = { version = "0.33", features = ["serde", "bytemuck"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+half     = { version = "2.7", features = ["bytemuck"] }
+
+# --- serialization / io ---
+serde       = { version = "1.0", features = ["derive"] }
+ron         = "0.12"
+directories = "6.0"
+memmap2     = "0.9"
+zstd        = "0.13"
+image       = { version = "0.25", default-features = false, features = ["png"] }
+rfd         = "0.17"
+uuid        = { version = "1.24", features = ["v4", "serde"] }
+
+# --- physics ---
+# Rapier 0.35 / parry 0.30 are glam-based, so they share our vector type
+# directly -- no nalgebra, and no conversion layer at the boundary.
+rapier3d = "0.35"
+
+# --- misc ---
+anyhow     = "1.0"
+thiserror  = "2.0"
+log        = "0.4"
+env_logger = "0.11"
+pollster   = "1.0"
+rayon      = "1.12"
+
+# Our own code stays at opt-level 1 for fast rebuilds, but dependencies are
+# fully optimized -- a debug-build wgpu/image is unusably slow for this workload.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

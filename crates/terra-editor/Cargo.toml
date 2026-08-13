@@ -1,0 +1,30 @@
+[package]
+name = "terra-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "terra-editor"
+path = "src/main.rs"
+
+[dependencies]
+terra-core.workspace = true
+terra-project.workspace = true
+terra-gen.workspace = true
+terra-render.workspace = true
+terra-assets.workspace = true
+terra-physics.workspace = true
+
+wgpu.workspace = true
+winit.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+glam.workspace = true
+rfd.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+pollster.workspace = true
