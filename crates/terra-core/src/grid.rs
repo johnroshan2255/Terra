@@ -7,6 +7,7 @@
 
 use crate::error::{CoreError, Result};
 use crate::units::HEIGHT_RANGE_M;
+use rayon::prelude::*;
 
 /// A square `u16` heightmap.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +93,7 @@ impl HeightGrid {
             return Err(CoreError::GridSize { expected, actual: meters.len() });
         }
         let data = meters
-            .iter()
+            .par_iter()
             .map(|m| {
                 let t = (m / HEIGHT_RANGE_M).clamp(0.0, 1.0);
                 (t * u16::MAX as f32).round() as u16
@@ -103,7 +104,9 @@ impl HeightGrid {
 
     /// Decode every texel to meters.
     pub fn to_meters(&self) -> Vec<f32> {
-        self.data.iter().map(|h| *h as f32 / u16::MAX as f32 * HEIGHT_RANGE_M).collect()
+        // A 4096^2 world is 16.7 M texels; this runs on every world load and
+        // save, and it is a pure per-element map with nothing to share.
+        self.data.par_iter().map(|h| *h as f32 / u16::MAX as f32 * HEIGHT_RANGE_M).collect()
     }
 
     /// Build from values already in `0..=1`, e.g. a flow or deposition mask.
@@ -113,14 +116,16 @@ impl HeightGrid {
         if values.len() != expected {
             return Err(CoreError::GridSize { expected, actual: values.len() });
         }
-        let data =
-            values.iter().map(|v| (v.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16).collect();
+        let data = values
+            .par_iter()
+            .map(|v| (v.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16)
+            .collect();
         Ok(Self { res, data })
     }
 
     /// Decode every texel to `0..=1`.
     pub fn to_unit(&self) -> Vec<f32> {
-        self.data.iter().map(|v| *v as f32 / u16::MAX as f32).collect()
+        self.data.par_iter().map(|v| *v as f32 / u16::MAX as f32).collect()
     }
 
     /// Lowest and highest texel, as raw values. Useful for the editor's

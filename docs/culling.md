@@ -6,6 +6,23 @@ Status at time of writing: **2 draw calls per frame**, ~524k triangles, 1.39 ms
 GPU. Nothing is instanced. There is nothing to cull yet — every technique below
 is staged behind the feature that creates the work it removes.
 
+**Update, with scatter landed:** Phase B's GPU instance culling is implemented
+(`scatter.rs`, `assets/shaders/render/scatter_cull.wgsl`). Measured on an M4 at
+1600x900 with four species covering a 4 km world, ~140k instances: 3.10 ms GPU,
+1.73 ms CPU. Phase A (CDLOD) is still the larger outstanding win and remains
+unbuilt.
+
+**Update, with grass landed:** Hi-Z occlusion is implemented (`hiz.rs`,
+`assets/shaders/render/hiz.wgsl`) and used by the grass placement pass. It
+carries one lesson worth recording. Applied literally -- cull anything behind
+the farthest surface in its footprint -- it culled about seventy per cent of
+the near blades and visibly thinned the field, because *a field of grass is not
+an occluder*. The depth buffer records only the frontmost blade, and at the
+coarse pyramid levels the test reads, the gaps between blades are gone: grass
+culls grass. The test now compares in metres and demands real slack, so a
+landform still culls what is behind it while blades no longer cull each other.
+Measured at 620 blades/m2, 34 m: 4.81 ms with, 5.18 ms without.
+
 Building culling before the geometry exists costs complexity and measures as
 zero. Each phase below lands *with* the system it serves.
 
@@ -43,14 +60,17 @@ Expected: this is what makes 8–16 km worlds viable at all.
 This is where the real win lives, because this is where the object count goes
 from 1 to 10⁵–10⁶.
 
-- **GPU instance culling.** A compute pass tests every instance against the
-  frustum and a distance threshold, compacts the survivors into an instance
+- **GPU instance culling.** *Done.* A compute pass tests every instance against
+  the frustum and a distance threshold, compacts the survivors into an instance
   buffer, and writes a draw count. One `draw_indexed_indirect` per prop type.
-  The CPU never sees an instance.
-- **Hi-Z occlusion culling.** Build a depth mip pyramid from last frame's depth,
-  test each instance's bounding sphere against the appropriate mip. In mountain
-  terrain a ridge hides an enormous amount, and this is the technique that
-  finds it.
+  The CPU never sees an instance. Per-species draw distance is exposed in the
+  foliage tool, because it is the dial that decides how much there is to cull.
+- **Hi-Z occlusion culling.** *Done, for grass.* A depth mip pyramid built from
+  last frame's depth, each level the minimum reversed-Z of the block below it --
+  the farthest surface drawn there. Each blade's bounding sphere tests against
+  the level whose texels cover its screen footprint. In mountain terrain a ridge
+  hides an enormous amount, and this is the technique that finds it. Scatter's
+  props do not use it yet; the same pyramid is already there for them.
 
 Both are compute + indirect draw, which wgpu supports on every backend.
 

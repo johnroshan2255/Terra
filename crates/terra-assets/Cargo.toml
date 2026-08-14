@@ -13,3 +13,7 @@ ron.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 log.workspace = true
+gltf.workspace = true
+rayon.workspace = true
+glam.workspace = true
+anyhow.workspace = true

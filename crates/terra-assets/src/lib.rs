@@ -8,3 +8,4 @@ pub mod db;
 pub mod mesh;
 
 pub use db::{AssetDb, AssetId};
+pub use mesh::{Builtin, MeshData};

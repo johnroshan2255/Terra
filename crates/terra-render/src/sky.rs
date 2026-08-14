@@ -15,7 +15,7 @@ pub struct Sky {
 }
 
 impl Sky {
-    pub fn new(ctx: &RenderContext) -> Self {
+    pub fn new(ctx: &RenderContext, lighting: &crate::lighting::Lighting) -> Self {
         let device = &ctx.device;
 
         let camera_ub = device.create_buffer(&wgpu::BufferDescriptor {
@@ -51,13 +51,19 @@ impl Sky {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../../assets/shaders/render/sky.wgsl").into(),
+                format!(
+                    "{}
+{}",
+                    include_str!("../../../assets/shaders/common/lighting.wgsl"),
+                    include_str!("../../../assets/shaders/render/sky.wgsl"),
+                )
+                .into(),
             ),
         });
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sky-layout"),
-            bind_group_layouts: &[Some(&bgl)],
+            bind_group_layouts: &[Some(&bgl), Some(&lighting.layout)],
             immediate_size: 0,
         });
 
@@ -74,7 +80,7 @@ impl Sky {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: ctx.config.format,
+                    format: crate::context::SCENE_FORMAT,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -106,9 +112,10 @@ impl Sky {
         queue.write_buffer(&self.camera_ub, 0, bytemuck::bytes_of(&cam.uniform(aspect)));
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, lighting: &crate::lighting::Lighting) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_bind_group(1, &lighting.bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
 }

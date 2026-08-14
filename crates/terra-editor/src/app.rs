@@ -5,22 +5,35 @@
 //! which controls the left rail draws -- nothing is torn down or rebuilt.
 
 use crate::theme;
-use crate::ui::{self, Action, CreateForm, EditorAction, EditorView, Pane, PerfView, Tool};
+use crate::ui::{
+    self, Action, CreateForm, EditorAction, EditorView, FoliageEntry, PaintMode, PaletteEntry,
+    Pane, PerfView, Tool,
+};
 use anyhow::Result;
 use glam::{Mat4, Quat};
 use glam::{Vec2, Vec3, Vec4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use terra_core::{BASE_ELEVATION_M, WorldSize};
-use terra_physics::{FIXED_DT, PhysicsWorld, Vehicle, VehicleInput, vehicle};
+use terra_physics::{
+    FIXED_DT, Obstacle, ObstacleShape, PhysicsWorld, Vehicle, VehicleInput, vehicle,
+};
 use terra_project::roads::{Road, RoadNetwork};
 use terra_project::{Library, Project, TerrainParams, WorldData};
 use terra_render::camera::Camera;
 use terra_render::context::RenderContext;
+use terra_render::grass::Grass;
+use terra_render::hiz::HiZ;
+use terra_render::lighting::{CASCADES, LightMode, Lighting, SkySettings};
+use terra_render::material::Materials;
 use terra_render::mesh::{Instance, MeshRenderer};
+use terra_render::post::Post;
+use terra_render::scatter::Scatter;
 use terra_render::sky::Sky;
 use terra_render::stats::{FrameStats, GpuTimer};
+use terra_render::taa::Taa;
 use terra_render::terrain::{SculptMode, Terrain, apply_brush};
+use terra_render::volumetrics::{FroxelGrids, Volumetrics};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -76,12 +89,20 @@ struct Input {
     down: bool,
     boost: bool,
     looking: bool,
+    /// Middle mouse held: dragging the view rather than aiming it.
+    panning: bool,
+    /// Left mouse held while the Camera tool is active.
+    orbiting: bool,
     sculpting: bool,
     /// One-shot: a left press that has not been consumed yet. Sculpting wants a
     /// held state, but placing a road point wants a single event.
     clicked: bool,
     cursor: (f32, f32),
+    /// Raw mouse movement this frame, consumed by whichever of look or pan is
+    /// active.
     look_delta: (f32, f32),
+    /// Wheel notches accumulated since the last frame.
+    scroll: f32,
 }
 
 impl Input {
@@ -97,6 +118,26 @@ impl Input {
 struct Gfx {
     ctx: RenderContext,
     sky: Sky,
+    /// Generated once and shared by the backdrop and every world opened this
+    /// session -- the textures are read-only, so there is nothing to duplicate.
+    materials: Materials,
+    /// Sun, sky and the shadow cascades. Shared by every pass.
+    lighting: Lighting,
+    /// Volumetric fog. Built before the scene, sampled by every shading pass.
+    fog: Volumetrics,
+    /// Temporal resolve, between the scene and the post chain.
+    taa: Taa,
+    /// God rays and the final resolve.
+    post: Post,
+    /// Depth pyramid built from the previous frame, for occlusion culling.
+    hiz: HiZ,
+    /// Dense grass, generated per frame around the camera.
+    grass: Grass,
+    /// Sampler the grass pass reads the splat map with.
+    splat_sampler: wgpu::Sampler,
+    /// Foliage species and their instance buffers. Shared like materials: the
+    /// meshes are read-only, the per-world painting is not.
+    scatter: Scatter,
     meshes: MeshRenderer,
     egui_renderer: egui_wgpu::Renderer,
     gpu_timer: Option<GpuTimer>,
@@ -166,6 +207,8 @@ struct Loading {
     flow: Vec<f32>,
     deposition: Vec<f32>,
     roads: RoadNetwork,
+    foliage: Option<Vec<u8>>,
+    props: terra_project::props::PropSet,
 }
 
 impl Loading {
@@ -185,6 +228,8 @@ impl Loading {
             flow: Vec::new(),
             deposition: Vec::new(),
             roads: RoadNetwork::default(),
+            foliage: None,
+            props: Default::default(),
         }
     }
 
@@ -224,6 +269,44 @@ pub struct App {
     brush_strength: f32,
     brush_hit: Option<Vec2>,
     tool: Tool,
+    /// Selected palette slot, and how a stroke is applied.
+    paint_layer: u32,
+    paint_mode: PaintMode,
+    /// Weight added per second of painting, so a stroke builds up over time
+    /// rather than snapping to full on the first frame.
+    paint_flow: f32,
+    /// Selected foliage species.
+    species: usize,
+    /// Whether the in-play graphics panel is showing.
+    graphics_open: bool,
+    /// Whether each docked side panel is expanded.
+    tools_open: bool,
+    inspector_open: bool,
+    /// Index into the prop list, when the Select tool has one picked.
+    selected_prop: Option<usize>,
+    /// True while a picked prop is being dragged.
+    dragging_prop: bool,
+    /// Deferred prop edits, applied after `update_editor` releases its borrows.
+    pending_prop_move: Option<Vec3>,
+    pending_prop_refresh: bool,
+    /// Whether a sculpt stroke was in progress last frame, so its end can be
+    /// detected and the foliage rebuilt once rather than per dab.
+    was_sculpting: bool,
+    /// This frame's sub-pixel camera offset, held so the resolve can use the
+    /// same value the scene was rendered with.
+    frame_jitter: glam::Vec2,
+    /// Where the streamed obstacle set was last built.
+    obstacle_origin: Vec3,
+    /// Brush stroke waiting to be applied to the scatter palette. Deferred
+    /// because painting needs `gfx` mutably while the editor update already
+    /// holds it shared.
+    pending_foliage: Option<(Vec2, f32)>,
+    /// Palette thumbnails, registered with egui on the first editor frame.
+    /// Held here rather than rebuilt per frame: uploading six textures every
+    /// frame would be a leak in all but name.
+    swatches: Vec<egui::TextureHandle>,
+    /// Species previews, registered alongside the material swatches.
+    species_swatches: Vec<egui::TextureHandle>,
     /// Road currently being drawn, as an index into the network.
     active_road: Option<usize>,
     /// Raw cursor trail for the stroke in progress, before smoothing and
@@ -280,7 +363,24 @@ impl App {
             brush_radius: 120.0,
             brush_strength: 1.5,
             brush_hit: None,
-            tool: Tool::Sculpt,
+            tool: Tool::Camera,
+            paint_layer: 0,
+            paint_mode: PaintMode::Brush,
+            paint_flow: 2.0,
+            species: 0,
+            graphics_open: false,
+            tools_open: true,
+            inspector_open: true,
+            selected_prop: None,
+            dragging_prop: false,
+            pending_prop_move: None,
+            pending_prop_refresh: false,
+            was_sculpting: false,
+            frame_jitter: glam::Vec2::ZERO,
+            obstacle_origin: Vec3::ZERO,
+            pending_foliage: None,
+            swatches: Vec::new(),
+            species_swatches: Vec::new(),
             active_road: None,
             stroke: Vec::new(),
             pending_stroke_finish: false,
@@ -329,6 +429,29 @@ impl App {
 
     fn finish_loading(&mut self, l: Loading) {
         let Some(terrain) = l.terrain else { return };
+        // A world opening replaces whatever the last one painted; species are
+        // shared, their painting is not.
+        if let Some(gfx) = self.gfx.as_mut() {
+            for s in &mut gfx.scatter.species {
+                s.clear_density();
+            }
+            if let Some(bytes) = l.foliage.as_deref() {
+                gfx.scatter.restore(bytes);
+            }
+            // Props resolve by species name; one whose model has since been
+            // removed is dropped rather than silently becoming something else.
+            gfx.scatter.props.clear();
+            for p in &l.props.props {
+                match gfx.scatter.species.iter().position(|s| s.name == p.species) {
+                    Some(species) => {
+                        gfx.scatter.place(species, Vec3::from(p.pos), p.scale, p.yaw);
+                    }
+                    None => log::warn!("placed object references missing species '{}'", p.species),
+                }
+            }
+            gfx.scatter.touch_props();
+        }
+        self.selected_prop = None;
         // Start above the flat base so a new world is in frame immediately.
         let camera =
             Camera { pos: Vec3::new(0.0, BASE_ELEVATION_M + 380.0, 900.0), ..Camera::default() };
@@ -341,7 +464,15 @@ impl App {
             flow: l.flow,
             deposition: l.deposition,
         });
+        // Grass reads the world's heightfield and splat map directly.
+        if let (Some(gfx), Some(w)) = (self.gfx.as_mut(), self.world.as_ref()) {
+            let (device, sampler) = (&gfx.ctx.device, &gfx.splat_sampler);
+            gfx.grass.attach(device, &w.terrain, sampler);
+        }
         self.unsaved = false;
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.taa.invalidate();
+        }
         self.screen = Screen::Editor;
     }
 
@@ -416,6 +547,10 @@ impl App {
         // Roads survive a regenerate -- that is the whole point of keeping them
         // as splines over a base layer.
         self.rebuild_roads();
+        // So does foliage, but only if it is told the ground moved. Scatter is
+        // derived, so it regenerates at the new heights; props hold their
+        // position as data and have to be put back on the surface.
+        self.invalidate_foliage();
 
         // The clock skips by however long generation took; do not let that
         // land in the frame-time history as a stutter.
@@ -444,6 +579,15 @@ impl App {
         // Drop it in front of the current camera, above the ground.
         let eye = world.camera.pos;
         let ground = world.terrain.height_at(eye.x, eye.z);
+        // Obstacles around the spawn. Streamed, per docs/physics.md -- a
+        // collider per scatter instance is not viable, and nothing beyond a few
+        // hundred metres can be hit before the set is rebuilt.
+        if let Some(gfx) = self.gfx.as_ref() {
+            let solids = gfx.scatter.obstacles_near(&world.terrain, eye, OBSTACLE_RADIUS_M);
+            physics.set_obstacles(&to_obstacles(&solids));
+            log::info!("play: {} obstacle colliders", solids.len());
+        }
+
         let car = Vehicle::spawn(&mut physics, [eye.x, ground + 3.0, eye.z]);
 
         let (t, r) = car.chassis_pose(&physics);
@@ -453,6 +597,7 @@ impl App {
         };
         let wheels = wheel_poses(&car, pose.rotation);
 
+        self.obstacle_origin = eye;
         self.play = Some(Play {
             world: physics,
             car,
@@ -468,6 +613,28 @@ impl App {
 
     fn stop_play(&mut self) {
         self.play = None;
+    }
+
+    /// Rebuild the obstacle set when the car has left the one it was given.
+    ///
+    /// Half the radius is the trigger, so there is always a margin of built
+    /// colliders ahead of the car rather than a boundary it can cross before
+    /// the rebuild lands.
+    fn stream_obstacles(&mut self) {
+        let Some(play) = self.play.as_ref() else { return };
+        let pos = play.curr.translation;
+        if pos.distance(self.obstacle_origin) < OBSTACLE_RADIUS_M * 0.5 {
+            return;
+        }
+        self.obstacle_origin = pos;
+        let (Some(gfx), Some(world)) = (self.gfx.as_ref(), self.world.as_ref()) else {
+            return;
+        };
+        let solids = gfx.scatter.obstacles_near(&world.terrain, pos, OBSTACLE_RADIUS_M);
+        let obstacles = to_obstacles(&solids);
+        if let Some(play) = self.play.as_mut() {
+            play.world.set_obstacles(&obstacles);
+        }
     }
 
     /// Advance the simulation at a fixed rate, whatever the frame rate is.
@@ -501,6 +668,9 @@ impl App {
             play.accumulator -= FIXED_DT;
         }
 
+        self.stream_obstacles();
+        let Some(play) = self.play.as_mut() else { return };
+
         // Chase camera follows the interpolated pose, smoothed so it lags the
         // car slightly rather than being welded to it.
         let alpha = play.accumulator / FIXED_DT;
@@ -513,6 +683,18 @@ impl App {
         let to_car = (pose.translation + Vec3::Y * 1.0) - play.camera.pos;
         play.camera.yaw = to_car.z.atan2(to_car.x);
         play.camera.pitch = (to_car.y / to_car.length().max(0.01)).clamp(-1.0, 1.0).asin();
+    }
+
+    /// Tell the foliage the terrain moved.
+    ///
+    /// `docs/physics.md` makes the same point about colliders: rebuild on
+    /// stroke end, not per dab. A held brush would otherwise regenerate every
+    /// species seventy-five times a second.
+    fn invalidate_foliage(&mut self) {
+        let Some(world) = self.world.as_ref() else { return };
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        gfx.scatter.mark_all_dirty();
+        gfx.scatter.reground_props(&world.terrain);
     }
 
     fn rebuild_roads(&mut self) {
@@ -540,6 +722,60 @@ impl App {
             flow: w.flow.clone(),
             deposition: w.deposition.clone(),
         };
+        // Painting is authored work and is saved even when untouched-and-empty
+        // is the common case, because the file's absence is what means "never
+        // painted" on the way back in.
+        let splat_path = w.project.paths.splat();
+        if w.terrain.is_painted() {
+            if let Some(parent) = splat_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&splat_path, w.terrain.splat()) {
+                log::error!("could not save material painting: {e}");
+                return;
+            }
+        } else {
+            let _ = std::fs::remove_file(&splat_path);
+        }
+
+        let foliage_path = w.project.paths.foliage();
+        if let Some(gfx) = self.gfx.as_ref() {
+            if gfx.scatter.is_painted() {
+                if let Some(parent) = foliage_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(&foliage_path, gfx.scatter.save()) {
+                    log::error!("could not save foliage: {e}");
+                    return;
+                }
+            } else {
+                let _ = std::fs::remove_file(&foliage_path);
+            }
+        }
+
+        if let Some(gfx) = self.gfx.as_ref() {
+            let set = terra_project::props::PropSet {
+                props: gfx
+                    .scatter
+                    .props
+                    .iter()
+                    .filter_map(|p| {
+                        let sp = gfx.scatter.species.get(p.species)?;
+                        Some(terra_project::props::Prop {
+                            species: sp.name.clone(),
+                            pos: p.pos.to_array(),
+                            yaw: p.yaw,
+                            scale: p.scale,
+                        })
+                    })
+                    .collect(),
+            };
+            if let Err(e) = set.save(&w.project.paths) {
+                log::error!("could not save placed objects: {e}");
+                return;
+            }
+        }
+
         if let Err(e) = w.roads.save(&w.project.paths) {
             log::error!("could not save roads: {e}");
             return;
@@ -564,6 +800,9 @@ impl App {
             self.save_world();
         }
         self.world = None;
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.grass.detach();
+        }
         self.screen = Screen::Menu(Pane::Worlds);
     }
 
@@ -579,6 +818,53 @@ impl App {
                     self.pending_stroke_finish = false;
                     self.finish_stroke();
                 }
+                // Sculpt stroke ended: the ground under the foliage has moved.
+                let sculpting = self.input.sculpting && self.tool == Tool::Sculpt;
+                if self.was_sculpting && !sculpting {
+                    self.invalidate_foliage();
+                }
+                self.was_sculpting = sculpting;
+                if let Some((centre, flow)) = self.pending_foliage.take() {
+                    let (index, erase) = (self.species, self.paint_mode == PaintMode::Erase);
+                    if let (Some(gfx), Some(w)) = (self.gfx.as_mut(), self.world.as_ref()) {
+                        gfx.scatter.paint(
+                            index,
+                            &w.terrain,
+                            centre,
+                            self.brush_radius,
+                            flow,
+                            erase,
+                        );
+                    }
+                }
+                if let (Some(pos), Some(i), Some(gfx)) =
+                    (self.pending_prop_move.take(), self.selected_prop, self.gfx.as_mut())
+                {
+                    if let Some(p) = gfx.scatter.props.get_mut(i) {
+                        p.pos = pos;
+                        gfx.scatter.touch_props();
+                        self.unsaved = true;
+                    }
+                }
+                if self.pending_prop_refresh {
+                    self.pending_prop_refresh = false;
+                    if let Some(gfx) = self.gfx.as_mut() {
+                        gfx.scatter.touch_props();
+                    }
+                }
+                let selected = self.selected_prop;
+                if let Some(gfx) = self.gfx.as_mut() {
+                    let device = &gfx.ctx.device;
+                    gfx.scatter.refresh_props(device, selected);
+                }
+
+                // Regenerating here rather than at the point of edit means a
+                // held brush or a dragged slider costs one rebuild a frame at
+                // most, not one per event.
+                if let (Some(gfx), Some(w)) = (self.gfx.as_mut(), self.world.as_ref()) {
+                    let (device, scatter) = (&gfx.ctx.device, &mut gfx.scatter);
+                    scatter.refresh(device, &w.terrain);
+                }
             }
             Screen::Loading => {
                 self.update_backdrop();
@@ -587,8 +873,42 @@ impl App {
             Screen::Menu(_) => self.update_backdrop(),
         }
 
+        // Sub-pixel offset for this frame, applied to every camera the scene
+        // is drawn from so the resolve can undo exactly what was added.
+        self.frame_jitter = self
+            .gfx
+            .as_ref()
+            .map(|g| g.taa.jitter(g.ctx.config.width, g.ctx.config.height))
+            .unwrap_or_default();
+        let j = self.frame_jitter;
+        self.backdrop_cam.jitter = j;
+        if let Some(w) = self.world.as_mut() {
+            w.camera.jitter = j;
+        }
+        if let Some(p) = self.play.as_mut() {
+            p.camera.jitter = j;
+        }
+
         // The sky follows whichever camera is active this frame.
         let aspect = self.gfx.as_ref().map(|g| g.ctx.aspect()).unwrap_or(1.0);
+        // Driving always shows the world's own sun. The editor shows it only
+        // when asked, and the menu never does -- the backdrop is a fixed
+        // portrait, not a scene anyone is authoring.
+        let mode = match (self.screen, self.play.is_some()) {
+            (Screen::Editor, true) => LightMode::Scene,
+            (Screen::Editor, false) => {
+                let preview = self.gfx.as_ref().is_some_and(|g| g.lighting.settings.editor_preview);
+                if preview { LightMode::Scene } else { LightMode::Fixed }
+            }
+            _ => LightMode::Fixed,
+        };
+        if let Some(gfx) = self.gfx.as_mut() {
+            gfx.lighting.update(dt, mode);
+            // Resolution changes reallocate the map, so this has to happen
+            // outside the frame that samples it.
+            let grid = gfx.fog.scattered_view();
+            gfx.lighting.apply_quality(&gfx.ctx.device, grid);
+        }
         let cam = match (self.screen, self.play.as_ref(), self.world.as_ref()) {
             (Screen::Editor, Some(p), _) => p.camera.clone(),
             (Screen::Editor, None, Some(w)) => w.camera.clone(),
@@ -597,6 +917,20 @@ impl App {
         if let Some(gfx) = self.gfx.as_ref() {
             gfx.sky.upload_camera(&gfx.ctx.queue, &cam, aspect);
             gfx.meshes.upload_camera(&gfx.ctx.queue, &cam, aspect);
+            // Cascades are fitted to the camera actually being rendered from.
+            let f = &gfx.fog.settings;
+            gfx.lighting.upload(
+                &gfx.ctx.queue,
+                &cam,
+                aspect,
+                [
+                    gfx.fog.near(),
+                    f.distance,
+                    if f.enabled { 1.0 } else { 0.0 },
+                    terra_render::volumetrics::FROXELS[2] as f32,
+                ],
+                [gfx.ctx.config.width as f32, gfx.ctx.config.height as f32],
+            );
         }
         // While driving, the terrain must be drawn from the chase camera too.
         if let (Some(p), Some(w), Some(gfx)) =
@@ -616,7 +950,12 @@ impl App {
             l.elapsed += dt;
             match l.stage {
                 0 => {
-                    l.terrain = Some(Terrain::new(&gfx.ctx, l.project.size()));
+                    l.terrain = Some(Terrain::new(
+                        &gfx.ctx,
+                        l.project.size(),
+                        &gfx.materials,
+                        &gfx.lighting,
+                    ));
                     l.stage = 1;
                 }
                 1 => {
@@ -640,6 +979,11 @@ impl App {
                         );
                         t.set_heights(&gfx.ctx.queue, composed);
                         t.set_road_masks(&gfx.ctx.queue, &surface.mask, &surface.rut);
+                        if let Ok(splat) = std::fs::read(l.project.paths.splat()) {
+                            t.set_splat(&gfx.ctx.queue, splat);
+                        }
+                        l.foliage = std::fs::read(l.project.paths.foliage()).ok();
+                        l.props = terra_project::props::PropSet::load(&l.project.paths);
                     }
                     l.stage = 3;
                 }
@@ -657,7 +1001,11 @@ impl App {
     /// Slow cinematic orbit around the menu landscape.
     fn update_backdrop(&mut self) {
         const RADIUS: f32 = 1180.0;
-        let t = self.time * 0.045;
+        // TERRA_FREEZE pins the orbit so GPU timings are comparable between
+        // runs. Without it the camera sweeps a ~140 s cycle and each sample
+        // sees a different amount of terrain, which reads as a 20% swing in
+        // frame cost that has nothing to do with the change being measured.
+        let t = if std::env::var_os("TERRA_FREEZE").is_some() { 0.7 } else { self.time * 0.045 };
         self.backdrop_cam.pos = Vec3::new(t.cos() * RADIUS, 430.0, t.sin() * RADIUS);
         // Face the middle of the map: the inward direction is the orbit angle
         // turned by half a turn.
@@ -710,11 +1058,42 @@ impl App {
         world.camera.speed = self.settings.camera_speed;
         world.camera.fov_y = self.settings.fov_deg.to_radians();
 
-        if self.input.looking {
-            let (dx, dy) = self.input.look_delta;
+        // How far the ground is, used to scale both pan and zoom. Working from
+        // the surface under the camera rather than a fixed number is what makes
+        // the controls feel the same skimming a valley floor and 3 km up.
+        let ground = world.terrain.height_at(world.camera.pos.x, world.camera.pos.z);
+        let dist = (world.camera.pos.y - ground).abs().clamp(MIN_VIEW_DIST_M, 6000.0);
+
+        let (dx, dy) = self.input.look_delta;
+        if self.input.orbiting && self.tool == Tool::Camera {
+            // Orbit about what is actually in front of the camera. Falling back
+            // to a point at the current view distance keeps the control usable
+            // when aimed at the sky, where there is nothing to circle.
+            let f = world.camera.forward();
+            let pivot =
+                world.terrain.raycast(world.camera.pos, f).unwrap_or(world.camera.pos + f * dist);
+            world.camera.orbit(pivot, dx * 0.006, dy * 0.006);
+        } else if self.input.looking {
             world.camera.rotate(dx * 0.0025, dy * 0.0025);
+        } else if self.input.panning {
+            let scale = world.camera.pixel_scale(dist, gfx.ctx.config.height as f32);
+            world.camera.pan(dx, dy, scale);
         }
         self.input.look_delta = (0.0, 0.0);
+
+        // Wheel zoom. Each notch covers a fixed fraction of the distance to the
+        // ground, so approaching a ridge slows down instead of overshooting
+        // through it -- and backing off speeds up.
+        let scroll = std::mem::take(&mut self.input.scroll);
+        if scroll != 0.0 && !wants_ptr {
+            let step = (dist * ZOOM_PER_NOTCH * scroll).clamp(-dist * 4.0, dist * 0.9);
+            world.camera.dolly(step);
+            // Never let a zoom bury the camera in the terrain; there is no way
+            // back out of it except flying blind.
+            let floor =
+                world.terrain.height_at(world.camera.pos.x, world.camera.pos.z) + MIN_VIEW_DIST_M;
+            world.camera.pos.y = world.camera.pos.y.max(floor);
+        }
 
         if !wants_kb {
             world.camera.translate(self.input.axis(), dt, self.input.boost);
@@ -722,7 +1101,7 @@ impl App {
 
         self.brush_hit = None;
         let mut finish_stroke = false;
-        if !wants_ptr && !self.input.looking {
+        if !wants_ptr && !self.input.looking && !self.input.panning && self.tool.edits() {
             let (o, d) = {
                 let (w, h) = (gfx.ctx.config.width as f32, gfx.ctx.config.height as f32);
                 let ndc_x = (self.input.cursor.0 / w) * 2.0 - 1.0;
@@ -733,9 +1112,28 @@ impl App {
                 let near = p.truncate() / p.w;
                 (world.camera.pos, (near - world.camera.pos).normalize_or_zero())
             };
+            if self.tool == Tool::Select {
+                if self.input.clicked {
+                    // A fresh press picks; a press that misses clears, which is
+                    // what makes clicking empty ground feel like a deselect
+                    // rather than a dead click.
+                    self.selected_prop = gfx.scatter.pick(o, d);
+                    self.dragging_prop = self.selected_prop.is_some();
+                    self.pending_prop_refresh = true;
+                }
+                if !self.input.sculpting {
+                    self.dragging_prop = false;
+                }
+            }
+
             if let Some(hit) = world.terrain.raycast(o, d) {
                 let c = Vec2::new(hit.x, hit.z);
                 self.brush_hit = Some(c);
+                // Dragging keeps the object on the surface: an object that
+                // moves in a plane ends up floating over a valley.
+                if self.dragging_prop && self.input.sculpting && self.tool == Tool::Select {
+                    self.pending_prop_move = Some(Vec3::new(hit.x, hit.y, hit.z));
+                }
                 // Freehand: capture the cursor trail while the button is held.
                 // Sampled by distance rather than per frame, so the density of
                 // the stroke does not depend on how fast the mouse moved or
@@ -749,6 +1147,29 @@ impl App {
                     if far_enough {
                         self.stroke.push([c.x, c.y]);
                     }
+                }
+                if self.input.sculpting && self.tool == Tool::Foliage {
+                    let flow = (self.paint_flow * dt).clamp(0.0, 1.0);
+                    self.pending_foliage = Some((c, flow));
+                    self.unsaved = true;
+                }
+                if self.input.sculpting && self.tool == Tool::Paint {
+                    // Scaled by dt for the same reason sculpting is: a stroke
+                    // should deposit the same coverage whatever the frame rate.
+                    let flow = (self.paint_flow * dt).clamp(0.0, 1.0);
+                    match self.paint_mode {
+                        crate::ui::PaintMode::Brush => world.terrain.paint(
+                            &gfx.ctx.queue,
+                            c,
+                            self.brush_radius,
+                            flow,
+                            self.paint_layer,
+                        ),
+                        crate::ui::PaintMode::Erase => {
+                            world.terrain.erase(&gfx.ctx.queue, c, self.brush_radius, flow)
+                        }
+                    }
+                    self.unsaved = true;
                 }
                 if self.input.sculpting && self.tool == Tool::Sculpt {
                     // Scale by dt so a held stroke deposits the same material
@@ -815,6 +1236,83 @@ impl App {
                 let size =
                     self.world.as_ref().map(|w| w.project.size()).unwrap_or(WorldSize::Medium);
                 let brush_at = self.brush_hit.map(|c| (c.x, c.y));
+                self.ensure_swatches(ui.ctx());
+                self.ensure_species_swatches(ui.ctx());
+                let painted = self.world.as_ref().is_some_and(|w| w.terrain.is_painted());
+                let foliage: Vec<FoliageEntry> = self
+                    .gfx
+                    .as_ref()
+                    .map(|g| {
+                        g.scatter
+                            .species
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| FoliageEntry {
+                                name: s.name.clone(),
+                                instances: s.instance_count(),
+                                painted: s.is_painted(),
+                                texture: self.species_swatches.get(i).cloned(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let foliage_instances =
+                    self.gfx.as_ref().map(|g| g.scatter.total_instances()).unwrap_or(0);
+                self.species = self.species.min(foliage.len().saturating_sub(1));
+                let species_index = self.species;
+                let names: Vec<(String, &'static str)> = self
+                    .gfx
+                    .as_ref()
+                    .map(|g| {
+                        g.materials
+                            .layers
+                            .iter()
+                            .map(|l| (l.name.clone(), terra_render::material::role_label(l.role)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let palette: Vec<PaletteEntry<'_>> = names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, role))| PaletteEntry {
+                        name,
+                        role,
+                        texture: self.swatches.get(i),
+                    })
+                    .collect();
+
+                let prop_count = self.gfx.as_ref().map(|g| g.scatter.props.len()).unwrap_or(0);
+                // Edited on a copy and written back, so the panel never holds a
+                // borrow of  across the rest of the UI build.
+                let mut sky_settings =
+                    self.gfx.as_ref().map(|g| g.lighting.settings).unwrap_or_default();
+                let mut grass_settings =
+                    self.gfx.as_ref().map(|g| g.grass.settings).unwrap_or_default();
+                let mut fog_settings =
+                    self.gfx.as_ref().map(|g| g.fog.settings).unwrap_or_default();
+                // The selected object's editable fields, copied out and copied
+                // back after the UI runs -- the panel cannot hold a borrow into
+                // `gfx` while the species rules already do.
+                let mut selection_view = self.selected_prop.and_then(|i| {
+                    let g = self.gfx.as_ref()?;
+                    let p = g.scatter.props.get(i)?;
+                    let sp = g.scatter.species.get(p.species)?;
+                    Some(ui::SelectionView {
+                        species: sp.name.clone(),
+                        scale: p.scale,
+                        yaw: p.yaw,
+                        height: sp.height_m,
+                    })
+                });
+
+                // Taken last: this is the only mutable borrow of `gfx` here, so
+                // every shared read of it has to have finished first.
+                let species_rules = self
+                    .gfx
+                    .as_mut()
+                    .and_then(|g| g.scatter.species.get_mut(species_index))
+                    .map(|s| &mut s.rules);
+
                 // Everything borrowed from the open world in one place, so the
                 // params and the active road come from a single mutable borrow
                 // of disjoint fields rather than two overlapping ones.
@@ -842,6 +1340,22 @@ impl App {
                         height_res,
                         params,
                         tool: &mut self.tool,
+                        palette: &palette,
+                        selected_layer: &mut self.paint_layer,
+                        paint_mode: &mut self.paint_mode,
+                        paint_flow: &mut self.paint_flow,
+                        painted,
+                        foliage: &foliage,
+                        selected_species: &mut self.species,
+                        species_rules,
+                        foliage_instances,
+                        selection: selection_view.as_mut(),
+                        prop_count,
+                        tools_open: &mut self.tools_open,
+                        inspector_open: &mut self.inspector_open,
+                        sky: &mut sky_settings,
+                        grass: &mut grass_settings,
+                        fog: &mut fog_settings,
                         active_road,
                         road_count,
                         playing: self.play.is_some(),
@@ -852,6 +1366,27 @@ impl App {
                             .unwrap_or(0.0),
                     },
                 );
+                if let Some(g) = self.gfx.as_mut() {
+                    g.lighting.settings = sky_settings;
+                    g.grass.settings = grass_settings;
+                    g.fog.settings = fog_settings;
+                    g.taa.enabled = sky_settings.temporal_aa;
+                }
+
+                // Slider edits land on the copy; write them back.
+                if let (Some(view), Some(i), Some(g)) =
+                    (selection_view.as_ref(), self.selected_prop, self.gfx.as_mut())
+                {
+                    if let Some(p) = g.scatter.props.get_mut(i) {
+                        if p.scale != view.scale || p.yaw != view.yaw {
+                            p.scale = view.scale;
+                            p.yaw = view.yaw;
+                            g.scatter.touch_props();
+                            self.unsaved = true;
+                        }
+                    }
+                }
+
                 match act {
                     EditorAction::Save => self.save_world(),
                     EditorAction::Exit => self.exit_editor(),
@@ -888,6 +1423,71 @@ impl App {
                         self.rebuild_roads();
                     }
                     EditorAction::RebuildRoads => self.rebuild_roads(),
+                    EditorAction::FillMaterial => {
+                        let layer = self.paint_layer;
+                        if let (Some(w), Some(gfx)) = (self.world.as_mut(), self.gfx.as_ref()) {
+                            w.terrain.fill(&gfx.ctx.queue, layer);
+                            self.unsaved = true;
+                        }
+                    }
+                    EditorAction::FillFoliage => {
+                        let i = self.species;
+                        if let Some(g) = self.gfx.as_mut() {
+                            g.scatter.fill(i);
+                        }
+                        self.unsaved = true;
+                    }
+                    EditorAction::ClearFoliage => {
+                        let i = self.species;
+                        if let Some(g) = self.gfx.as_mut() {
+                            g.scatter.clear(i);
+                        }
+                        self.unsaved = true;
+                    }
+                    EditorAction::ReseedFoliage => {
+                        let i = self.species;
+                        if let Some(g) = self.gfx.as_mut() {
+                            if let Some(s) = g.scatter.species.get_mut(i) {
+                                s.rules.seed = s.rules.seed.wrapping_add(1);
+                                s.touch();
+                            }
+                        }
+                        self.unsaved = true;
+                    }
+                    EditorAction::PlaceProp => {
+                        // Placed where the brush ray hits, which is where the
+                        // cursor already shows a ring -- no separate aim.
+                        if let (Some(hit), Some(w)) = (self.brush_hit, self.world.as_ref()) {
+                            let y = w.terrain.height_at(hit.x, hit.y);
+                            let species = self.species;
+                            if let Some(g) = self.gfx.as_mut() {
+                                let yaw = (ui::fresh_seed() % 628) as f32 / 100.0;
+                                let i =
+                                    g.scatter.place(species, Vec3::new(hit.x, y, hit.y), 1.0, yaw);
+                                self.selected_prop = Some(i);
+                            }
+                            self.unsaved = true;
+                        }
+                    }
+                    EditorAction::DeleteProp => {
+                        if let (Some(i), Some(g)) = (self.selected_prop, self.gfx.as_mut()) {
+                            g.scatter.remove_prop(i);
+                        }
+                        self.selected_prop = None;
+                        self.unsaved = true;
+                    }
+                    EditorAction::Deselect => {
+                        self.selected_prop = None;
+                        if let Some(g) = self.gfx.as_mut() {
+                            g.scatter.touch_props();
+                        }
+                    }
+                    EditorAction::ClearPaint => {
+                        if let (Some(w), Some(gfx)) = (self.world.as_mut(), self.gfx.as_ref()) {
+                            w.terrain.clear_paint(&gfx.ctx.queue);
+                            self.unsaved = true;
+                        }
+                    }
                     EditorAction::Play => self.start_play(),
                     EditorAction::Stop => self.stop_play(),
                     EditorAction::None => {}
@@ -941,6 +1541,22 @@ impl App {
             }
         }
 
+        // Graphics panel while driving.
+        if self.screen == Screen::Editor && self.play.is_some() {
+            let mut sky = self.gfx.as_ref().map(|g| g.lighting.settings).unwrap_or_default();
+            let mut grass = self.gfx.as_ref().map(|g| g.grass.settings).unwrap_or_default();
+            let mut fog = self.gfx.as_ref().map(|g| g.fog.settings).unwrap_or_default();
+            let mut open = self.graphics_open;
+            ui::play_overlay(ui, &mut sky, &mut grass, &mut fog, &mut open);
+            self.graphics_open = open;
+            if let Some(g) = self.gfx.as_mut() {
+                g.lighting.settings = sky;
+                g.grass.settings = grass;
+                g.fog.settings = fog;
+                g.taa.enabled = sky.temporal_aa;
+            }
+        }
+
         if self.settings.perf_overlay {
             ui::perf_overlay(
                 ui,
@@ -953,11 +1569,57 @@ impl App {
                         .unwrap_or(false),
                     graph: self.settings.perf_graph,
                     // Clear the editor's inspector rather than floating on it.
-                    right_inset: if self.screen == Screen::Editor { 268.0 } else { 0.0 },
+                    // Asked for, not assumed: the inspector is sized to the
+                    // window, so a constant here parks the HUD in the wrong
+                    // place on every window that is not 1600 wide.
+                    right_inset: match (self.screen, self.inspector_open) {
+                        (Screen::Editor, true) => theme::editor_panels(&self.egui_ctx).1,
+                        (Screen::Editor, false) => ui::RAIL_COLLAPSED_W,
+                        _ => 0.0,
+                    },
                 },
             );
         }
         quit
+    }
+
+    /// Register palette thumbnails with egui once, on first use.
+    fn ensure_swatches(&mut self, ctx: &egui::Context) {
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        if self.swatches.len() == gfx.materials.layers.len() {
+            return;
+        }
+        let size = terra_render::material::THUMB as usize;
+        self.swatches = gfx
+            .materials
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, layer)| {
+                let image =
+                    egui::ColorImage::from_rgba_unmultiplied([size, size], &layer.thumbnail);
+                ctx.load_texture(format!("swatch-{i}"), image, egui::TextureOptions::LINEAR)
+            })
+            .collect();
+    }
+
+    /// Register species previews with egui once.
+    fn ensure_species_swatches(&mut self, ctx: &egui::Context) {
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        if self.species_swatches.len() == gfx.scatter.species.len() {
+            return;
+        }
+        let size = terra_render::scatter::THUMB as usize;
+        self.species_swatches = gfx
+            .scatter
+            .species
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let image = egui::ColorImage::from_rgba_unmultiplied([size, size], &s.thumbnail);
+                ctx.load_texture(format!("species-{i}"), image, egui::TextureOptions::LINEAR)
+            })
+            .collect();
     }
 
     fn render(&mut self) -> Result<Frame> {
@@ -1010,6 +1672,83 @@ impl App {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
+        // The depth buffer still holds the previous frame at this point, which
+        // is exactly what the pyramid is built from -- reading this frame's
+        // instead would mean a read-back and a stall. One frame of staleness is
+        // handled by a margin in the test rather than by trying to be exact.
+        if self.screen == Screen::Editor && self.world.is_some() {
+            gfx.hiz.build(&mut encoder);
+        }
+
+        // Culling runs before the render pass that consumes its output.
+        if let (Screen::Editor, Some(w)) = (self.screen, self.world.as_ref()) {
+            let cam = match self.play.as_ref() {
+                Some(p) => &p.camera,
+                None => &w.camera,
+            };
+            gfx.scatter.cull(&mut encoder, &gfx.ctx.queue, cam, gfx.ctx.aspect());
+        }
+
+        // Fog needs the shadow cascades, so it is built after them and before
+        // anything that samples the grid.
+
+        // Grass is placed before the shadow pass so the near cascade casts from
+        // the same clumps the scene draws.
+        if let (Screen::Editor, Some(w)) = (self.screen, self.world.as_ref()) {
+            let cam = match self.play.as_ref() {
+                Some(p) => p.camera.clone(),
+                None => w.camera.clone(),
+            };
+            let aspect = gfx.ctx.aspect();
+            let time = self.time;
+            let vh = gfx.ctx.config.height as f32;
+            let (queue, terrain, hiz) = (&gfx.ctx.queue, &w.terrain, &gfx.hiz);
+            gfx.grass.generate(&mut encoder, queue, &cam, aspect, vh, terrain, hiz, time);
+        }
+
+        // Shadow cascades, before anything samples them.
+        if gfx.lighting.settings.shadow_quality.enabled() && self.screen == Screen::Editor {
+            for cascade in 0..CASCADES {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("shadow"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &gfx.lighting.cascade_views[cascade],
+                        // Reversed-Z here too, so the compare matches the
+                        // scene's and the sampler's `Greater`.
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                if let Some(w) = self.world.as_ref() {
+                    w.terrain.draw_shadow(&mut pass, &gfx.lighting, cascade);
+                }
+                gfx.scatter.draw_shadow(&mut pass, &gfx.meshes, &gfx.lighting, cascade);
+                gfx.grass.draw_shadow(&mut pass, &gfx.lighting, cascade);
+                gfx.scatter.draw_props_shadow(&mut pass, &gfx.meshes, &gfx.lighting, cascade);
+            }
+        }
+
+        // Volumetrics, after the cascades it samples and before the scene that
+        // samples it.
+        {
+            let cam = match (self.screen, self.play.as_ref(), self.world.as_ref()) {
+                (Screen::Editor, Some(p), _) => p.camera.clone(),
+                (Screen::Editor, None, Some(w)) => w.camera.clone(),
+                _ => self.backdrop_cam.clone(),
+            };
+            let aspect = gfx.ctx.aspect();
+            let time = self.time;
+            let (queue, lighting) = (&gfx.ctx.queue, &gfx.lighting);
+            gfx.fog.build(&mut encoder, queue, lighting, &cam, aspect, time);
+        }
+
         let scene_ts = gfx.gpu_timer.as_ref().and_then(|t| t.scene_writes());
         let ui_ts = gfx.gpu_timer.as_ref().and_then(|t| t.ui_writes());
 
@@ -1017,16 +1756,13 @@ impl App {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &gfx.ctx.scene_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.055,
-                            g: 0.062,
-                            b: 0.085,
-                            a: 1.0,
-                        }),
+                        // Alpha 1 means "sky": anything the sky pass does not
+                        // cover is still unoccluded as far as the rays care.
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1043,12 +1779,21 @@ impl App {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            gfx.sky.draw(&mut pass);
+            gfx.sky.draw(&mut pass, &gfx.lighting);
             match (self.screen, self.world.as_ref(), self.backdrop.as_ref()) {
-                (Screen::Editor, Some(w), _) => w.terrain.draw(&mut pass),
-                (_, _, Some(b)) => b.draw(&mut pass),
+                (Screen::Editor, Some(w), _) => w.terrain.draw(&mut pass, &gfx.lighting),
+                (_, _, Some(b)) => b.draw(&mut pass, &gfx.lighting),
                 _ => {}
             }
+            // Foliage, after the terrain so the depth buffer rejects most of it.
+            if self.screen == Screen::Editor {
+                if let Some(w) = self.world.as_ref() {
+                    gfx.scatter.draw(&mut pass, &gfx.meshes, &gfx.lighting);
+                    gfx.scatter.draw_props(&mut pass, &gfx.meshes, &gfx.lighting);
+                    gfx.grass.draw(&mut pass, w.terrain.camera_bind_group(), &gfx.lighting);
+                }
+            }
+
             if let Some(p) = self.play.as_ref() {
                 // Chassis first, then the four wheels, in one instance buffer.
                 let alpha = p.accumulator / FIXED_DT;
@@ -1065,9 +1810,55 @@ impl App {
                     ));
                 }
                 let n = gfx.meshes.upload_instances(&gfx.ctx.queue, &instances);
-                gfx.meshes.draw(&mut pass, &gfx.meshes.chassis, 0, 1.min(n));
-                gfx.meshes.draw(&mut pass, &gfx.meshes.wheel, 1, n.saturating_sub(1));
+                gfx.meshes.draw(&mut pass, &gfx.lighting, &gfx.meshes.chassis, 0, 1.min(n));
+                gfx.meshes.draw(
+                    &mut pass,
+                    &gfx.lighting,
+                    &gfx.meshes.wheel,
+                    1,
+                    n.saturating_sub(1),
+                );
             }
+        }
+
+        // --- temporal resolve ---
+        {
+            let cam = match (self.screen, self.play.as_ref(), self.world.as_ref()) {
+                (Screen::Editor, Some(p), _) => p.camera.clone(),
+                (Screen::Editor, None, Some(w)) => w.camera.clone(),
+                _ => self.backdrop_cam.clone(),
+            };
+            let aspect = gfx.ctx.aspect();
+            let vp = cam.projection(aspect) * cam.look_at();
+            let jitter = self.frame_jitter;
+            let queue = &gfx.ctx.queue;
+            gfx.taa.resolve(&mut encoder, queue, vp, jitter);
+        }
+
+        // --- post: god rays, exposure, encode ---
+        {
+            let post_cam = match (self.screen, self.play.as_ref(), self.world.as_ref()) {
+                (Screen::Editor, Some(p), _) => p.camera.clone(),
+                (Screen::Editor, None, Some(w)) => w.camera.clone(),
+                _ => self.backdrop_cam.clone(),
+            };
+            let sky = gfx.lighting.settings;
+            let sun = gfx.lighting.sun;
+            let active = gfx.post.prepare(
+                &gfx.ctx.queue,
+                &post_cam,
+                gfx.ctx.aspect(),
+                sun.direction,
+                sun.daylight,
+                if sun.night { 0.0 } else { sky.god_rays },
+                sky.exposure,
+                gfx.fog.settings.enabled,
+            );
+            let source = gfx.taa.output_index();
+            if active {
+                gfx.post.render_rays(&mut encoder, source);
+            }
+            gfx.post.resolve(&mut encoder, &view, source);
         }
 
         // --- egui paint ---
@@ -1117,7 +1908,6 @@ impl App {
             t.resolve(&mut encoder);
         }
         gfx.ctx.queue.submit(cmds.into_iter().chain(std::iter::once(encoder.finish())));
-
         self.cpu_ms = self.update_ms + cpu_start.elapsed().as_secs_f32() * 1000.0;
 
         let Some(gfx) = self.gfx.as_mut() else { return Ok(Frame::Presented) };
@@ -1160,7 +1950,12 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("Terra")
-            .with_inner_size(winit::dpi::LogicalSize::new(1600.0, 900.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(1600.0, 900.0))
+            // Do not take focus on open. A tool that steals the foreground
+            // every time it is rebuilt makes it unusable to work alongside --
+            // and the window still draws, so nothing is lost by opening
+            // behind whatever is in front.
+            .with_active(false);
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -1195,17 +1990,71 @@ impl ApplicationHandler for App {
             egui_wgpu::RendererOptions::default(),
         );
 
-        let sky = Sky::new(&ctx);
-        let meshes = MeshRenderer::new(&ctx, vehicle::CHASSIS_HALF, vehicle::WHEEL_RADIUS);
+        // Textures first: the light state names the fog grid, and the fog
+        // pipelines name the light state.
+        let grids = FroxelGrids::new(&ctx.device);
+        let lighting = Lighting::new(&ctx.device, SkySettings::default(), grids.scattered());
+        let fog = Volumetrics::new(&ctx.device, &lighting, grids);
+        let sky = Sky::new(&ctx, &lighting);
+        let meshes =
+            MeshRenderer::new(&ctx, vehicle::CHASSIS_HALF, vehicle::WHEEL_RADIUS, &lighting);
         let gpu_timer = GpuTimer::new(&ctx.device, &ctx.queue, ctx.supports_timestamps());
-        let gfx = Gfx { ctx, sky, meshes, egui_renderer, gpu_timer };
-
-        // Menu backdrop: built once, reused for the whole session.
-        let mut backdrop = Terrain::new(&gfx.ctx, BACKDROP_SIZE);
+        let t_mat = Instant::now();
+        let materials = Materials::load(&ctx.device, &ctx.queue, &texture_dir());
+        log::info!("materials baked in {:.0} ms", t_mat.elapsed().as_secs_f32() * 1000.0);
+        let t_models = Instant::now();
+        let scatter = Scatter::load(&ctx.device, &ctx.queue, &meshes, &model_dir());
+        log::info!("models loaded in {:.0} ms", t_models.elapsed().as_secs_f32() * 1000.0);
+        let mut post = Post::new(&ctx);
+        let taa = Taa::new(&ctx);
+        post.rebind(&ctx, taa.outputs());
+        let splat_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("grass-splat-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // Menu backdrop first: it is built once for the session, and the grass
+        // pipeline needs a camera bind group layout, which a terrain owns.
+        let mut backdrop = Terrain::new(&ctx, BACKDROP_SIZE, &materials, &lighting);
         let params = backdrop_params();
         let heights =
             terra_gen::heightfield::generate(backdrop.resolution(), backdrop.extent_m(), &params);
-        backdrop.set_heights(&gfx.ctx.queue, heights);
+        backdrop.set_heights(&ctx.queue, heights);
+
+        let hiz = HiZ::new(&ctx);
+        let mut grass = Grass::new(&ctx, &lighting, &hiz, backdrop.camera_layout());
+        // Match the blades to the grass material the ground is painted with, so
+        // a dissolving blade and the texture under it are the same colour.
+        if let Some((i, layer)) = materials
+            .layers
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.role == terra_render::material::GRASS)
+        {
+            grass.layer = i as u32;
+            grass.ground_color = glam::Vec3::from(layer.average_color);
+            log::info!("grass matched to material '{}'", layer.name);
+        }
+
+        let gfx = Gfx {
+            ctx,
+            sky,
+            lighting,
+            fog,
+            taa,
+            post,
+            hiz,
+            grass,
+            splat_sampler,
+            materials,
+            scatter,
+            meshes,
+            egui_renderer,
+            gpu_timer,
+        };
         self.backdrop = Some(backdrop);
 
         self.egui_state = Some(egui_state);
@@ -1239,6 +2088,17 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gfx.as_mut() {
                     g.ctx.resize(size.width, size.height);
+                    // The scene view was recreated, so every bind group holding
+                    // it is stale.
+                    if g.taa.size() != (g.ctx.config.width, g.ctx.config.height) {
+                        g.taa.resize(&g.ctx);
+                        // The scene view was recreated too, so every bind group
+                        // holding it -- history and post alike -- is stale.
+                        g.post.rebind(&g.ctx, g.taa.outputs());
+                        // The depth buffer was recreated with it, so the
+                        // pyramid's source and every view of it are stale.
+                        g.hiz.resize(&g.ctx);
+                    }
                 }
             }
             WindowEvent::Occluded(hidden) => {
@@ -1250,15 +2110,37 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.input.cursor = (position.x as f32, position.y as f32);
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if !consumed {
+                    // A wheel notch and a trackpad's pixel scroll are wildly
+                    // different magnitudes; normalise to notches so zooming
+                    // feels the same on both.
+                    self.input.scroll += match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
+                    };
+                }
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 match button {
                     MouseButton::Right => self.input.looking = down,
+                    MouseButton::Middle if !consumed => self.input.panning = down,
+                    MouseButton::Middle => self.input.panning = false,
                     MouseButton::Left if !consumed => {
-                        self.input.sculpting = down;
-                        self.input.clicked |= down;
+                        // In the Camera tool the left button drives the view,
+                        // never the brush.
+                        if self.tool.edits() {
+                            self.input.sculpting = down;
+                            self.input.clicked |= down;
+                        } else {
+                            self.input.orbiting = down;
+                        }
                     }
-                    MouseButton::Left => self.input.sculpting = false,
+                    MouseButton::Left => {
+                        self.input.sculpting = false;
+                        self.input.orbiting = false;
+                    }
                     _ => {}
                 }
             }
@@ -1281,6 +2163,15 @@ impl ApplicationHandler for App {
                         }
                         KeyCode::BracketRight if down => {
                             self.brush_radius = (self.brush_radius * 1.18).min(800.0);
+                        }
+                        KeyCode::Delete | KeyCode::Backspace
+                            if down && self.tool == Tool::Select =>
+                        {
+                            if let (Some(i), Some(g)) = (self.selected_prop, self.gfx.as_mut()) {
+                                g.scatter.remove_prop(i);
+                                self.selected_prop = None;
+                                self.unsaved = true;
+                            }
                         }
                         KeyCode::Escape if down && self.play.is_some() => self.stop_play(),
                         KeyCode::Escape if down && self.screen == Screen::Editor => {
@@ -1373,7 +2264,7 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _e: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
-            if self.input.looking {
+            if self.input.looking || self.input.panning || self.input.orbiting {
                 self.input.look_delta.0 += delta.0 as f32;
                 self.input.look_delta.1 += delta.1 as f32;
             }
@@ -1390,6 +2281,32 @@ impl ApplicationHandler for App {
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
     }
+}
+
+/// Closest the camera is allowed to sit above the surface, and the floor used
+/// when scaling pan and zoom. Without it, both stall to nothing the moment the
+/// camera touches the ground.
+const MIN_VIEW_DIST_M: f32 = 4.0;
+
+/// Fraction of the distance to the ground covered by one wheel notch.
+const ZOOM_PER_NOTCH: f32 = 0.12;
+
+/// Radius around the car that gets obstacle colliders.
+const OBSTACLE_RADIUS_M: f32 = 220.0;
+
+/// Translate renderer solids into physics shapes.
+fn to_obstacles(solids: &[terra_render::scatter::Solid]) -> Vec<Obstacle> {
+    solids
+        .iter()
+        .map(|s| Obstacle {
+            pos: s.pos.to_array(),
+            shape: if s.boulder {
+                ObstacleShape::Boulder { radius: s.radius.max(0.15) }
+            } else {
+                ObstacleShape::Trunk { radius: s.radius.max(0.08), height: s.height }
+            },
+        })
+        .collect()
 }
 
 /// How far a simplified control point may sit from the drawn line. Larger
@@ -1421,6 +2338,20 @@ fn wheel_poses(car: &Vehicle, chassis_rotation: Quat) -> Vec<Pose> {
                 * Quat::from_rotation_x(w.roll),
         })
         .collect()
+}
+
+/// Where material folders are looked for.
+///
+/// Relative to the executable's crate root at build time, so running from a
+/// checkout finds the same folder the artist drops textures into. A shipped
+/// build would resolve this next to the binary instead.
+fn texture_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/texture")
+}
+
+/// Where glTF models are looked for, alongside the texture folder.
+fn model_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/models")
 }
 
 /// The menu backdrop is its own small world, independent of any project.

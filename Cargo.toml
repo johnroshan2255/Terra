@@ -35,7 +35,8 @@ ron         = "0.12"
 directories = "6.0"
 memmap2     = "0.9"
 zstd        = "0.13"
-image       = { version = "0.25", default-features = false, features = ["png"] }
+image       = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+gltf        = { version = "1", default-features = false, features = ["import", "utils"] }
 rfd         = "0.17"
 uuid        = { version = "1.24", features = ["v4", "serde"] }
 

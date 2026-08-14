@@ -16,16 +16,22 @@ pub const MUTED: Color32 = Color32::from_rgb(156, 167, 182);
 pub const DANGER: Color32 = Color32::from_rgb(226, 138, 124);
 pub const WARN: Color32 = Color32::from_rgb(240, 180, 110);
 
-/// Width of the menu rail, including its margins.
+/// Widest the menu rail is ever drawn, including its margins.
 pub const RAIL_WIDTH: f32 = 400.0;
-/// How far the scrim extends past the rail before it is fully transparent.
-pub const SCRIM_WIDTH: f32 = 720.0;
+/// Narrowest the rail may shrink to before its contents start to scroll.
+pub const RAIL_MIN_WIDTH: f32 = 248.0;
 
 /// Editor panel fill. Opaque enough to read a tool list against terrain.
 pub const PANEL: Color32 = Color32::from_rgba_premultiplied(17, 20, 27, 232);
 pub const PANEL_SOFT: Color32 = Color32::from_rgba_premultiplied(30, 35, 46, 140);
-pub const HAIRLINE: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 26);
-pub const HOVER: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 20);
+// White at a low alpha. In *premultiplied* form that is `rgb == a`, not
+// `rgb == 255`: with the channels left at 255 the colour is additive, so what
+// was meant as a faint film painted as near-solid white and swallowed the label
+// sitting on top of it. `from_rgba_unmultiplied` is not const, hence by hand.
+/// White, ~15% opacity.
+pub const HAIRLINE: Color32 = Color32::from_rgba_premultiplied(38, 38, 38, 38);
+/// White, ~13% opacity.
+pub const HOVER: Color32 = Color32::from_rgba_premultiplied(34, 34, 34, 34);
 
 pub fn apply(ctx: &egui::Context) {
     let mut v = Visuals::dark();
@@ -66,17 +72,56 @@ pub fn apply(ctx: &egui::Context) {
     }
 }
 
+/// Rail width for the current window.
+///
+/// A fixed 400 px rail is a third of a laptop window and nearly all of a small
+/// one, so it tracks the viewport instead and only stops shrinking where the
+/// two-line nav rows would start to wrap.
+pub fn rail_width(ctx: &egui::Context) -> f32 {
+    let w = ctx.viewport_rect().width();
+    (w * 0.34).clamp(RAIL_MIN_WIDTH.min(w), RAIL_WIDTH)
+}
+
+/// Margins inside the rail, tightened as it narrows so the content keeps a
+/// usable width rather than being squeezed between generous gutters.
+pub fn rail_margin(rail: f32) -> Margin {
+    let t = ((rail - RAIL_MIN_WIDTH) / (RAIL_WIDTH - RAIL_MIN_WIDTH)).clamp(0.0, 1.0);
+    let lerp = |a: f32, b: f32| (a + (b - a) * t).round() as i8;
+    Margin {
+        left: lerp(22.0, 46.0),
+        right: lerp(18.0, 38.0),
+        top: lerp(24.0, 42.0),
+        bottom: lerp(20.0, 30.0),
+    }
+}
+
+/// Widths of the editor's two docked side panels, as `(tools, inspector)`.
+///
+/// Scaled to the window, and jointly capped: two fixed rails on a small window
+/// leave no viewport between them to sculpt in.
+pub fn editor_panels(ctx: &egui::Context) -> (f32, f32) {
+    let w = ctx.viewport_rect().width();
+    let tools = (w * 0.15).clamp(128.0, 196.0);
+    let inspector = (w * 0.21).clamp(190.0, 288.0);
+    let budget = w * 0.62;
+    if tools + inspector > budget {
+        let k = budget / (tools + inspector);
+        (tools * k, inspector * k)
+    } else {
+        (tools, inspector)
+    }
+}
+
 /// Horizontal gradient behind the menu rail, painted on the background layer.
 ///
 /// A solid panel fill would hide the landscape; this fades to fully transparent
 /// well before mid-screen, so the scene reads as the background of the app
 /// rather than as a picture behind a window.
-pub fn paint_rail_scrim(ctx: &egui::Context) {
+pub fn paint_rail_scrim(ctx: &egui::Context, rail: f32) {
     let screen = ctx.viewport_rect();
-    let rect = Rect::from_min_max(
-        screen.left_top(),
-        egui::pos2(screen.left() + SCRIM_WIDTH.min(screen.width()), screen.bottom()),
-    );
+    let width = (rail * 1.8).min(screen.width());
+    let rect =
+        Rect::from_min_max(screen.left_top(), egui::pos2(screen.left() + width, screen.bottom()));
 
     let opaque = Color32::from_rgba_premultiplied(6, 8, 13, 226);
     let clear = Color32::from_rgba_premultiplied(0, 0, 0, 0);

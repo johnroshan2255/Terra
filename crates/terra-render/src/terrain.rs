@@ -7,6 +7,8 @@
 
 use crate::camera::{Camera, CameraUniform};
 use crate::context::{DEPTH_FORMAT, RenderContext};
+use crate::lighting::Lighting;
+use crate::material::{MAX_LAYERS, Materials};
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
 use terra_core::WorldSize;
@@ -16,6 +18,34 @@ use wgpu::util::DeviceExt;
 /// uniform grid placeholder for CDLOD, and 512 keeps the vertex count at ~263k
 /// (0.5 M triangles), comfortably inside the 1.2 ms terrain budget.
 const GRID_RES: u32 = 512;
+
+/// Grid the terrain casts shadows from.
+///
+/// The same as the render grid. A coarser caster was tried -- 96 rather than
+/// 512, which is thirty times less vertex work across three cascades -- and
+/// measured no faster on this GPU, twice, interleaved. Depth-only vertex
+/// throughput is simply not what this frame is spending its time on, and a
+/// coarse caster costs silhouette accuracy for nothing.
+const SHADOW_GRID_RES: u32 = GRID_RES;
+
+/// Resolution of the painted layer weights.
+///
+/// Independent of, and much coarser than, the heightfield: painting is a
+/// large-scale act -- the smallest brush is 8 m across -- and a splat map at
+/// heightfield resolution would cost 8 bytes a texel for detail no brush can
+/// place.
+const SPLAT_RES: u32 = 1024;
+
+/// Metres per material tile repeat.
+///
+/// Sets how much texture there is per metre of ground, and therefore how close
+/// you can get before it turns to blur: a 1k tile over seven metres is under
+/// seven millimetres per texel, while a screen pixel at arm's length covers
+/// about two, so the near ground was magnified three times over and read as a
+/// smear. Halving the repeat halves that. The cost is that the tile itself
+/// repeats twice as often, which the macro wobble below and the grass standing
+/// on top of it both hide.
+const MATERIAL_SCALE_M: f32 = 3.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SculptMode {
@@ -48,7 +78,21 @@ struct TerrainUniform {
     brush_radius: f32,
     brush_center: [f32; 2],
     brush_active: f32,
-    _pad: f32,
+    /// Metres covered by one repeat of a material tile. Smaller tiles show more
+    /// grain up close and repeat more visibly at distance; this is the dial.
+    mat_scale_m: f32,
+    /// How many palette slots actually hold a material.
+    layer_count: u32,
+    /// Which slot the grass pass grows from, so the ground can darken under it.
+    grass_layer: u32,
+    /// Kept here rather than beside `grid_res`: a `u32` inserted there pushes
+    /// `brush_center` off its 8-byte alignment, and the block silently grows to
+    /// 96 bytes on the shader side while staying 84 on this one.
+    shadow_grid_res: u32,
+    _pad: u32,
+    /// Automatic role per layer, or `ROLE_NONE`. Packed as two vec4s because a
+    /// `u32` array in a uniform is padded to 16 bytes a element anyway.
+    layer_roles: [[u32; 4]; 2],
 }
 
 /// Pre-brush copy of the region a Smooth pass reads, so the filter never
@@ -76,6 +120,23 @@ pub struct Terrain {
     res: u32,
     extent_m: f32,
 
+    /// Painted layer weights, `SPLAT_RES^2 * MAX_LAYERS`, layer-minor.
+    ///
+    /// All-zero at a texel means "never painted here", which the shader reads
+    /// as a request for the automatic slope- and erosion-driven weights rather
+    /// than as an instruction to paint nothing.
+    splat: Vec<u8>,
+    /// Cached: whether `splat` holds anything.
+    ///
+    /// The UI asks this every frame. Deriving it by scanning is 8 MB of reads
+    /// per frame for one bool, which does not show up as a stutter -- it shows
+    /// up as a couple of milliseconds of CPU that look like they belong to
+    /// something else.
+    splat_painted: bool,
+    splat_tex: [wgpu::Texture; 2],
+    /// Kept so the grass pass can bind the same weights the terrain shades by.
+    splat_views: [wgpu::TextureView; 2],
+
     height_buf: wgpu::Buffer,
     flow_buf: wgpu::Buffer,
     deposit_buf: wgpu::Buffer,
@@ -85,16 +146,27 @@ pub struct Terrain {
     camera_ub: wgpu::Buffer,
     index_buf: wgpu::Buffer,
     index_count: u32,
+    shadow_index_buf: wgpu::Buffer,
+    shadow_index_count: u32,
 
+    camera_bgl: wgpu::BindGroupLayout,
     camera_bg: wgpu::BindGroup,
     terrain_bg: wgpu::BindGroup,
+    /// Shared with every other terrain in the session; the handle is cheap.
+    material_bg: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
+    shadow_pipeline: wgpu::RenderPipeline,
 
     brush: TerrainUniform,
 }
 
 impl Terrain {
-    pub fn new(ctx: &RenderContext, size: WorldSize) -> Self {
+    pub fn new(
+        ctx: &RenderContext,
+        size: WorldSize,
+        materials: &Materials,
+        lighting: &Lighting,
+    ) -> Self {
         let device = &ctx.device;
         let res = size.tier0_res();
         let extent_m = size.extent_m() as f32;
@@ -122,6 +194,41 @@ impl Terrain {
         let road_buf = mask_buf("road-mask", 0.0);
         let rut_buf = mask_buf("rut-mask", 0.0);
 
+        // Two RGBA8 textures rather than an eight-slice array: four weights
+        // per fetch means the fragment shader reads the whole palette in two
+        // samples instead of eight.
+        let splat = vec![0u8; (SPLAT_RES * SPLAT_RES * MAX_LAYERS) as usize];
+        let splat_tex = std::array::from_fn(|i| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(if i == 0 { "splat-0-3" } else { "splat-4-7" }),
+                size: wgpu::Extent3d {
+                    width: SPLAT_RES,
+                    height: SPLAT_RES,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        });
+        let splat_views: [wgpu::TextureView; 2] =
+            std::array::from_fn(|i| splat_tex[i].create_view(&Default::default()));
+        let splat_views_kept: [wgpu::TextureView; 2] =
+            std::array::from_fn(|i| splat_tex[i].create_view(&Default::default()));
+        // Clamped, not repeating: the splat map covers the world exactly once,
+        // and wrapping would smear the far edge onto the near one.
+        let splat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("splat-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let brush = TerrainUniform {
             world_extent: extent_m,
             height_res: res,
@@ -129,7 +236,16 @@ impl Terrain {
             brush_radius: 0.0,
             brush_center: [0.0, 0.0],
             brush_active: 0.0,
-            _pad: 0.0,
+            mat_scale_m: MATERIAL_SCALE_M,
+            layer_count: materials.count().min(MAX_LAYERS),
+            shadow_grid_res: SHADOW_GRID_RES,
+            grass_layer: materials
+                .layers
+                .iter()
+                .position(|l| l.role == crate::material::GRASS)
+                .unwrap_or(0) as u32,
+            _pad: 0,
+            layer_roles: pack_roles(materials),
         };
 
         let terrain_ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -149,6 +265,12 @@ impl Terrain {
         let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("terrain-indices"),
             contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let (shadow_indices, shadow_index_count) = build_indices(SHADOW_GRID_RES);
+        let shadow_index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain-shadow-indices"),
+            contents: bytemuck::cast_slice(&shadow_indices),
             usage: wgpu::BufferUsages::INDEX,
         });
 
@@ -230,6 +352,33 @@ impl Terrain {
                     },
                     count: None,
                 },
+                // Painted layer weights.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -252,19 +401,44 @@ impl Terrain {
                 wgpu::BindGroupEntry { binding: 3, resource: deposit_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: road_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: rut_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&splat_views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&splat_views[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&splat_sampler),
+                },
             ],
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain"),
+            // WGSL has no `#include`; the shared chunks are prepended the same
+            // way the generation passes compose theirs.
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../../assets/shaders/render/terrain.wgsl").into(),
+                format!(
+                    "{}\n{}\n{}",
+                    include_str!("../../../assets/shaders/common/noise.wgsl"),
+                    include_str!("../../../assets/shaders/common/lighting.wgsl"),
+                    include_str!("../../../assets/shaders/render/terrain.wgsl"),
+                )
+                .into(),
             ),
         });
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain-layout"),
-            bind_group_layouts: &[Some(&camera_bgl), Some(&terrain_bgl)],
+            bind_group_layouts: &[
+                Some(&camera_bgl),
+                Some(&terrain_bgl),
+                Some(&materials.layout),
+                Some(&lighting.layout),
+            ],
             immediate_size: 0,
         });
 
@@ -281,7 +455,7 @@ impl Terrain {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: ctx.config.format,
+                    format: crate::context::SCENE_FORMAT,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -305,10 +479,50 @@ impl Terrain {
             cache: None,
         });
 
+        // Depth-only pass for the shadow cascades. Group 0 is a cascade's light
+        // matrix rather than the camera; the shader is the same module.
+        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("terrain-shadow-layout"),
+            bind_group_layouts: &[Some(&lighting.cascade_layout), Some(&terrain_bgl)],
+            immediate_size: 0,
+        });
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("terrain-shadow-pipeline"),
+            layout: Some(&shadow_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_shadow"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                // Front faces cast: shifting the shadow caster to the far side
+                // of the geometry hides most acne without a large depth bias.
+                cull_mode: Some(wgpu::Face::Front),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Self {
             heights,
             res,
             extent_m,
+            splat,
+            splat_painted: false,
+            splat_tex,
+            splat_views: splat_views_kept,
             height_buf,
             flow_buf,
             deposit_buf,
@@ -318,9 +532,14 @@ impl Terrain {
             camera_ub,
             index_buf,
             index_count,
+            shadow_index_buf,
+            shadow_index_count,
+            camera_bgl,
             camera_bg,
             terrain_bg,
+            material_bg: materials.bind_group.clone(),
             pipeline,
+            shadow_pipeline,
             brush,
         }
     }
@@ -356,8 +575,36 @@ impl Terrain {
         }
     }
 
+    /// Heightfield storage buffer, for passes that place things on the surface.
+    /// The camera bind group layout, so passes that draw in this world can
+    /// share it rather than declaring a structurally identical copy.
+    pub fn camera_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.camera_bgl
+    }
+
+    pub fn camera_bind_group(&self) -> &wgpu::BindGroup {
+        &self.camera_bg
+    }
+
+    pub fn height_buffer(&self) -> &wgpu::Buffer {
+        &self.height_buf
+    }
+
+    /// Painted layer weights, four per view.
+    pub fn splat_views(&self) -> &[wgpu::TextureView; 2] {
+        &self.splat_views
+    }
+
     pub fn extent_m(&self) -> f32 {
         self.extent_m
+    }
+
+    /// Cells per side of the drawn mesh, which is coarser than the heightfield.
+    /// Anything that has to sit *on* the visible ground -- grass especially --
+    /// has to interpolate at this resolution, not the heightfield's, or it ends
+    /// up under a surface that bridges over the detail it was placed in.
+    pub fn mesh_resolution(&self) -> u32 {
+        GRID_RES
     }
 
     pub fn resolution(&self) -> u32 {
@@ -411,6 +658,18 @@ impl Terrain {
     /// 16 km, fine enough that the brush lands where the cursor points; a
     /// proper hierarchical march is only worth it once terrain is much steeper
     /// than a sculpt session produces.
+    /// Surface normal at a world position, from central differences on the CPU
+    /// heightfield. Scatter needs it to reject steep ground and to lean
+    /// instances with the slope.
+    pub fn normal_at(&self, x: f32, z: f32) -> Vec3 {
+        let step = self.extent_m / (self.res - 1) as f32;
+        let l = self.height_at(x - step, z);
+        let r = self.height_at(x + step, z);
+        let d = self.height_at(x, z - step);
+        let u = self.height_at(x, z + step);
+        Vec3::new(l - r, 2.0 * step, d - u).normalize_or(Vec3::Y)
+    }
+
     pub fn raycast(&self, origin: Vec3, dir: Vec3) -> Option<Vec3> {
         let half = self.extent_m * 0.5;
         let step = (self.extent_m / self.res as f32).max(1.0);
@@ -479,13 +738,224 @@ impl Terrain {
         }
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    // --- material painting ---
+
+    /// Painted weights, as saved with the world.
+    pub fn splat(&self) -> &[u8] {
+        &self.splat
+    }
+
+    pub fn splat_res() -> u32 {
+        SPLAT_RES
+    }
+
+    /// Restore painted weights loaded from disk. A mismatched length is
+    /// ignored rather than fatal -- a world saved before painting existed, or
+    /// with a different resolution, simply comes back unpainted.
+    pub fn set_splat(&mut self, queue: &wgpu::Queue, splat: Vec<u8>) {
+        if splat.len() != self.splat.len() {
+            if !splat.is_empty() {
+                log::warn!("splat map is {} bytes, expected {}", splat.len(), self.splat.len());
+            }
+            return;
+        }
+        self.splat_painted = splat.iter().any(|&v| v != 0);
+        self.splat = splat;
+        self.upload_splat(queue, 0, 0, SPLAT_RES, SPLAT_RES);
+    }
+
+    /// Paint `layer` under the brush.
+    ///
+    /// The weights behave the way a terrain painter is expected to: the target
+    /// layer rises toward full and the others give way in proportion, so the
+    /// set always sums to at most one and no layer can be starved by painting
+    /// its neighbour.
+    pub fn paint(
+        &mut self,
+        queue: &wgpu::Queue,
+        center: Vec2,
+        radius_m: f32,
+        strength: f32,
+        layer: u32,
+    ) {
+        if layer >= MAX_LAYERS {
+            return;
+        }
+        let Some((x0, x1, z0, z1)) = self.splat_window(center, radius_m) else {
+            return;
+        };
+        let n = MAX_LAYERS as usize;
+
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                let wx = (x as f32 / (SPLAT_RES - 1) as f32 - 0.5) * self.extent_m;
+                let wz = (z as f32 / (SPLAT_RES - 1) as f32 - 0.5) * self.extent_m;
+                let d = ((wx - center.x).powi(2) + (wz - center.y).powi(2)).sqrt();
+                if d > radius_m {
+                    continue;
+                }
+                // Soft-shouldered falloff. A linear one leaves a visible cone
+                // edge wherever two strokes overlap.
+                let t = (d / radius_m.max(1e-3)).clamp(0.0, 1.0);
+                let fall = (1.0 - t * t).powi(2);
+                let amount = (strength * fall).clamp(0.0, 1.0);
+                if amount <= 0.0 {
+                    continue;
+                }
+
+                let base = ((z * SPLAT_RES + x) as usize) * n;
+                let cur = self.splat[base + layer as usize] as f32 / 255.0;
+                let target = (cur + amount).min(1.0);
+                let rest: f32 = 1.0 - target;
+
+                let others: f32 = (0..n)
+                    .filter(|i| *i != layer as usize)
+                    .map(|i| self.splat[base + i] as f32 / 255.0)
+                    .sum();
+                if others > 1e-4 {
+                    let k = (rest / others).min(1.0);
+                    for i in 0..n {
+                        if i != layer as usize {
+                            let v = self.splat[base + i] as f32 / 255.0 * k;
+                            self.splat[base + i] = (v * 255.0 + 0.5) as u8;
+                        }
+                    }
+                }
+                self.splat[base + layer as usize] = (target * 255.0 + 0.5) as u8;
+                self.splat_painted = true;
+            }
+        }
+        self.upload_splat(queue, x0, z0, x1 - x0 + 1, z1 - z0 + 1);
+    }
+
+    /// Lift painting under the brush, fading each texel back toward the
+    /// automatic weights rather than toward an empty surface.
+    pub fn erase(&mut self, queue: &wgpu::Queue, center: Vec2, radius_m: f32, strength: f32) {
+        let Some((x0, x1, z0, z1)) = self.splat_window(center, radius_m) else {
+            return;
+        };
+        let n = MAX_LAYERS as usize;
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                let wx = (x as f32 / (SPLAT_RES - 1) as f32 - 0.5) * self.extent_m;
+                let wz = (z as f32 / (SPLAT_RES - 1) as f32 - 0.5) * self.extent_m;
+                let d = ((wx - center.x).powi(2) + (wz - center.y).powi(2)).sqrt();
+                if d > radius_m {
+                    continue;
+                }
+                let t = (d / radius_m.max(1e-3)).clamp(0.0, 1.0);
+                let k = 1.0 - (strength * (1.0 - t * t).powi(2)).clamp(0.0, 1.0);
+                let base = ((z * SPLAT_RES + x) as usize) * n;
+                for i in 0..n {
+                    self.splat[base + i] = (self.splat[base + i] as f32 * k) as u8;
+                }
+            }
+        }
+        self.upload_splat(queue, x0, z0, x1 - x0 + 1, z1 - z0 + 1);
+    }
+
+    /// Cover the whole world with one layer. The "set the base coat" action
+    /// every terrain tool has, and the fastest way out of a painting mistake.
+    pub fn fill(&mut self, queue: &wgpu::Queue, layer: u32) {
+        if layer >= MAX_LAYERS {
+            return;
+        }
+        let n = MAX_LAYERS as usize;
+        for texel in self.splat.chunks_exact_mut(n) {
+            texel.fill(0);
+            texel[layer as usize] = 255;
+        }
+        self.splat_painted = true;
+        self.upload_splat(queue, 0, 0, SPLAT_RES, SPLAT_RES);
+    }
+
+    /// Discard all painting and hand the surface back to the automatic weights.
+    pub fn clear_paint(&mut self, queue: &wgpu::Queue) {
+        self.splat.fill(0);
+        self.splat_painted = false;
+        self.upload_splat(queue, 0, 0, SPLAT_RES, SPLAT_RES);
+    }
+
+    /// True if anything has been painted. Lets the UI say which mode the
+    /// surface is in rather than leaving it a guess.
+    pub fn is_painted(&self) -> bool {
+        self.splat_painted
+    }
+
+    /// Splat-space bounding box of a brush, clamped to the map.
+    fn splat_window(&self, center: Vec2, radius_m: f32) -> Option<(u32, u32, u32, u32)> {
+        let to_texel = |v: f32| (v / self.extent_m + 0.5) * (SPLAT_RES - 1) as f32;
+        let last = (SPLAT_RES - 1) as f32;
+        let x0 = to_texel(center.x - radius_m).floor().clamp(0.0, last) as u32;
+        let x1 = to_texel(center.x + radius_m).ceil().clamp(0.0, last) as u32;
+        let z0 = to_texel(center.y - radius_m).floor().clamp(0.0, last) as u32;
+        let z1 = to_texel(center.y + radius_m).ceil().clamp(0.0, last) as u32;
+        (x1 >= x0 && z1 >= z0).then_some((x0, x1, z0, z1))
+    }
+
+    /// Push a rectangle of weights to both halves of the palette.
+    fn upload_splat(&self, queue: &wgpu::Queue, x: u32, z: u32, w: u32, h: u32) {
+        let n = MAX_LAYERS as usize;
+        for half in 0..2usize {
+            let mut rows = Vec::with_capacity((w * h * 4) as usize);
+            for row in 0..h {
+                for col in 0..w {
+                    let base = (((z + row) * SPLAT_RES + x + col) as usize) * n;
+                    for c in 0..4 {
+                        rows.push(self.splat[base + half * 4 + c]);
+                    }
+                }
+            }
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.splat_tex[half],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y: z, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &rows,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
+    }
+
+    /// Depth-only draw into one shadow cascade.
+    pub fn draw_shadow(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        lighting: &Lighting,
+        cascade: usize,
+    ) {
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_bind_group(0, &lighting.cascade_bind_group, &[Lighting::cascade_offset(cascade)]);
+        pass.set_bind_group(1, &self.terrain_bg, &[]);
+        pass.set_index_buffer(self.shadow_index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.shadow_index_count, 0, 0..1);
+    }
+
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, lighting: &Lighting) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.camera_bg, &[]);
         pass.set_bind_group(1, &self.terrain_bg, &[]);
+        pass.set_bind_group(2, &self.material_bg, &[]);
+        pass.set_bind_group(3, &lighting.bind_group, &[]);
         pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, 0..1);
     }
+}
+
+/// Roles laid out the way the uniform block expects them.
+fn pack_roles(materials: &Materials) -> [[u32; 4]; 2] {
+    let mut out = [[crate::material::ROLE_NONE; 4]; 2];
+    for (i, layer) in materials.layers.iter().take(MAX_LAYERS as usize).enumerate() {
+        out[i / 4][i % 4] = layer.role;
+    }
+    out
 }
 
 /// Bilinear height at a world position, on a bare slice.
@@ -619,6 +1089,15 @@ fn build_indices(n: u32) -> (Vec<u32>, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shader block is 80 bytes. Inserting a scalar in the wrong place
+    /// pushes `brush_center` off its 8-byte alignment and the two sides
+    /// silently disagree -- which shows up as a validation error the moment a
+    /// world is open, and never before.
+    #[test]
+    fn uniform_matches_the_shader_block() {
+        assert_eq!(std::mem::size_of::<TerrainUniform>(), 80);
+    }
 
     #[test]
     fn index_buffer_covers_every_quad() {

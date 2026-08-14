@@ -19,6 +19,20 @@ use rapier3d::prelude::*;
 pub const FIXED_DT: f32 = 1.0 / 60.0;
 
 /// The simulation. Owns every Rapier set so the caller holds one thing.
+/// A primitive standing in for one scattered object.
+#[derive(Clone, Copy, Debug)]
+pub struct Obstacle {
+    /// Base of the object, on the ground.
+    pub pos: [f32; 3],
+    pub shape: ObstacleShape,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ObstacleShape {
+    Trunk { radius: f32, height: f32 },
+    Boulder { radius: f32 },
+}
+
 pub struct PhysicsWorld {
     pub bodies: RigidBodySet,
     pub colliders: ColliderSet,
@@ -32,6 +46,8 @@ pub struct PhysicsWorld {
     multibody_joints: MultibodyJointSet,
     ccd: CCDSolver,
     terrain: Option<ColliderHandle>,
+    /// Streamed obstacle colliders, rebuilt as the player moves.
+    obstacles: Vec<ColliderHandle>,
 }
 
 impl Default for PhysicsWorld {
@@ -56,6 +72,7 @@ impl PhysicsWorld {
             multibody_joints: MultibodyJointSet::new(),
             ccd: CCDSolver::new(),
             terrain: None,
+            obstacles: Vec::new(),
         }
     }
 
@@ -84,6 +101,40 @@ impl PhysicsWorld {
             .friction(0.9)
             .build();
         self.terrain = Some(self.colliders.insert(collider));
+    }
+
+    /// Replace the streamed obstacle colliders.
+    ///
+    /// Per `docs/physics.md`: primitive shapes, and only within a radius of the
+    /// player. A collider per scatter instance is not viable at 10^5-10^6
+    /// instances, and it is not needed -- nothing outside a few hundred metres
+    /// can be hit. The caller derives the same set the renderer scatters, so
+    /// nothing per-instance is stored on either side.
+    pub fn set_obstacles(&mut self, obstacles: &[Obstacle]) {
+        for h in std::mem::take(&mut self.obstacles) {
+            self.colliders.remove(h, &mut self.islands, &mut self.bodies, false);
+        }
+        self.obstacles.reserve(obstacles.len());
+        for o in obstacles {
+            let builder = match o.shape {
+                // A trunk is a cylinder; the canopy is not solid and should not
+                // stop a car that clears the bole.
+                ObstacleShape::Trunk { radius, height } => ColliderBuilder::cylinder(
+                    height * 0.5,
+                    radius,
+                )
+                .translation(Vector::new(o.pos[0], o.pos[1] + height * 0.5, o.pos[2])),
+                // A ball rather than a box: a boulder mesh is lumpy, and a box
+                // catches wheels on corners that are not there in the picture.
+                ObstacleShape::Boulder { radius } => ColliderBuilder::ball(radius)
+                    .translation(Vector::new(o.pos[0], o.pos[1] + radius * 0.6, o.pos[2])),
+            };
+            self.obstacles.push(self.colliders.insert(builder.friction(0.8).build()));
+        }
+    }
+
+    pub fn obstacle_count(&self) -> usize {
+        self.obstacles.len()
     }
 
     pub fn step(&mut self) {

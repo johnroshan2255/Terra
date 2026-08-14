@@ -10,3 +10,15 @@
 !/worlds/.gitkeep
 
 .DS_Store
+
+# Downloaded texture sets. Large, binary, and re-downloadable from the source
+# site. The material loader treats a missing texture folder as "use the
+# generated fallback", so a fresh clone still runs.
+# /assets/texture/**/*.png
+# /assets/texture/*.zip
+# /assets/texture/.cache/
+# /assets/models/**/*.gltf
+# /assets/models/**/*.glb
+# /assets/models/**/*.bin
+# /assets/models/**/*.jpg
+# /assets/models/**/*.png

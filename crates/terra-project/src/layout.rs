@@ -133,6 +133,18 @@ impl ProjectPaths {
 
     /// Authored road splines. Under `edits/` because they are human work and
     /// must survive a terrain regenerate.
+    /// Painted material weights. Beside the other masks: it is authored data,
+    /// but it is a raster, not a document.
+    pub fn splat(&self) -> PathBuf {
+        self.masks_dir().join("splat.bin")
+    }
+
+    /// Foliage rules and painted density. Rules are a document; the density
+    /// masks are rasters appended after them.
+    pub fn foliage(&self) -> PathBuf {
+        self.edits_dir().join("foliage.bin")
+    }
+
     pub fn roads(&self) -> PathBuf {
         self.edits_dir().join("roads.ron")
     }

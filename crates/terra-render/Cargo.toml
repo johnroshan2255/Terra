@@ -16,3 +16,5 @@ glam.workspace = true
 bytemuck.workspace = true
 anyhow.workspace = true
 log.workspace = true
+rayon.workspace = true
+image.workspace = true

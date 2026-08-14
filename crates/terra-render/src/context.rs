@@ -9,12 +9,22 @@ use winit::window::Window;
 /// 16 km view distances.
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// Offscreen target the scene is rendered into before post-processing.
+///
+/// Float, because god rays sample the scene's brightness and an 8-bit buffer
+/// has already clipped the sun to white by the time the effect reads it -- the
+/// shafts then carry no more energy than the sky beside them. Alpha carries a
+/// sky mask: 1 where nothing occludes the sun, 0 on geometry.
+pub const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
 pub struct RenderContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
     pub depth_view: wgpu::TextureView,
+    /// Linear HDR scene, resolved to the swapchain by the post pass.
+    pub scene_view: wgpu::TextureView,
     window: Arc<Window>,
     vsync: bool,
     supports_uncapped: bool,
@@ -91,6 +101,7 @@ impl RenderContext {
         surface.configure(&device, &config);
 
         let depth_view = create_depth(&device, w, h);
+        let scene_view = create_scene(&device, w, h);
 
         Ok(Self {
             device,
@@ -98,6 +109,7 @@ impl RenderContext {
             surface,
             config,
             depth_view,
+            scene_view,
             window,
             vsync,
             supports_uncapped,
@@ -137,6 +149,7 @@ impl RenderContext {
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
         self.depth_view = create_depth(&self.device, w, h);
+        self.scene_view = create_scene(&self.device, w, h);
     }
 
     pub fn set_vsync(&mut self, vsync: bool) {
@@ -171,6 +184,21 @@ fn pick_present_mode(caps: &wgpu::SurfaceCapabilities, vsync: bool) -> wgpu::Pre
     wgpu::PresentMode::AutoVsync
 }
 
+fn create_scene(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene-color"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SCENE_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
@@ -180,7 +208,9 @@ fn create_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // Sampled as well as written: temporal reprojection reconstructs
+            // each pixel's world position from it.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default())

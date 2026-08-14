@@ -11,6 +11,7 @@ pub mod layout;
 pub mod library;
 pub mod params;
 pub mod project;
+pub mod props;
 pub mod roads;
 pub mod version;
 pub mod world;

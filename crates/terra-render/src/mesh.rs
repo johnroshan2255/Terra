@@ -7,6 +7,7 @@
 
 use crate::camera::{Camera, CameraUniform};
 use crate::context::{DEPTH_FORMAT, RenderContext};
+use crate::lighting::Lighting;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
@@ -16,6 +17,7 @@ use wgpu::util::DeviceExt;
 pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    pub uv: [f32; 2],
 }
 
 #[repr(C)]
@@ -31,28 +33,20 @@ impl Instance {
     }
 }
 
-/// Vertices and indices for one shape, uploaded once.
+/// Vertices, indices and the material bindings for one shape.
 pub struct Mesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
+    material: wgpu::BindGroup,
+    /// Leaf cards need both faces; solid geometry does not and should not pay
+    /// for the doubled fill.
+    double_sided: bool,
 }
 
 impl Mesh {
-    fn new(device: &wgpu::Device, label: &str, verts: &[Vertex], idx: &[u32]) -> Self {
-        Self {
-            vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            }),
-            indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(idx),
-                usage: wgpu::BufferUsages::INDEX,
-            }),
-            index_count: idx.len() as u32,
-        }
+    pub fn index_count(&self) -> u32 {
+        self.index_count
     }
 }
 
@@ -73,7 +67,7 @@ pub fn box_mesh(half: [f32; 3]) -> (Vec<Vertex>, Vec<u32>) {
     for (normal, corners) in faces {
         let base = verts.len() as u32;
         for c in corners {
-            verts.push(Vertex { position: c, normal });
+            verts.push(Vertex { position: c, normal, uv: [0.0, 0.0] });
         }
         idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
@@ -91,8 +85,16 @@ pub fn cylinder_mesh(radius: f32, half_width: f32, segments: u32) -> (Vec<Vertex
         let a = i as f32 / segments as f32 * std::f32::consts::TAU;
         let (s, c) = a.sin_cos();
         let n = [0.0, c, s];
-        verts.push(Vertex { position: [-half_width, c * radius, s * radius], normal: n });
-        verts.push(Vertex { position: [half_width, c * radius, s * radius], normal: n });
+        verts.push(Vertex {
+            position: [-half_width, c * radius, s * radius],
+            normal: n,
+            uv: [0.0, 0.0],
+        });
+        verts.push(Vertex {
+            position: [half_width, c * radius, s * radius],
+            normal: n,
+            uv: [0.0, 0.0],
+        });
     }
     for i in 0..segments {
         let b = i * 2;
@@ -102,11 +104,15 @@ pub fn cylinder_mesh(radius: f32, half_width: f32, segments: u32) -> (Vec<Vertex
     // Two caps, each a fan around its own centre.
     for (sign, normal) in [(-1.0f32, [-1.0, 0.0, 0.0]), (1.0, [1.0, 0.0, 0.0])] {
         let centre = verts.len() as u32;
-        verts.push(Vertex { position: [half_width * sign, 0.0, 0.0], normal });
+        verts.push(Vertex { position: [half_width * sign, 0.0, 0.0], normal, uv: [0.0, 0.0] });
         for i in 0..=segments {
             let a = i as f32 / segments as f32 * std::f32::consts::TAU;
             let (s, c) = a.sin_cos();
-            verts.push(Vertex { position: [half_width * sign, c * radius, s * radius], normal });
+            verts.push(Vertex {
+                position: [half_width * sign, c * radius, s * radius],
+                normal,
+                uv: [0.0, 0.0],
+            });
         }
         for i in 0..segments {
             let (a, b) = (centre + 1 + i, centre + 2 + i);
@@ -127,6 +133,11 @@ pub struct MeshRenderer {
     pipeline: wgpu::RenderPipeline,
     camera_ub: wgpu::Buffer,
     camera_bg: wgpu::BindGroup,
+    /// Same pipeline with back-face culling off, for cut-out foliage.
+    pipeline_double: wgpu::RenderPipeline,
+    shadow_pipeline: wgpu::RenderPipeline,
+    material_bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     instances: wgpu::Buffer,
     capacity: usize,
     pub chassis: Mesh,
@@ -137,8 +148,14 @@ pub struct MeshRenderer {
 const MAX_INSTANCES: usize = 64;
 
 impl MeshRenderer {
-    pub fn new(ctx: &RenderContext, chassis_half: [f32; 3], wheel_radius: f32) -> Self {
+    pub fn new(
+        ctx: &RenderContext,
+        chassis_half: [f32; 3],
+        wheel_radius: f32,
+        lighting: &Lighting,
+    ) -> Self {
         let device = &ctx.device;
+        let queue = &ctx.queue;
 
         let camera_ub = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mesh-camera"),
@@ -168,10 +185,47 @@ impl MeshRenderer {
             }],
         });
 
-        let (cv, ci) = box_mesh(chassis_half);
-        let (wv, wi) = cylinder_mesh(wheel_radius, 0.16, 20);
-        let chassis = Mesh::new(device, "chassis", &cv, &ci);
-        let wheel = Mesh::new(device, "wheel", &wv, &wi);
+        let material_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mesh-material-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("mesh-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: 4,
+            ..Default::default()
+        });
 
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mesh-instances"),
@@ -183,16 +237,21 @@ impl MeshRenderer {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mesh"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../../../assets/shaders/render/mesh.wgsl").into(),
+                format!(
+                    "{}\n{}",
+                    include_str!("../../../assets/shaders/common/lighting.wgsl"),
+                    include_str!("../../../assets/shaders/render/mesh.wgsl"),
+                )
+                .into(),
             ),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh-layout"),
-            bind_group_layouts: &[Some(&bgl)],
+            bind_group_layouts: &[Some(&bgl), Some(&material_bgl), Some(&lighting.layout)],
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let mut descriptor = wgpu::RenderPipelineDescriptor {
             label: Some("mesh-pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
@@ -202,14 +261,16 @@ impl MeshRenderer {
                     Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Vertex>() as u64,
                         step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x3, 1 => Float32x3, 2 => Float32x2
+                        ],
                     }),
                     Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<Instance>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &wgpu::vertex_attr_array![
-                            2 => Float32x4, 3 => Float32x4, 4 => Float32x4, 5 => Float32x4,
-                            6 => Float32x4
+                            3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4,
+                            7 => Float32x4
                         ],
                     }),
                 ],
@@ -219,7 +280,7 @@ impl MeshRenderer {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: ctx.config.format,
+                    format: crate::context::SCENE_FORMAT,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -241,9 +302,103 @@ impl MeshRenderer {
             multisample: Default::default(),
             multiview_mask: None,
             cache: None,
-        });
+        };
+        let pipeline = device.create_render_pipeline(&descriptor);
 
-        Self { pipeline, camera_ub, camera_bg, instances, capacity: MAX_INSTANCES, chassis, wheel }
+        // Identical but without back-face culling, for cut-out foliage.
+        descriptor.label = Some("mesh-pipeline-double");
+        descriptor.primitive.cull_mode = None;
+        let pipeline_double = device.create_render_pipeline(&descriptor);
+
+        // Depth-only, alpha-tested. Group 0 is a cascade matrix.
+        let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh-shadow-layout"),
+            bind_group_layouts: &[Some(&lighting.cascade_layout), Some(&material_bgl)],
+            immediate_size: 0,
+        });
+        let mut sd = descriptor.clone();
+        sd.label = Some("mesh-shadow-pipeline");
+        sd.layout = Some(&shadow_layout);
+        sd.vertex.entry_point = Some("vs_shadow");
+        sd.fragment = Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_shadow"),
+            targets: &[],
+            compilation_options: Default::default(),
+        });
+        // Cut-out foliage casts from both faces, and the terrain's front-face
+        // trick does not apply to a leaf card with no inside.
+        sd.primitive.cull_mode = None;
+        let shadow_pipeline = device.create_render_pipeline(&sd);
+
+        let (cv, ci) = box_mesh(chassis_half);
+        let (wv, wi) = cylinder_mesh(wheel_radius, 0.16, 20);
+        let chassis = build_mesh(
+            device,
+            queue,
+            &material_bgl,
+            &sampler,
+            "chassis",
+            &cv,
+            &ci,
+            None,
+            None,
+            false,
+        );
+        let wheel = build_mesh(
+            device,
+            queue,
+            &material_bgl,
+            &sampler,
+            "wheel",
+            &wv,
+            &wi,
+            None,
+            None,
+            false,
+        );
+
+        Self {
+            pipeline,
+            pipeline_double,
+            shadow_pipeline,
+            material_bgl,
+            sampler,
+            camera_ub,
+            camera_bg,
+            instances,
+            capacity: MAX_INSTANCES,
+            chassis,
+            wheel,
+        }
+    }
+
+    /// Upload an imported or generated mesh, with its material.
+    pub fn upload_mesh(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        data: &terra_assets::MeshData,
+    ) -> Mesh {
+        let verts: Vec<Vertex> = (0..data.positions.len())
+            .map(|i| Vertex {
+                position: data.positions[i],
+                normal: *data.normals.get(i).unwrap_or(&[0.0, 1.0, 0.0]),
+                uv: *data.uvs.get(i).unwrap_or(&[0.0, 0.0]),
+            })
+            .collect();
+        build_mesh(
+            device,
+            queue,
+            &self.material_bgl,
+            &self.sampler,
+            "imported",
+            &verts,
+            &data.indices,
+            data.albedo.as_ref(),
+            data.alpha_cutoff,
+            data.double_sided,
+        )
     }
 
     pub fn upload_camera(&self, queue: &wgpu::Queue, cam: &Camera, aspect: f32) {
@@ -259,19 +414,216 @@ impl MeshRenderer {
         n as u32
     }
 
-    /// Draw `count` instances of `mesh`, reading from `offset` in the instance
-    /// buffer.
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, mesh: &Mesh, offset: u32, count: u32) {
+    /// Draw with a GPU-written instance count.
+    ///
+    /// The count lives in `args` and is never read back, which is the whole
+    /// point of culling on the GPU -- asking how many survived would cost a
+    /// sync every frame.
+    /// Depth-only instanced draw into a shadow cascade.
+    pub fn draw_shadow_indirect(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        lighting: &Lighting,
+        cascade: usize,
+        mesh: &Mesh,
+        instances: &wgpu::Buffer,
+        args: &wgpu::Buffer,
+    ) {
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_bind_group(0, &lighting.cascade_bind_group, &[Lighting::cascade_offset(cascade)]);
+        pass.set_bind_group(1, &mesh.material, &[]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_vertex_buffer(1, instances.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed_indirect(args, 0);
+    }
+
+    /// Depth-only instanced draw from a caller-owned buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_shadow_instanced(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        lighting: &Lighting,
+        cascade: usize,
+        mesh: &Mesh,
+        instances: &wgpu::Buffer,
+        offset: u32,
+        count: u32,
+    ) {
         if count == 0 {
             return;
         }
         let stride = std::mem::size_of::<Instance>() as u64;
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_bind_group(0, &lighting.cascade_bind_group, &[Lighting::cascade_offset(cascade)]);
+        pass.set_bind_group(1, &mesh.material, &[]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_vertex_buffer(1, instances.slice(offset as u64 * stride..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..count);
+    }
+
+    pub fn draw_indirect(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        lighting: &Lighting,
+        mesh: &Mesh,
+        instances: &wgpu::Buffer,
+        args: &wgpu::Buffer,
+    ) {
+        pass.set_pipeline(if mesh.double_sided { &self.pipeline_double } else { &self.pipeline });
         pass.set_bind_group(0, &self.camera_bg, &[]);
+        pass.set_bind_group(1, &mesh.material, &[]);
+        pass.set_bind_group(2, &lighting.bind_group, &[]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_vertex_buffer(1, instances.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed_indirect(args, 0);
+    }
+
+    /// Draw from a caller-owned instance buffer.
+    ///
+    /// Scatter keeps one static buffer per species -- the transforms do not
+    /// change between frames -- so it has nothing to gain from the shared
+    /// per-frame buffer the vehicle uses.
+    pub fn draw_instanced(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        lighting: &Lighting,
+        mesh: &Mesh,
+        instances: &wgpu::Buffer,
+        offset: u32,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let stride = std::mem::size_of::<Instance>() as u64;
+        pass.set_pipeline(if mesh.double_sided { &self.pipeline_double } else { &self.pipeline });
+        pass.set_bind_group(0, &self.camera_bg, &[]);
+        pass.set_bind_group(1, &mesh.material, &[]);
+        pass.set_bind_group(2, &lighting.bind_group, &[]);
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_vertex_buffer(1, instances.slice(offset as u64 * stride..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..count);
+    }
+
+    /// Draw `count` instances of `mesh`, reading from `offset` in the instance
+    /// buffer.
+    pub fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        lighting: &Lighting,
+        mesh: &Mesh,
+        offset: u32,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let stride = std::mem::size_of::<Instance>() as u64;
+        pass.set_pipeline(if mesh.double_sided { &self.pipeline_double } else { &self.pipeline });
+        pass.set_bind_group(0, &self.camera_bg, &[]);
+        pass.set_bind_group(1, &mesh.material, &[]);
+        pass.set_bind_group(2, &lighting.bind_group, &[]);
         pass.set_vertex_buffer(0, mesh.vertices.slice(..));
         pass.set_vertex_buffer(1, self.instances.slice(offset as u64 * stride..));
         pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.index_count, 0, 0..count);
+    }
+}
+
+/// Upload geometry plus its material bindings.
+///
+/// Meshes with no map get a 1x1 white texture rather than a second pipeline:
+/// the shader multiplies by it, so untextured geometry is unaffected and there
+/// is one code path.
+#[allow(clippy::too_many_arguments)]
+fn build_mesh(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    label: &str,
+    verts: &[Vertex],
+    idx: &[u32],
+    albedo: Option<&terra_assets::mesh::Texture>,
+    alpha_cutoff: Option<f32>,
+    double_sided: bool,
+) -> Mesh {
+    let white = terra_assets::mesh::Texture { width: 1, height: 1, rgba: vec![255; 4] };
+    let tex = albedo.unwrap_or(&white);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: tex.width.max(1),
+            height: tex.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &tex.rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(tex.width.max(1) * 4),
+            rows_per_image: Some(tex.height.max(1)),
+        },
+        wgpu::Extent3d {
+            width: tex.width.max(1),
+            height: tex.height.max(1),
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&Default::default());
+
+    // Negative disables the test, so opaque geometry never branches on it.
+    let cutoff = [alpha_cutoff.unwrap_or(-1.0), 0.0, 0.0, 0.0];
+    let cutoff_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh-alpha-cutoff"),
+        contents: bytemuck::cast_slice(&cutoff),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let material = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: cutoff_buf.as_entire_binding() },
+        ],
+    });
+
+    Mesh {
+        vertices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        }),
+        indices: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(idx),
+            usage: wgpu::BufferUsages::INDEX,
+        }),
+        index_count: idx.len() as u32,
+        material,
+        double_sided,
     }
 }
 
