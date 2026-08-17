@@ -6,6 +6,7 @@
 //! this costs microseconds -- compute is for whole-map work like erosion.
 
 use crate::camera::{Camera, CameraUniform};
+use crate::cdlod::{self, Cdlod, PATCH_QUADS};
 use crate::context::{DEPTH_FORMAT, RenderContext};
 use crate::lighting::Lighting;
 use crate::material::{MAX_LAYERS, Materials};
@@ -14,19 +15,19 @@ use glam::{Vec2, Vec3};
 use terra_core::WorldSize;
 use wgpu::util::DeviceExt;
 
-/// Grid quads per side. Independent of heightfield resolution: this is a
-/// uniform grid placeholder for CDLOD, and 512 keeps the vertex count at ~263k
-/// (0.5 M triangles), comfortably inside the 1.2 ms terrain budget.
-const GRID_RES: u32 = 512;
-
-/// Grid the terrain casts shadows from.
+/// Vertex spacing the finest CDLOD level aims for, in metres.
 ///
-/// The same as the render grid. A coarser caster was tried -- 96 rather than
-/// 512, which is thirty times less vertex work across three cascades -- and
-/// measured no faster on this GPU, twice, interleaved. Depth-only vertex
-/// throughput is simply not what this frame is spending its time on, and a
-/// coarse caster costs silhouette accuracy for nothing.
-const SHADOW_GRID_RES: u32 = GRID_RES;
+/// This is the number that decides whether a material can displace geometry at
+/// all. Materials tile every few metres, so a vertex every half metre puts roughly
+/// seven vertices across one repeat -- enough for a height map to read as bumps
+/// rather than as the whole quad lurching. The uniform 512-square grid this
+/// replaced had 7.81 m between vertices on a 4 km world, two full repeats inside
+/// one quad.
+///
+/// It costs almost nothing to ask for, because CDLOD only reaches this spacing in
+/// the patches nearest the camera: the measured selection is 232 patches and 0.48 M
+/// triangles against the old grid's 0.52 M.
+const CDLOD_TARGET_SPACING_M: f32 = 0.5;
 
 /// Resolution of the painted layer weights.
 ///
@@ -36,28 +37,35 @@ const SHADOW_GRID_RES: u32 = GRID_RES;
 /// place.
 const SPLAT_RES: u32 = 1024;
 
-/// Metres per material tile repeat.
-///
-/// Sets how much texture there is per metre of ground, and therefore how close
-/// you can get before it turns to blur: a 1k tile over seven metres is under
-/// seven millimetres per texel, while a screen pixel at arm's length covers
-/// about two, so the near ground was magnified three times over and read as a
-/// smear. Halving the repeat halves that. The cost is that the tile itself
-/// repeats twice as often, which the macro wobble below and the grass standing
-/// on top of it both hide.
-const MATERIAL_SCALE_M: f32 = 3.5;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SculptMode {
     Raise,
     Lower,
     Smooth,
     Flatten,
+    /// Build material up toward the brush plane, never cutting into ground that
+    /// already stands above it.
+    Clay,
+    /// Drag the surface along the stroke. Shifts heights rather than adding to
+    /// them, so existing detail travels instead of being smeared flat.
+    Move,
+    /// Displace by a noise pattern -- the built-in basis or an uploaded map.
+    Noise,
+    /// Pull heights toward the brush centre, sharpening a rise into a ridge.
+    Pinch,
 }
 
 impl SculptMode {
-    pub const ALL: [SculptMode; 4] =
-        [SculptMode::Raise, SculptMode::Lower, SculptMode::Smooth, SculptMode::Flatten];
+    pub const ALL: [SculptMode; 8] = [
+        SculptMode::Clay,
+        SculptMode::Raise,
+        SculptMode::Lower,
+        SculptMode::Move,
+        SculptMode::Flatten,
+        SculptMode::Smooth,
+        SculptMode::Noise,
+        SculptMode::Pinch,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -65,7 +73,16 @@ impl SculptMode {
             SculptMode::Lower => "Lower",
             SculptMode::Smooth => "Smooth",
             SculptMode::Flatten => "Flatten",
+            SculptMode::Clay => "Clay",
+            SculptMode::Move => "Move",
+            SculptMode::Noise => "Noise",
+            SculptMode::Pinch => "Pinch",
         }
+    }
+
+    /// Whether this mode reads the noise pattern.
+    pub fn uses_noise(self) -> bool {
+        matches!(self, SculptMode::Noise)
     }
 }
 
@@ -74,26 +91,42 @@ impl SculptMode {
 struct TerrainUniform {
     world_extent: f32,
     height_res: u32,
-    grid_res: u32,
+    /// Quads per side of one CDLOD patch. See `cdlod::PATCH_QUADS`.
+    patch_quads: u32,
     brush_radius: f32,
     brush_center: [f32; 2],
     brush_active: f32,
-    /// Metres covered by one repeat of a material tile. Smaller tiles show more
-    /// grain up close and repeat more visibly at distance; this is the dial.
-    mat_scale_m: f32,
+    /// Viewport visualization mode, as `ViewMode::shader_index`.
+    ///
+    /// Sits in what used to be padding. The slot exists because `layer_roles` is
+    /// an array of vec4 and needs a 16-byte offset, which 44 bytes of preceding
+    /// fields would not give it -- so this costs nothing.
+    view_mode: u32,
     /// How many palette slots actually hold a material.
     layer_count: u32,
     /// Which slot the grass pass grows from, so the ground can darken under it.
     grass_layer: u32,
-    /// Kept here rather than beside `grid_res`: a `u32` inserted there pushes
-    /// `brush_center` off its 8-byte alignment, and the block silently grows to
-    /// 96 bytes on the shader side while staying 84 on this one.
-    shadow_grid_res: u32,
-    _pad: u32,
+    _pad0: [u32; 2],
+    /// Camera position for the CDLOD morph: `xy` is the eye's world XZ, `z` its
+    /// vertical distance to the terrain's height slab, `w` unused.
+    ///
+    /// Here rather than read from the camera uniform because the shadow pass binds
+    /// group 0 to a cascade's light matrix and has no camera at all. That is not a
+    /// workaround, it is a requirement: if the depth-only caster morphed
+    /// differently from the shaded surface, every level boundary would grow a band
+    /// of shadow acne. One uniform, bound in both passes, makes disagreeing
+    /// impossible.
+    morph_eye: [f32; 4],
     /// Automatic role per layer, or `ROLE_NONE`. Packed as two vec4s because a
     /// `u32` array in a uniform is padded to 16 bytes a element anyway.
     layer_roles: [[u32; 4]; 2],
 }
+
+const _: () = assert!(std::mem::size_of::<TerrainUniform>() == 96);
+// `morph_eye` is a vec4 in WGSL and must land on a 16-byte boundary, which is what
+// `_pad0` buys; `layer_roles` then follows at 64.
+const _: () = assert!(std::mem::offset_of!(TerrainUniform, morph_eye) == 48);
+const _: () = assert!(std::mem::offset_of!(TerrainUniform, layer_roles) == 64);
 
 /// Pre-brush copy of the region a Smooth pass reads, so the filter never
 /// observes its own writes.
@@ -144,10 +177,31 @@ pub struct Terrain {
     rut_buf: wgpu::Buffer,
     terrain_ub: wgpu::Buffer,
     camera_ub: wgpu::Buffer,
+
+    /// Quadtree LOD selection, rebuilt every frame from the camera.
+    cdlod: Cdlod,
+    /// The selected patches, as instance data for the vertex shader.
+    patch_buf: wgpu::Buffer,
+    /// Instances in `patch_buf`, i.e. how many patches the last selection chose.
+    patch_count: u32,
+    /// Min and max of `heights`, for the altitude term in LOD selection.
+    ///
+    /// Cached rather than scanned: selection runs every frame and the heightfield is
+    /// up to 16 M floats. Sculpting widens it from the touched window, which can
+    /// leave it wider than the true range after a Lower stroke -- harmless, because
+    /// a wider slab only makes selection slightly more conservative.
+    height_range: (f32, f32),
+
     index_buf: wgpu::Buffer,
     index_count: u32,
-    shadow_index_buf: wgpu::Buffer,
-    shadow_index_count: u32,
+    /// Filled faces off, for the Wireframe view mode.
+    wire_pipeline: wgpu::RenderPipeline,
+    /// Grid edges as a line list. Used only on the fallback path; on the
+    /// `POLYGON_MODE_LINE` path the triangle buffer is drawn instead.
+    wire_index_buf: wgpu::Buffer,
+    wire_index_count: u32,
+    /// Which of the two wireframe paths this pipeline was built for.
+    wire_uses_polygon_line: bool,
 
     camera_bgl: wgpu::BindGroupLayout,
     camera_bg: wgpu::BindGroup,
@@ -166,6 +220,7 @@ impl Terrain {
         size: WorldSize,
         materials: &Materials,
         lighting: &Lighting,
+        clouds: &crate::clouds::Clouds,
     ) -> Self {
         let device = &ctx.device;
         let res = size.tier0_res();
@@ -232,19 +287,19 @@ impl Terrain {
         let brush = TerrainUniform {
             world_extent: extent_m,
             height_res: res,
-            grid_res: GRID_RES,
+            patch_quads: PATCH_QUADS,
             brush_radius: 0.0,
             brush_center: [0.0, 0.0],
             brush_active: 0.0,
-            mat_scale_m: MATERIAL_SCALE_M,
+            view_mode: crate::ViewMode::Lit.shader_index(),
             layer_count: materials.count().min(MAX_LAYERS),
-            shadow_grid_res: SHADOW_GRID_RES,
             grass_layer: materials
                 .layers
                 .iter()
                 .position(|l| l.role == crate::material::GRASS)
                 .unwrap_or(0) as u32,
-            _pad: 0,
+            _pad0: [0; 2],
+            morph_eye: [0.0; 4],
             layer_roles: pack_roles(materials),
         };
 
@@ -261,18 +316,31 @@ impl Terrain {
             mapped_at_creation: false,
         });
 
-        let (indices, index_count) = build_indices(GRID_RES);
+        // One patch's worth of indices, shared by every instance. The shadow pass
+        // draws the same buffer: selection is distance-based and covers the whole
+        // world, so the patch set is already everything that could cast.
+        let indices = cdlod::patch_indices();
+        let index_count = indices.len() as u32;
         let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("terrain-indices"),
+            label: Some("terrain-patch-indices"),
             contents: bytemuck::cast_slice(&indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let (shadow_indices, shadow_index_count) = build_indices(SHADOW_GRID_RES);
-        let shadow_index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("terrain-shadow-indices"),
-            contents: bytemuck::cast_slice(&shadow_indices),
-            usage: wgpu::BufferUsages::INDEX,
+
+        // Sized for the first selection's worth of patches and grown on demand;
+        // `select` tracks the high-water mark so a camera move does not reallocate.
+        let mut cdlod = Cdlod::new(extent_m, CDLOD_TARGET_SPACING_M);
+        let patches = cdlod.select(Vec3::ZERO, (0.0, 0.0), extent_m).to_vec();
+        let patch_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cdlod-patches"),
+            size: cdlod.buffer_bytes(),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        // Seeded here so the first frame draws even if it renders before any camera
+        // upload -- an empty instance range would be a blank viewport, not a stall.
+        ctx.queue.write_buffer(&patch_buf, 0, bytemuck::cast_slice(&patches));
+        let patch_count = patches.len() as u32;
 
         let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera-bgl"),
@@ -379,6 +447,18 @@ impl Terrain {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // CDLOD patches, read by `instance_index`. Vertex-only: the fragment
+                // stage receives the world position it needs as an interpolant.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -413,6 +493,7 @@ impl Terrain {
                     binding: 8,
                     resource: wgpu::BindingResource::Sampler(&splat_sampler),
                 },
+                wgpu::BindGroupEntry { binding: 9, resource: patch_buf.as_entire_binding() },
             ],
         });
 
@@ -422,9 +503,12 @@ impl Terrain {
             // way the generation passes compose theirs.
             source: wgpu::ShaderSource::Wgsl(
                 format!(
-                    "{}\n{}\n{}",
+                    "{}\n{}\n{}\n{}\n{}\n{}",
                     include_str!("../../../assets/shaders/common/noise.wgsl"),
                     include_str!("../../../assets/shaders/common/lighting.wgsl"),
+                    include_str!("../../../assets/shaders/common/cdlod.wgsl"),
+                    include_str!("../../../assets/shaders/common/grid.wgsl"),
+                    include_str!("../../../assets/shaders/common/brush.wgsl"),
                     include_str!("../../../assets/shaders/render/terrain.wgsl"),
                 )
                 .into(),
@@ -438,6 +522,7 @@ impl Terrain {
                 Some(&terrain_bgl),
                 Some(&materials.layout),
                 Some(&lighting.layout),
+                Some(&clouds.shadow_layout),
             ],
             immediate_size: 0,
         });
@@ -477,6 +562,71 @@ impl Terrain {
             multisample: Default::default(),
             multiview_mask: None,
             cache: None,
+        });
+
+        // --- wireframe ---
+        //
+        // Two paths, because `PolygonMode::Line` is not core WebGPU. When the
+        // adapter has it, the same triangle buffer is drawn with filled faces
+        // turned off, which gives triangle edges including the diagonals. When it
+        // does not, a line-list buffer over the grid edges is drawn instead --
+        // exact, and no optional feature. See `cdlod::grid_wire_indices` for why this
+        // is not the usual barycentric trick.
+        let line_mode = ctx.supports_polygon_line();
+        let wire_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("terrain-wireframe"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: crate::context::SCENE_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: if line_mode {
+                    wgpu::PrimitiveTopology::TriangleList
+                } else {
+                    wgpu::PrimitiveTopology::LineList
+                },
+                polygon_mode: if line_mode {
+                    wgpu::PolygonMode::Line
+                } else {
+                    wgpu::PolygonMode::Fill
+                },
+                // No culling: a wireframe is meant to show the far side of the
+                // surface as well, and back-face culling hides exactly the edges
+                // that reveal a fold.
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let wire_indices = cdlod::patch_wire_indices();
+        let wire_index_count = wire_indices.len() as u32;
+        let wire_index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain-wire-indices"),
+            contents: bytemuck::cast_slice(&wire_indices),
+            usage: wgpu::BufferUsages::INDEX,
         });
 
         // Depth-only pass for the shadow cascades. Group 0 is a cascade's light
@@ -530,10 +680,16 @@ impl Terrain {
             rut_buf,
             terrain_ub,
             camera_ub,
+            cdlod,
+            patch_buf,
+            patch_count,
+            height_range: (0.0, 0.0),
             index_buf,
             index_count,
-            shadow_index_buf,
-            shadow_index_count,
+            wire_pipeline,
+            wire_index_buf,
+            wire_index_count,
+            wire_uses_polygon_line: line_mode,
             camera_bgl,
             camera_bg,
             terrain_bg,
@@ -550,6 +706,7 @@ impl Terrain {
     pub fn set_heights(&mut self, queue: &wgpu::Queue, heights: Vec<f32>) {
         assert_eq!(heights.len(), self.heights.len(), "heightfield size mismatch");
         self.heights = heights;
+        self.height_range = height_range(&self.heights);
         queue.write_buffer(&self.height_buf, 0, bytemuck::cast_slice(&self.heights));
     }
 
@@ -599,24 +756,39 @@ impl Terrain {
         self.extent_m
     }
 
-    /// Cells per side of the drawn mesh, which is coarser than the heightfield.
-    /// Anything that has to sit *on* the visible ground -- grass especially --
-    /// has to interpolate at this resolution, not the heightfield's, or it ends
-    /// up under a surface that bridges over the detail it was placed in.
-    pub fn mesh_resolution(&self) -> u32 {
-        GRID_RES
-    }
-
     pub fn resolution(&self) -> u32 {
         self.res
     }
 
+    /// Triangles the last selection submits. Varies with the camera now, which is
+    /// the point -- the stats panel is showing an adaptive mesh, not a fixed grid.
     pub fn triangle_count(&self) -> u32 {
-        self.index_count / 3
+        self.cdlod.triangle_count()
     }
 
-    pub fn upload_camera(&self, queue: &wgpu::Queue, cam: &Camera, aspect: f32) {
+    /// Patches the last selection chose, and the LOD levels in the tree.
+    pub fn lod_stats(&self) -> (u32, u32) {
+        (self.patch_count, self.cdlod.levels())
+    }
+
+    /// Upload the camera and reselect the LOD patches for it.
+    ///
+    /// The two belong together: the patch set is a pure function of the camera, and
+    /// splitting them would let a frame draw one camera's patches through another
+    /// camera's matrix -- which looks like the terrain tearing along level
+    /// boundaries as you move.
+    pub fn upload_camera(&mut self, queue: &wgpu::Queue, cam: &Camera, aspect: f32) {
         queue.write_buffer(&self.camera_ub, 0, bytemuck::bytes_of(&cam.uniform(aspect)));
+
+        let patches = self.cdlod.select(cam.pos, self.height_range, self.extent_m);
+        self.patch_count = patches.len() as u32;
+        queue.write_buffer(&self.patch_buf, 0, bytemuck::cast_slice(patches));
+
+        // The shader morphs from the same eye and the same slab gap the selection
+        // above used, so the two cannot disagree about where a level ends.
+        let gap = cdlod::vertical_gap(cam.pos.y, self.height_range);
+        self.brush.morph_eye = [cam.pos.x, cam.pos.z, gap, 0.0];
+        queue.write_buffer(&self.terrain_ub, 0, bytemuck::bytes_of(&self.brush));
     }
 
     pub fn set_brush(&mut self, queue: &wgpu::Queue, center: Option<Vec2>, radius: f32) {
@@ -708,6 +880,25 @@ impl Terrain {
     /// Apply one brush dab to the live field, then upload only the rows it
     /// touched.
     ///
+    /// Swap in a rebuilt palette.
+    ///
+    /// Importing a texture rebuilds [`Materials`], which means a new bind group
+    /// and a new layer count. Without this the editor would need a restart to
+    /// see anything it had just imported, which for a content browser is the
+    /// same as the import not working.
+    ///
+    /// The bind group *layout* is unchanged, so the pipelines stay valid and
+    /// only the group and three uniform fields move.
+    pub fn set_materials(&mut self, queue: &wgpu::Queue, materials: &Materials) {
+        self.material_bg = materials.bind_group.clone();
+        self.brush.layer_count = materials.count().min(MAX_LAYERS);
+        self.brush.grass_layer =
+            materials.layers.iter().position(|l| l.role == crate::material::GRASS).unwrap_or(0)
+                as u32;
+        self.brush.layer_roles = pack_roles(materials);
+        queue.write_buffer(&self.terrain_ub, 0, bytemuck::bytes_of(&self.brush));
+    }
+
     /// Callers keeping a separate base layer (see the road system) should apply
     /// [`apply_brush`] to that layer with the same arguments, so the edit
     /// survives a road rebuild.
@@ -717,10 +908,10 @@ impl Terrain {
         center: Vec2,
         radius: f32,
         strength: f32,
-        mode: SculptMode,
+        op: &BrushOp<'_>,
     ) {
         let Some((x0, x1, z0, z1)) =
-            apply_brush(&mut self.heights, self.res, self.extent_m, center, radius, strength, mode)
+            apply_brush(&mut self.heights, self.res, self.extent_m, center, radius, strength, op)
         else {
             return;
         };
@@ -730,11 +921,16 @@ impl Terrain {
         for z in z0..=z1 {
             let start = (z * n + x0) as usize;
             let offset = (start * std::mem::size_of::<f32>()) as u64;
-            queue.write_buffer(
-                &self.height_buf,
-                offset,
-                bytemuck::cast_slice(&self.heights[start..start + row_len]),
-            );
+            let row = &self.heights[start..start + row_len];
+            // Widen the cached height slab from the rows we already have in hand.
+            // Only ever widened, never narrowed: recovering the true range after a
+            // Lower stroke would mean rescanning the whole field mid-drag, and a slab
+            // wider than the terrain only makes LOD selection more conservative.
+            for h in row {
+                self.height_range.0 = self.height_range.0.min(*h);
+                self.height_range.1 = self.height_range.1.max(*h);
+            }
+            queue.write_buffer(&self.height_buf, offset, bytemuck::cast_slice(row));
         }
     }
 
@@ -934,18 +1130,53 @@ impl Terrain {
         pass.set_pipeline(&self.shadow_pipeline);
         pass.set_bind_group(0, &lighting.cascade_bind_group, &[Lighting::cascade_offset(cascade)]);
         pass.set_bind_group(1, &self.terrain_bg, &[]);
-        pass.set_index_buffer(self.shadow_index_buf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..self.shadow_index_count, 0, 0..1);
+        // The same patches the colour pass draws, morphed from the same camera. A
+        // caster that disagreed with the shaded surface would put a band of acne
+        // along every level boundary.
+        pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..self.index_count, 0, 0..self.patch_count);
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, lighting: &Lighting) {
-        pass.set_pipeline(&self.pipeline);
+    /// Which view mode subsequent draws use.
+    ///
+    /// Uploaded rather than passed per draw: the shader branches on it, and a
+    /// mode change is a keypress rather than a per-frame value.
+    pub fn set_view_mode(&mut self, queue: &wgpu::Queue, mode: crate::ViewMode) {
+        if self.brush.view_mode == mode.shader_index() {
+            return;
+        }
+        self.brush.view_mode = mode.shader_index();
+        queue.write_buffer(&self.terrain_ub, 0, bytemuck::bytes_of(&self.brush));
+    }
+
+    pub fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        lighting: &Lighting,
+        clouds: &crate::clouds::Clouds,
+        mode: crate::ViewMode,
+    ) {
+        if mode.is_wireframe() {
+            pass.set_pipeline(&self.wire_pipeline);
+        } else {
+            pass.set_pipeline(&self.pipeline);
+        }
         pass.set_bind_group(0, &self.camera_bg, &[]);
         pass.set_bind_group(1, &self.terrain_bg, &[]);
         pass.set_bind_group(2, &self.material_bg, &[]);
         pass.set_bind_group(3, &lighting.bind_group, &[]);
-        pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..self.index_count, 0, 0..1);
+        pass.set_bind_group(4, &clouds.shadow_bind_group, &[]);
+
+        // On the fallback path the wireframe is a different buffer with a
+        // different length, so the index buffer has to follow the mode and not
+        // just the pipeline.
+        if mode.is_wireframe() && !self.wire_uses_polygon_line {
+            pass.set_index_buffer(self.wire_index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.wire_index_count, 0, 0..self.patch_count);
+        } else {
+            pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.index_count, 0, 0..self.patch_count);
+        }
     }
 }
 
@@ -979,6 +1210,27 @@ fn sample_bilinear(heights: &[f32], res: u32, extent_m: f32, x: f32, z: f32) -> 
 /// missed the field entirely. Free-standing so the same edit can be applied to
 /// both the rendered field and a base layer underneath it.
 #[allow(clippy::too_many_arguments)]
+/// Everything one brush dab needs beyond its geometry.
+///
+/// A struct rather than three more positional arguments: `apply_brush` already
+/// took seven, and `(.., strength, drag, noise, mode)` at a call site is a line
+/// nobody can read without going to look at the signature.
+pub struct BrushOp<'a> {
+    pub mode: SculptMode,
+    /// Cursor travel this dab, in world metres. Only [`SculptMode::Move`] reads
+    /// it; zero is a no-op for that mode.
+    pub drag: Vec2,
+    /// Pattern for [`SculptMode::Noise`]. `None` makes that mode a no-op rather
+    /// than an error, so a caller with no pattern loaded is still valid.
+    pub noise: Option<&'a terra_voxel::NoiseField>,
+}
+
+impl BrushOp<'_> {
+    pub fn new(mode: SculptMode) -> Self {
+        Self { mode, drag: Vec2::ZERO, noise: None }
+    }
+}
+
 pub fn apply_brush(
     heights: &mut [f32],
     res: u32,
@@ -986,8 +1238,16 @@ pub fn apply_brush(
     center: Vec2,
     radius: f32,
     strength: f32,
-    mode: SculptMode,
+    op: &BrushOp<'_>,
 ) -> Option<(i32, i32, i32, i32)> {
+    let mode = op.mode;
+    // Noise with no pattern loaded, or a Move with no travel, would otherwise
+    // walk the whole brush rectangle writing zeros.
+    if (mode == SculptMode::Noise && op.noise.is_none())
+        || (mode == SculptMode::Move && op.drag.length_squared() < 1e-12)
+    {
+        return None;
+    }
     let n = res as i32;
     let to_texel = |w: f32| ((w / extent_m + 0.5) * (res - 1) as f32).round() as i32;
     let r_texels = (radius / extent_m * (res - 1) as f32).ceil() as i32 + 1;
@@ -1002,25 +1262,40 @@ pub fn apply_brush(
         return None;
     }
 
+    // Drag converted to whole texels: the scratch snapshot is indexed by texel,
+    // so a sub-texel drag rounds to zero and the mode correctly does nothing
+    // until the cursor has actually moved a texel.
+    let texels_per_m = (res - 1) as f32 / extent_m;
+    let drag_texels = {
+        let d = op.drag * texels_per_m;
+        (d.x.round() as i32, d.y.round() as i32)
+    };
+    // Sampled in 3D so the pattern does not slide when the ground moves under
+    // it; the Y coordinate is the current height.
+    let noise_at = |wx: f32, wy: f32, wz: f32| -> f32 {
+        op.noise.map_or(0.0, |n| n.sample(glam::Vec3::new(wx, wy, wz), glam::Vec3::Y))
+    };
+
     // Smooth reads neighbours, so it must not observe its own writes.
     //
     // Copy ONLY the brush rectangle plus a one-texel apron. Cloning the
     // whole heightfield here allocated and freed the entire field on every
     // dab -- 67 MB per frame at the largest world size, which is enough
     // allocator churn to put the machine into memory pressure.
-    let scratch = matches!(mode, SculptMode::Smooth).then(|| {
-        let sx = (x0 - 1).max(0);
-        let sxe = (x1 + 1).min(n - 1);
-        let sz = (z0 - 1).max(0);
-        let sze = (z1 + 1).min(n - 1);
-        let w = (sxe - sx + 1) as usize;
-        let mut buf = Vec::with_capacity(w * (sze - sz + 1) as usize);
-        for z in sz..=sze {
-            let start = (z * n + sx) as usize;
-            buf.extend_from_slice(&heights[start..start + w]);
-        }
-        Scratch { x0: sx, x1: sxe, z0: sz, z1: sze, w, buf }
-    });
+    let scratch =
+        matches!(mode, SculptMode::Smooth | SculptMode::Move | SculptMode::Pinch).then(|| {
+            let sx = (x0 - 1).max(0);
+            let sxe = (x1 + 1).min(n - 1);
+            let sz = (z0 - 1).max(0);
+            let sze = (z1 + 1).min(n - 1);
+            let w = (sxe - sx + 1) as usize;
+            let mut buf = Vec::with_capacity(w * (sze - sz + 1) as usize);
+            for z in sz..=sze {
+                let start = (z * n + sx) as usize;
+                buf.extend_from_slice(&heights[start..start + w]);
+            }
+            Scratch { x0: sx, x1: sxe, z0: sz, z1: sze, w, buf }
+        });
 
     // Flatten targets the height under the brush centre, sampled once so a
     // held stroke converges instead of chasing itself.
@@ -1056,6 +1331,47 @@ pub fn apply_brush(
                     let a = (w * strength / texel_m.max(1.0)).clamp(0.0, 1.0);
                     heights[i] += (avg - heights[i]) * a;
                 }
+                // Raise toward the brush plane, never past it and never below
+                // the existing ground. That "never cuts" property is what makes
+                // repeated strokes build a shape instead of inflating one.
+                SculptMode::Clay => {
+                    let a = (w * strength / texel_m.max(1.0)).clamp(0.0, 1.0);
+                    if target > heights[i] {
+                        heights[i] += (target - heights[i]) * a;
+                    }
+                }
+                // Sample the pre-stroke field one texel back along the drag, so
+                // the surface travels with its detail rather than being averaged.
+                SculptMode::Move => {
+                    let s = scratch.as_ref().unwrap();
+                    let (dx, dz) = drag_texels;
+                    let src = s.get(x - dx, z - dz);
+                    let a = (w * strength / texel_m.max(1.0)).clamp(0.0, 1.0);
+                    heights[i] += (src - heights[i]) * a;
+                }
+                // Displacement, not a target: noise adds relief rather than
+                // converging on a height, so a held stroke keeps roughening
+                // instead of settling.
+                SculptMode::Noise => {
+                    let v = noise_at(wx, heights[i], wz);
+                    heights[i] += w * strength * v;
+                }
+                // Pull heights inward toward the brush centre. Sampling further
+                // out drags the outer profile in, which narrows a rise into a
+                // ridge; the clamp stops the sample crossing the centre.
+                SculptMode::Pinch => {
+                    let s = scratch.as_ref().unwrap();
+                    let (ox, oz) = (x - cx, z - cz);
+                    let len = ((ox * ox + oz * oz) as f32).sqrt();
+                    if len >= 1.0 {
+                        let step = 1.0f32.min(len);
+                        let sx = x + ((ox as f32 / len) * step).round() as i32;
+                        let sz = z + ((oz as f32 / len) * step).round() as i32;
+                        let outer = s.get(sx, sz);
+                        let a = (w * strength / texel_m.max(1.0)).clamp(0.0, 1.0);
+                        heights[i] += (outer - heights[i]) * a;
+                    }
+                }
             }
         }
     }
@@ -1068,42 +1384,22 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Triangle-list indices for an `n x n` quad grid with `n + 1` verts per side.
-/// Counter-clockwise when viewed from above, matching `cull_mode: Back`.
-fn build_indices(n: u32) -> (Vec<u32>, u32) {
-    let verts = n + 1;
-    let mut idx = Vec::with_capacity((n * n * 6) as usize);
-    for z in 0..n {
-        for x in 0..n {
-            let a = z * verts + x;
-            let b = a + 1;
-            let c = a + verts;
-            let d = c + 1;
-            idx.extend_from_slice(&[a, c, b, b, c, d]);
-        }
-    }
-    let count = idx.len() as u32;
-    (idx, count)
+/// Min and max of a heightfield, for the altitude term in LOD selection.
+fn height_range(heights: &[f32]) -> (f32, f32) {
+    heights.iter().fold((f32::MAX, f32::MIN), |(lo, hi), h| (lo.min(*h), hi.max(*h)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The shader block is 80 bytes. Inserting a scalar in the wrong place
+    /// The shader block is 96 bytes. Inserting a scalar in the wrong place
     /// pushes `brush_center` off its 8-byte alignment and the two sides
     /// silently disagree -- which shows up as a validation error the moment a
     /// world is open, and never before.
     #[test]
     fn uniform_matches_the_shader_block() {
-        assert_eq!(std::mem::size_of::<TerrainUniform>(), 80);
-    }
-
-    #[test]
-    fn index_buffer_covers_every_quad() {
-        let (idx, count) = build_indices(4);
-        assert_eq!(count, 4 * 4 * 6);
-        assert_eq!(idx.iter().copied().max().unwrap(), 4 * 5 + 4);
+        assert_eq!(std::mem::size_of::<TerrainUniform>(), 96);
     }
 
     #[test]
@@ -1130,5 +1426,270 @@ mod tests {
         assert_eq!(smoothstep(0.0, 1.0, -1.0), 0.0);
         assert_eq!(smoothstep(0.0, 1.0, 2.0), 1.0);
         assert!(smoothstep(0.0, 1.0, 0.25) < smoothstep(0.0, 1.0, 0.75));
+    }
+}
+
+#[cfg(test)]
+mod brush_mode_tests {
+    use super::*;
+
+    const RES: u32 = 96;
+    const EXTENT: f32 = 200.0;
+
+    fn flat() -> Vec<f32> {
+        vec![100.0f32; (RES * RES) as usize]
+    }
+
+    fn at(h: &[f32], wx: f32, wz: f32) -> f32 {
+        let t = |w: f32| {
+            (((w / EXTENT + 0.5) * (RES - 1) as f32).round() as i32).clamp(0, RES as i32 - 1)
+        };
+        h[(t(wz) * RES as i32 + t(wx)) as usize]
+    }
+
+    fn dab(h: &mut [f32], op: &BrushOp<'_>, at_xz: Vec2, radius: f32, strength: f32) {
+        apply_brush(h, RES, EXTENT, at_xz, radius, strength, op);
+    }
+
+    #[test]
+    fn clay_builds_up_but_never_cuts_down() {
+        // The property that separates Clay from Raise: it converges on the brush
+        // plane instead of adding without limit, and leaves higher ground alone.
+        let mut h = flat();
+        // Put a mound inside the brush that already stands above the plane.
+        for (i, v) in h.iter_mut().enumerate() {
+            let x = (i as u32 % RES) as i32;
+            let z = (i as u32 / RES) as i32;
+            if (x - 48).abs() < 3 && (z - 48).abs() < 3 {
+                *v = 130.0;
+            }
+        }
+        let before_mound = at(&h, 0.0, 0.0);
+
+        let mut op = BrushOp::new(SculptMode::Clay);
+        op.drag = Vec2::ZERO;
+        for _ in 0..40 {
+            dab(&mut h, &op, Vec2::ZERO, 40.0, 4.0);
+        }
+
+        let flat_ground = at(&h, 18.0, 0.0);
+        assert!(flat_ground > 100.5, "clay should fill toward the plane, got {flat_ground}");
+        assert!(
+            at(&h, 0.0, 0.0) <= before_mound + 0.01,
+            "clay must not raise ground already above the plane: {} -> {}",
+            before_mound,
+            at(&h, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn move_shifts_the_surface_along_the_drag() {
+        // A step in the terrain, dragged in +X: the step must travel, so the
+        // height just past its original edge rises.
+        let mut h = flat();
+        for (i, v) in h.iter_mut().enumerate() {
+            if (i as u32 % RES) < 48 {
+                *v = 140.0;
+            }
+        }
+        let probe = 6.0f32;
+        let before = at(&h, probe, 0.0);
+
+        let mut op = BrushOp::new(SculptMode::Move);
+        op.drag = Vec2::new(6.0, 0.0);
+        for _ in 0..12 {
+            dab(&mut h, &op, Vec2::ZERO, 40.0, 6.0);
+        }
+        let after = at(&h, probe, 0.0);
+        assert!(after > before + 2.0, "the step did not travel: {before} -> {after}");
+    }
+
+    #[test]
+    fn move_with_no_drag_is_a_no_op() {
+        // Otherwise a held Move brush that is not being dragged would slowly
+        // blur the terrain, which is Smooth's job and not what was asked for.
+        let mut h = flat();
+        h[(48 * RES + 48) as usize] = 150.0;
+        let before = h.clone();
+        let op = BrushOp::new(SculptMode::Move);
+        dab(&mut h, &op, Vec2::ZERO, 40.0, 4.0);
+        assert_eq!(h, before);
+    }
+
+    #[test]
+    fn noise_roughens_and_needs_a_pattern() {
+        let spread = |h: &[f32]| {
+            let s: Vec<f32> = (-8..8).map(|i| at(h, i as f32 * 2.0, 0.0)).collect();
+            let mean = s.iter().sum::<f32>() / s.len() as f32;
+            (s.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / s.len() as f32).sqrt()
+        };
+
+        // With no pattern the mode must do nothing rather than panic.
+        let mut none = flat();
+        let before = none.clone();
+        dab(&mut none, &BrushOp::new(SculptMode::Noise), Vec2::ZERO, 40.0, 4.0);
+        assert_eq!(none, before, "noise with no pattern must be a no-op");
+
+        let field = terra_voxel::NoiseField::procedural(7, 4, false, 14.0);
+        let mut h = flat();
+        let mut op = BrushOp::new(SculptMode::Noise);
+        op.noise = Some(&field);
+        dab(&mut h, &op, Vec2::ZERO, 40.0, 6.0);
+        assert!(spread(&h) > 0.5, "noise did not roughen: spread {}", spread(&h));
+    }
+
+    #[test]
+    fn noise_is_a_displacement_not_a_target() {
+        // A held stroke must keep adding relief rather than converging, or the
+        // amplitude slider would have no effect past the first dab.
+        let field = terra_voxel::NoiseField::procedural(3, 3, false, 14.0);
+        let mut op = BrushOp::new(SculptMode::Noise);
+        op.noise = Some(&field);
+
+        let extent_of = |dabs: u32| {
+            let mut h = flat();
+            for _ in 0..dabs {
+                dab(&mut h, &op, Vec2::ZERO, 40.0, 3.0);
+            }
+            let s: Vec<f32> = (-8..8).map(|i| at(&h, i as f32 * 2.0, 0.0)).collect();
+            s.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                - s.iter().cloned().fold(f32::INFINITY, f32::min)
+        };
+        assert!(extent_of(8) > extent_of(1) * 1.5, "{} vs {}", extent_of(8), extent_of(1));
+    }
+
+    #[test]
+    fn pinch_sharpens_a_rise() {
+        // Pinch pulls the outer profile inward, so a broad dome narrows: the
+        // centre keeps its height while the flanks drop.
+        let mut h = flat();
+        for (i, v) in h.iter_mut().enumerate() {
+            let x = (i as u32 % RES) as f32;
+            let z = (i as u32 / RES) as f32;
+            let r = ((x - 47.5).powi(2) + (z - 47.5).powi(2)).sqrt();
+            *v = 100.0 + (30.0 - r).max(0.0);
+        }
+        let sharpness = |h: &[f32]| at(h, 0.0, 0.0) - at(h, 24.0, 0.0);
+        let before = sharpness(&h);
+
+        let op = BrushOp::new(SculptMode::Pinch);
+        for _ in 0..30 {
+            dab(&mut h, &op, Vec2::ZERO, 50.0, 4.0);
+        }
+        assert!(sharpness(&h) > before, "pinch did not sharpen: {before} -> {}", sharpness(&h));
+        assert!(h.iter().all(|v| v.is_finite()), "pinch produced non-finite heights");
+    }
+
+    #[test]
+    fn every_mode_leaves_the_field_finite_and_bounded() {
+        // A blanket guard: none of the eight may produce NaN or run away, which
+        // is what a bad falloff or a division by a zero radius would do.
+        let field = terra_voxel::NoiseField::default();
+        for m in SculptMode::ALL {
+            let mut h = flat();
+            let mut op = BrushOp::new(m);
+            op.drag = Vec2::new(3.0, -2.0);
+            op.noise = Some(&field);
+            for _ in 0..25 {
+                dab(&mut h, &op, Vec2::new(5.0, -5.0), 35.0, 5.0);
+            }
+            assert!(h.iter().all(|v| v.is_finite()), "{} produced NaN", m.label());
+            let lo = h.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            assert!((-500.0..3000.0).contains(&lo), "{} lo {lo}", m.label());
+            assert!((-500.0..3000.0).contains(&hi), "{} hi {hi}", m.label());
+        }
+    }
+}
+
+#[cfg(test)]
+mod wireframe_tests {
+    use super::*;
+
+    #[test]
+    fn the_terrain_uniform_keeps_its_vectors_aligned() {
+        // The same trap that made `LayerParams` render the terrain red: WGSL
+        // aligns vectors, `repr(C)` does not, and the two disagree silently. A
+        // `vec2` needs 8 and the `vec4` array needs 16.
+        assert_eq!(std::mem::offset_of!(TerrainUniform, brush_center) % 8, 0);
+        // `morph_eye` is a vec4 and `layer_roles` an array of them, so both need 16.
+        assert_eq!(std::mem::offset_of!(TerrainUniform, morph_eye) % 16, 0);
+        assert_eq!(std::mem::offset_of!(TerrainUniform, layer_roles) % 16, 0);
+        assert_eq!(std::mem::offset_of!(TerrainUniform, layer_roles), 64);
+        assert_eq!(std::mem::size_of::<TerrainUniform>(), 96);
+    }
+
+    #[test]
+    fn the_view_mode_lands_in_the_uniform() {
+        // The shader branches on this, and the slot it uses was padding, so a
+        // mismatch would read as the wrong mode rather than as an error.
+        assert_eq!(std::mem::size_of::<TerrainUniform>(), 96);
+        for m in crate::ViewMode::ALL {
+            let u = TerrainUniform { view_mode: m.shader_index(), ..bytemuck::Zeroable::zeroed() };
+            let words: &[u32; 24] = bytemuck::cast_ref(&u);
+            // Offset 7: after extent, height_res, patch_quads, brush_radius,
+            // brush_center (two), brush_active.
+            assert_eq!(words[7], m.shader_index(), "{} landed in the wrong slot", m.label());
+        }
+    }
+}
+
+#[cfg(test)]
+mod aliasing_tests {
+    /// How many heightfield texels land in one pixel at a given view distance.
+    ///
+    /// The quantity that decides whether the terrain shimmers: once it exceeds
+    /// one, the normal is being sampled finer than the pixel can show, and the
+    /// temporal jitter puts each frame's sample somewhere different.
+    fn texels_per_pixel(dist_m: f32, world_extent_m: f32, height_res: u32, viewport_h: f32) -> f32 {
+        let fov_y = 60f32.to_radians();
+        let pixel_m = 2.0 * dist_m * (fov_y * 0.5).tan() / viewport_h;
+        let texel_m = world_extent_m / (height_res - 1) as f32;
+        pixel_m / texel_m
+    }
+
+    #[test]
+    fn zooming_out_undersamples_the_heightfield_badly() {
+        // Why zooming out shook. A 4 km world at 1024 texels is a 3.9 m texel;
+        // from 40 km one pixel spans 51 m, so thirteen texels fall inside it.
+        let close = texels_per_pixel(900.0, 4000.0, 1024, 900.0);
+        let far = texels_per_pixel(40_000.0, 4000.0, 1024, 900.0);
+        assert!(close < 1.0, "up close a pixel should be finer than a texel, got {close}");
+        assert!(far > 8.0, "far out should be badly undersampled, got {far}");
+    }
+
+    /// The fragment shader's fade, restated: full detail while a pixel is finer
+    /// than a texel, gone by the time it spans six.
+    fn detail_fade(oversample: f32) -> f32 {
+        let t = ((oversample - 1.0) / 5.0).clamp(0.0, 1.0);
+        1.0 - t * t * (3.0 - 2.0 * t)
+    }
+
+    #[test]
+    fn detail_is_kept_up_close_and_dropped_when_it_cannot_be_resolved() {
+        assert_eq!(detail_fade(0.5), 1.0, "a pixel finer than a texel keeps full detail");
+        assert_eq!(detail_fade(8.0), 0.0, "detail finer than the pixel must go");
+        // Monotonic, so there is no distance at which detail comes back.
+        let mut prev = 1.0;
+        for i in 0..=80 {
+            let f = detail_fade(i as f32 * 0.1);
+            assert!(f <= prev + 1e-6, "detail rose with distance at {}", i as f32 * 0.1);
+            prev = f;
+        }
+    }
+
+    #[test]
+    fn losing_the_bump_gains_roughness() {
+        // The trade: the surface loses a bump it could not resolve and gains the
+        // blur that bump would have averaged to. Dropping one without the other
+        // leaves a mirror-smooth distant surface that sparkles just as badly.
+        let rough_at = |oversample: f32| {
+            let base = 0.4f32;
+            let fade = detail_fade(oversample);
+            (base + (1.0 - base) * ((1.0 - fade) * 0.75)).clamp(0.03, 1.0)
+        };
+        assert!((rough_at(0.5) - 0.4).abs() < 1e-6, "up close the material is unchanged");
+        assert!(rough_at(8.0) > 0.7, "far out it must be much rougher, got {}", rough_at(8.0));
+        assert!(rough_at(8.0) <= 1.0);
     }
 }

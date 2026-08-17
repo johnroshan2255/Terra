@@ -61,14 +61,29 @@ impl RenderContext {
         if !timestamps {
             log::warn!("adapter has no TIMESTAMP_QUERY; GPU timing unavailable");
         }
+
+        // `PolygonMode::Line` is the direct way to draw the wireframe view mode.
+        // It is not in the WebGPU core feature set -- notably absent on WebGPU
+        // itself and on some mobile drivers -- so it is requested when present
+        // and the wireframe falls back to a line-list index buffer when it is
+        // not. See `terrain::Terrain::wireframe`.
+        let polygon_line = adapter.features().contains(wgpu::Features::POLYGON_MODE_LINE);
+        if !polygon_line {
+            log::info!("adapter has no POLYGON_MODE_LINE; wireframe will use a line-list buffer");
+        }
+
+        let mut features = wgpu::Features::empty();
+        if timestamps {
+            features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        if polygon_line {
+            features |= wgpu::Features::POLYGON_MODE_LINE;
+        }
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("terra-device"),
-                required_features: if timestamps {
-                    wgpu::Features::TIMESTAMP_QUERY
-                } else {
-                    wgpu::Features::empty()
-                },
+                required_features: features,
                 required_limits: adapter.limits(),
                 ..Default::default()
             })
@@ -128,6 +143,14 @@ impl RenderContext {
     /// Whether GPU timestamp queries are available on this device.
     pub fn supports_timestamps(&self) -> bool {
         self.timestamps
+    }
+
+    /// Whether `PolygonMode::Line` is available.
+    ///
+    /// When false the wireframe view mode draws a line-list index buffer
+    /// instead, which is exact and needs no optional feature.
+    pub fn supports_polygon_line(&self) -> bool {
+        self.device.features().contains(wgpu::Features::POLYGON_MODE_LINE)
     }
 
     pub fn aspect(&self) -> f32 {

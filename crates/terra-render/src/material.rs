@@ -9,11 +9,12 @@
 //! through the dirt in clumps along a transition, which is what a linear blend
 //! can never produce.
 //!
-//! Content comes from `assets/texture/`: one subfolder per material, discovered
-//! at startup (see [`crate::texture_set`]). Nothing is registered by hand -- drop
-//! a downloaded set in the folder and it is in the palette next run. When the
-//! folder is empty the layers are generated from noise instead, so a fresh
-//! clone with no downloads still renders something.
+//! Content comes from the project's own `assets/textures/`: one subfolder per
+//! material, discovered by [`crate::texture_set`]. Nothing is registered by hand
+//! and nothing ships prebuilt -- an empty folder means an empty palette, and the
+//! terrain renders as plain shaded ground until something is imported. There was
+//! a noise-generated fallback here once; it made a fresh project look furnished
+//! with materials the user had not chosen and could not edit.
 //!
 //! Layout, per layer, as two array slices:
 //!
@@ -88,6 +89,77 @@ pub fn role_of(name: &str) -> u32 {
     }
 }
 
+/// Per-layer PBR settings, editable in the material editor.
+///
+/// One tiling scale for the whole terrain was the previous arrangement, and it
+/// cannot work across a palette: gravel wants a repeat every metre or two and a
+/// cliff face wants ten, and forcing both to share a number makes one of them
+/// either blurred or visibly tiled. Everything here is per layer for that
+/// reason.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LayerParams {
+    /// Metres per texture repeat.
+    pub tiling_m: f32,
+    /// Multiplier on the tangent-space normal. 0 flattens the layer.
+    pub normal_strength: f32,
+    /// Scales the sampled roughness. Above 1 dulls, below 1 polishes.
+    pub roughness: f32,
+    /// Width of the band where this layer and its neighbour both contend in the
+    /// height blend. 0 is a hard per-texel cut.
+    pub height_blend: f32,
+    /// Parallax depth in metres. 0 disables the effect for this layer.
+    ///
+    /// This is what makes gravel read as gravel rather than as a photograph of
+    /// gravel: the height channel offsets the lookup along the view vector, so
+    /// stones occlude each other as the camera moves.
+    pub parallax_m: f32,
+    /// Multiplier on sampled ambient occlusion.
+    pub ao: f32,
+    /// Padding the shader's alignment rules demand, not ours.
+    ///
+    /// WGSL aligns a `vec3<f32>` to **16 bytes**. The six scalars above fill
+    /// 0..24, so the shader places `tint` at offset 32 while `repr(C)` would put
+    /// it at 24 -- and the shader then reads `tint.rgb` from Rust bytes 32..44,
+    /// which are `tint[2]` followed by two padding floats: `(1, 0, 0)`. Pure red.
+    ///
+    /// That is exactly what it did: the menu backdrop, which is the one terrain
+    /// with a non-empty palette, rendered blood red. A fresh project has no
+    /// materials, takes the `layer_count == 0` branch, and never reads the tint --
+    /// which is why only the start page showed it.
+    _pad0: [f32; 2],
+    /// Albedo tint, applied after sampling. At offset 32, matching WGSL.
+    pub tint: [f32; 3],
+    /// Takes the element to 48 bytes, the 16-byte stride a uniform array needs.
+    _pad1: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<LayerParams>() == 48);
+// The size was already right; the *offset* was not, and only the offset produced
+// the bug. Asserted directly so a reordering cannot reintroduce it silently.
+const _: () = assert!(std::mem::offset_of!(LayerParams, tint) == 32);
+const _: () = assert!(std::mem::offset_of!(LayerParams, ao) == 20);
+
+impl Default for LayerParams {
+    fn default() -> Self {
+        Self {
+            // 3.5 m was the single global value this replaced, and it is a
+            // reasonable starting point for most ground.
+            tiling_m: 3.5,
+            normal_strength: 1.0,
+            roughness: 1.0,
+            height_blend: 0.22,
+            // Off by default. Parallax costs a loop of samples per pixel, and a
+            // material with a flat height channel gains nothing from it.
+            parallax_m: 0.0,
+            ao: 1.0,
+            _pad0: [0.0; 2],
+            tint: [1.0, 1.0, 1.0],
+            _pad1: 0.0,
+        }
+    }
+}
+
 /// What the UI needs to show a palette entry.
 #[derive(Clone)]
 pub struct LayerInfo {
@@ -149,11 +221,30 @@ pub struct Materials {
     pub layout: wgpu::BindGroupLayout,
     /// Palette entries, parallel to the texture array layers.
     pub layers: Vec<LayerInfo>,
+    /// Editable PBR settings, parallel to `layers`.
+    pub params: Vec<LayerParams>,
+    params_buffer: wgpu::Buffer,
 }
 
 impl Materials {
     pub fn count(&self) -> u32 {
         self.layers.len() as u32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+
+    /// Push the current parameters to the GPU.
+    ///
+    /// The whole array every time: it is 8 x 48 bytes, and a partial write keyed
+    /// by index would be more code than the transfer costs.
+    pub fn upload_params(&self, queue: &wgpu::Queue) {
+        let mut padded = [LayerParams::default(); MAX_LAYERS as usize];
+        for (slot, p) in padded.iter_mut().zip(&self.params) {
+            *slot = *p;
+        }
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&padded));
     }
 }
 
@@ -167,24 +258,22 @@ impl Materials {
     /// twice.
     pub fn load(device: &wgpu::Device, queue: &wgpu::Queue, dir: &Path) -> Self {
         let dirs = texture_set::discover(dir);
-        let (baked, names) = if dirs.is_empty() {
-            log::info!("{}: no material folders found, using generated layers", dir.display());
-            (generated_layers(), generated_names())
-        } else {
-            let taken = dirs.len().min(MAX_LAYERS as usize);
-            if dirs.len() > taken {
-                log::warn!(
-                    "{} material folders found but only {taken} slots; ignoring the rest",
-                    dirs.len()
-                );
-            }
-            let dirs = &dirs[..taken];
-            let names: Vec<String> = dirs
-                .iter()
-                .map(|d| d.file_name().unwrap_or_default().to_string_lossy().to_string())
-                .collect();
-            (load_or_bake(dir, dirs), names)
-        };
+        let taken = dirs.len().min(MAX_LAYERS as usize);
+        if dirs.len() > taken {
+            log::warn!(
+                "{} material folders found but only {taken} slots; ignoring the rest",
+                dirs.len()
+            );
+        }
+        let dirs = &dirs[..taken];
+        // Names travel with their layers rather than being zipped in afterwards:
+        // a set that fails to decode is dropped, so the two lists would fall out
+        // of step and every material after the failure would show under the
+        // wrong name.
+        let (names, baked): (Vec<String>, Vec<Baked>) = load_or_bake(dir, dirs).into_iter().unzip();
+        if baked.is_empty() {
+            log::info!("{}: no materials imported yet", dir.display());
+        }
 
         let roles = assign_roles(&names);
         for (n, r) in names.iter().zip(&roles) {
@@ -273,6 +362,24 @@ impl Materials {
         let sampler = aniso("material-sampler", MATERIAL_ANISOTROPY);
         let sampler_fast = aniso("material-sampler-fast", 1);
 
+        // Always MAX_LAYERS entries, whatever the palette holds: a fixed-size
+        // uniform block means the shader can index it without a bounds check and
+        // the layout never changes when a material is imported.
+        let params: Vec<LayerParams> = vec![LayerParams::default(); layers.len()];
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("material-params"),
+            size: (MAX_LAYERS as usize * std::mem::size_of::<LayerParams>()) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        {
+            let mut padded = [LayerParams::default(); MAX_LAYERS as usize];
+            for (slot, p) in padded.iter_mut().zip(&params) {
+                *slot = *p;
+            }
+            queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&padded));
+        }
+
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("material-bgl"),
             entries: &[
@@ -308,6 +415,16 @@ impl Materials {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -331,10 +448,11 @@ impl Materials {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&sampler_fast),
                 },
+                wgpu::BindGroupEntry { binding: 4, resource: params_buffer.as_entire_binding() },
             ],
         });
 
-        Self { bind_group, layout, layers }
+        Self { bind_group, layout, layers, params, params_buffer }
     }
 }
 
@@ -342,42 +460,45 @@ impl Materials {
 // Assembling layers
 // ---------------------------------------------------------------------------
 
-fn generated_layers() -> Vec<Baked> {
-    (0..LAYER_COUNT).into_par_iter().map(bake_layer).collect()
-}
-
-fn generated_names() -> Vec<String> {
-    ["Soil", "Grass", "Rock", "Gravel", "Snow", "Mud"].iter().map(|s| s.to_string()).collect()
-}
-
 /// Decoded layers for `dirs`, from the cache when it is still valid.
-fn load_or_bake(root: &Path, dirs: &[std::path::PathBuf]) -> Vec<Baked> {
+fn load_or_bake(root: &Path, dirs: &[std::path::PathBuf]) -> Vec<(String, Baked)> {
     let key = texture_set::fingerprint(dirs, TILE);
     let cache = root.join(".cache").join(format!("materials-{key:016x}.bin"));
+    let name_of = |d: &Path| d.file_name().unwrap_or_default().to_string_lossy().to_string();
 
     if let Some(v) = read_cache(&cache, dirs.len()) {
         log::info!("materials: {} layers from cache", v.len());
-        return v;
+        return dirs.iter().map(|d| name_of(d)).zip(v).collect();
     }
 
     let t0 = std::time::Instant::now();
-    let baked: Vec<Baked> = dirs
+    // An unreadable set is dropped, not substituted. Standing in a generated
+    // layer meant the palette showed a material the user never imported, under
+    // the name of the one that failed -- so a broken download looked like a
+    // successful one with the wrong content.
+    let pairs: Vec<(String, Baked)> = dirs
         .par_iter()
-        .map(|d| match texture_set::load(d, TILE) {
-            Some(set) => bake_set(&set),
+        .filter_map(|d| match texture_set::load(d, TILE) {
+            Some(set) => Some((name_of(d), bake_set(&set))),
             None => {
-                log::error!("{}: could not read texture set, substituting soil", d.display());
-                bake_layer(SOIL)
+                log::error!("{}: could not read texture set, skipping", d.display());
+                None
             }
         })
         .collect();
-    log::info!("materials: decoded {} sets in {:.1} s", baked.len(), t0.elapsed().as_secs_f32());
+    log::info!("materials: decoded {} sets in {:.1} s", pairs.len(), t0.elapsed().as_secs_f32());
 
-    if let Err(e) = write_cache(&cache, &baked) {
-        // Not fatal: it only means the next start pays for decoding again.
-        log::warn!("{}: could not write material cache: {e}", cache.display());
+    // Only cache a complete decode. `read_cache` validates against `dirs.len()`,
+    // so writing a short list would make the cache permanently unreadable and
+    // every start would silently re-decode.
+    if pairs.len() == dirs.len() {
+        let refs: Vec<&Baked> = pairs.iter().map(|(_, b)| b).collect();
+        if let Err(e) = write_cache(&cache, &refs) {
+            // Not fatal: it only means the next start pays for decoding again.
+            log::warn!("{}: could not write material cache: {e}", cache.display());
+        }
     }
-    baked
+    pairs
 }
 
 /// Pack one decoded set into the two-array layout the shader samples.
@@ -443,201 +564,6 @@ impl Baked {
     }
 }
 
-/// A layer as a set of dials rather than a bespoke function.
-///
-/// `relief` is the one that matters most: it is the amplitude of the height
-/// channel, and therefore how aggressively this layer punches through its
-/// neighbour at a transition. Grass sits high so it grows through soil in
-/// clumps; snow sits low so it fills in around what it settles on.
-struct Recipe {
-    /// Linear albedo, and the second colour the macro variation mixes toward.
-    base: [f32; 3],
-    alt: [f32; 3],
-    /// Tiles-per-texture of the coarse colour/height variation.
-    clump: i32,
-    /// Tiles-per-texture of the fine grain.
-    grain: i32,
-    relief: f32,
-    /// How strongly the height channel darkens the albedo in its own crevices.
-    /// Cheap baked occlusion, and most of what stops a texture looking printed.
-    cavity: f32,
-    roughness: f32,
-    /// Multiplier on the derived normal. Higher reads as coarser material.
-    bump: f32,
-}
-
-fn recipe(layer: u32) -> Recipe {
-    match layer {
-        // Fine, fairly uniform earth. Low relief: it is the thing other layers
-        // break through, so it must not fight them.
-        SOIL => Recipe {
-            base: [0.135, 0.098, 0.062],
-            alt: [0.088, 0.064, 0.042],
-            clump: 5,
-            grain: 44,
-            relief: 0.34,
-            cavity: 0.45,
-            roughness: 0.92,
-            bump: 1.0,
-        },
-        // Clumpy and high-relief. This is the layer the whole height-blend
-        // exists to serve.
-        GRASS => Recipe {
-            base: [0.105, 0.150, 0.062],
-            alt: [0.062, 0.092, 0.036],
-            clump: 9,
-            grain: 60,
-            relief: 0.95,
-            cavity: 0.70,
-            roughness: 0.85,
-            bump: 1.5,
-        },
-        // Cracked and directional; the ridged basis gives fractures rather
-        // than lumps.
-        ROCK => Recipe {
-            base: [0.150, 0.147, 0.140],
-            alt: [0.088, 0.086, 0.082],
-            clump: 3,
-            grain: 26,
-            relief: 0.85,
-            cavity: 0.65,
-            roughness: 0.78,
-            bump: 1.8,
-        },
-        // Loose stones: many small, high-contrast lumps.
-        GRAVEL => Recipe {
-            base: [0.205, 0.192, 0.172],
-            alt: [0.120, 0.112, 0.100],
-            clump: 7,
-            grain: 34,
-            relief: 0.80,
-            cavity: 0.60,
-            roughness: 0.70,
-            bump: 1.6,
-        },
-        // Nearly smooth, and bright enough that any relief reads as shadow.
-        SNOW => Recipe {
-            base: [0.780, 0.810, 0.860],
-            alt: [0.700, 0.740, 0.820],
-            clump: 4,
-            grain: 20,
-            relief: 0.22,
-            cavity: 0.20,
-            roughness: 0.35,
-            bump: 0.7,
-        },
-        // Wet earth, smoothed by traffic. Low roughness is what makes a track
-        // catch the sun the way packed mud does.
-        _ => Recipe {
-            base: [0.098, 0.076, 0.052],
-            alt: [0.062, 0.048, 0.034],
-            clump: 6,
-            grain: 38,
-            relief: 0.40,
-            cavity: 0.50,
-            roughness: 0.42,
-            bump: 0.9,
-        },
-    }
-}
-
-fn bake_layer(layer: u32) -> Baked {
-    let r = recipe(layer);
-    let n = TILE as usize;
-    let seed = layer * 7919 + 13;
-
-    // Height first and on its own: the albedo and the normal are both derived
-    // from it, which is what keeps the crevices, the shading and the blend
-    // mask agreeing with each other.
-    let height: Vec<f32> = (0..n * n)
-        .into_par_iter()
-        .map(|i| {
-            let u = (i % n) as f32 / n as f32;
-            let v = (i / n) as f32 / n as f32;
-            layer_height(layer, u, v, &r, seed)
-        })
-        .collect();
-
-    // Linear albedo and the packed surface data at full resolution. Mips are
-    // box-filtered from these floats rather than from the encoded bytes, so
-    // the sRGB curve is applied once, at the end, per level.
-    let mut rgba = vec![0.0f32; n * n * 4];
-    let mut surf = vec![0.0f32; n * n * 4];
-    for i in 0..n * n {
-        let x = i % n;
-        let z = i / n;
-        let h = height[i];
-
-        let u = x as f32 / n as f32;
-        let v = z as f32 / n as f32;
-        // Macro tint, so a tile is not one flat colour at distance.
-        let t = fbm(u, v, r.clump, 3, seed ^ 0x51ED).clamp(0.0, 1.0);
-        let mut c = [0.0f32; 3];
-        for (k, ch) in c.iter_mut().enumerate() {
-            *ch = r.base[k] + (r.alt[k] - r.base[k]) * t;
-        }
-        // Bake occlusion from the layer's own height. Pits go dark; tops stay.
-        let cavity = 1.0 - r.cavity * (1.0 - h);
-        let ao = 0.55 + 0.45 * h;
-
-        // Slope of the height field, in texels, becomes the tangent normal.
-        let hx = height[z * n + (x + 1) % n] - height[z * n + (x + n - 1) % n];
-        let hz = height[((z + 1) % n) * n + x] - height[((z + n - 1) % n) * n + x];
-        let nx = -hx * r.bump * 4.0;
-        let nz = -hz * r.bump * 4.0;
-
-        rgba[i * 4] = c[0] * cavity;
-        rgba[i * 4 + 1] = c[1] * cavity;
-        rgba[i * 4 + 2] = c[2] * cavity;
-        rgba[i * 4 + 3] = h;
-
-        surf[i * 4] = nx * 0.5 + 0.5;
-        surf[i * 4 + 1] = nz * 0.5 + 0.5;
-        surf[i * 4 + 2] = (r.roughness * (0.85 + 0.3 * (1.0 - h))).clamp(0.0, 1.0);
-        surf[i * 4 + 3] = ao;
-    }
-
-    mip_chain(rgba, surf, n)
-}
-
-/// The per-layer height field, 0..1. Each material gets the basis whose shape
-/// matches how it actually sits on the ground.
-fn layer_height(layer: u32, u: f32, v: f32, r: &Recipe, seed: u32) -> f32 {
-    let coarse = fbm(u, v, r.clump, 4, seed);
-    let fine = fbm(u, v, r.grain, 3, seed ^ 0xBEEF);
-
-    let h = match layer {
-        // Clumps with blade-scale break-up, then a curve that lifts the tufts
-        // and keeps the gaps low -- exactly the profile the blend needs.
-        GRASS => {
-            let clumps = (coarse * 1.25 - 0.12).clamp(0.0, 1.0);
-            (clumps * 0.75 + fine * 0.25).powf(0.65)
-        }
-        // Ridged: the creases become fractures rather than dents.
-        ROCK => {
-            let ridged = 1.0 - (coarse * 2.0 - 1.0).abs();
-            (ridged * 0.7 + fine * 0.3).powf(1.4)
-        }
-        // Many small stones: square the fine octave to separate them.
-        GRAVEL => {
-            let stones = fine * fine * 1.6;
-            (coarse * 0.35 + stones * 0.65).clamp(0.0, 1.0)
-        }
-        // Wind-smoothed, with the fine octave almost absent.
-        SNOW => coarse * 0.85 + fine * 0.15,
-        // Earth: mostly grain, with a little large-scale unevenness, plus
-        // sparse grit sitting on top.
-        _ => {
-            let grit = (fine - 0.72).max(0.0) * 3.0;
-            (coarse * 0.4 + fine * 0.6 + grit * 0.25).clamp(0.0, 1.0)
-        }
-    };
-
-    // `relief` is applied as a contrast curve about the midpoint, so a low
-    // relief layer flattens toward 0.5 instead of toward black.
-    (0.5 + (h - 0.5) * r.relief).clamp(0.0, 1.0)
-}
-
 /// Box-filtered mip chain, encoded per level.
 fn mip_chain(rgba: Vec<f32>, surf: Vec<f32>, n: usize) -> Baked {
     let mut levels = Vec::new();
@@ -696,7 +622,7 @@ impl Baked {
 /// Cache format: a plain length-prefixed dump. It is derived data keyed by a
 /// fingerprint of its inputs, so it needs no version field -- a format change
 /// means changing TILE or the packing, both of which change the key.
-fn write_cache(path: &Path, baked: &[Baked]) -> std::io::Result<()> {
+fn write_cache(path: &Path, baked: &[&Baked]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -761,59 +687,6 @@ fn srgb_to_linear(c: f32) -> f32 {
 // about the landform; it does not govern what a square metre of dirt looks
 // like up close.
 
-fn hash(x: i32, y: i32, seed: u32) -> f32 {
-    let mut h = (x as u32).wrapping_mul(0x1657_4B0D)
-        ^ (y as u32).wrapping_mul(0x27D4_EB2D)
-        ^ seed.wrapping_mul(0x85EB_CA6B);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x2545_F491);
-    h ^= h >> 13;
-    h as f32 / u32::MAX as f32
-}
-
-/// Value noise on a lattice of `period` cells across the unit square.
-fn vnoise(u: f32, v: f32, period: i32, seed: u32) -> f32 {
-    let x = u * period as f32;
-    let y = v * period as f32;
-    let xi = x.floor();
-    let yi = y.floor();
-    let fx = x - xi;
-    let fy = y - yi;
-    // Quintic: C2 continuous, so the derived normal has no cell-edge creases.
-    let sx = fx * fx * fx * (fx * (fx * 6.0 - 15.0) + 10.0);
-    let sy = fy * fy * fy * (fy * (fy * 6.0 - 15.0) + 10.0);
-
-    let wrap = |i: i32| i.rem_euclid(period.max(1));
-    let x0 = wrap(xi as i32);
-    let y0 = wrap(yi as i32);
-    let x1 = wrap(xi as i32 + 1);
-    let y1 = wrap(yi as i32 + 1);
-
-    let a = hash(x0, y0, seed);
-    let b = hash(x1, y0, seed);
-    let c = hash(x0, y1, seed);
-    let d = hash(x1, y1, seed);
-    let top = a + (b - a) * sx;
-    let bot = c + (d - c) * sx;
-    top + (bot - top) * sy
-}
-
-/// Octave sum. Both frequency and lattice period double per octave, so every
-/// octave tiles and therefore so does the sum.
-fn fbm(u: f32, v: f32, period: i32, octaves: u32, seed: u32) -> f32 {
-    let mut sum = 0.0;
-    let mut amp = 1.0;
-    let mut norm = 0.0;
-    let mut p = period.max(1);
-    for o in 0..octaves {
-        sum += amp * vnoise(u, v, p, seed.wrapping_add(o * 131));
-        norm += amp;
-        amp *= 0.5;
-        p *= 2;
-    }
-    sum / norm
-}
-
 // --- encoding --------------------------------------------------------------
 
 fn downsample(src: &[f32], w: usize) -> Vec<f32> {
@@ -854,56 +727,81 @@ fn linear_to_srgb(c: f32) -> f32 {
 mod tests {
     use super::*;
 
+    // The tests that used to live here -- seam tiling, per-layer relief, and
+    // "grass stands prouder than soil" -- all exercised the noise generator that
+    // produced the built-in layers. That generator is gone, so they are too:
+    // there is nothing to assert about content the user has not imported yet.
+    // What survives is the part that is still ours to get wrong.
+
     #[test]
-    fn noise_tiles_across_the_seam() {
-        // The left and right edges must agree, or every tile boundary draws a
-        // line across the terrain.
-        for i in 0..64 {
-            let v = i as f32 / 64.0;
-            let left = fbm(0.0, v, 8, 4, 99);
-            let right = fbm(1.0, v, 8, 4, 99);
-            assert!((left - right).abs() < 1e-4, "seam at v={v}: {left} vs {right}");
-            let top = fbm(v, 0.0, 8, 4, 99);
-            let bottom = fbm(v, 1.0, 8, 4, 99);
-            assert!((top - bottom).abs() < 1e-4, "seam at u={v}: {top} vs {bottom}");
-        }
+    fn an_empty_folder_yields_an_empty_palette() {
+        // The whole point of removing the fallback: a project with no imports
+        // must have no materials, not six invented ones.
+        let tmp = std::env::temp_dir().join("terra-empty-materials");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(texture_set::discover(&tmp).is_empty());
+        assert!(load_or_bake(&tmp, &[]).is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]
-    fn every_layer_has_relief_to_blend_with() {
-        // A layer whose height is constant cannot punch through anything, and
-        // the whole stack degrades to a linear cross-fade.
-        for layer in 0..LAYER_COUNT {
-            let r = recipe(layer);
-            let mut lo = f32::MAX;
-            let mut hi = f32::MIN;
-            for i in 0..4096 {
-                let u = (i % 64) as f32 / 64.0;
-                let v = (i / 64) as f32 / 64.0;
-                let h = layer_height(layer, u, v, &r, layer * 7919 + 13);
-                assert!((0.0..=1.0).contains(&h), "layer {layer} height out of range: {h}");
-                lo = lo.min(h);
-                hi = hi.max(h);
-            }
-            assert!(hi - lo > 0.1, "layer {layer} is nearly flat: {lo}..{hi}");
-        }
+    fn roles_are_claimed_once_and_then_paint_only() {
+        // Two grass sets placed automatically would fight over the same ground,
+        // so the first claims the role and the second becomes a brush.
+        let names = ["Grass001".to_string(), "MossyGrass".to_string(), "Rock017".to_string()];
+        let roles = assign_roles(&names);
+        assert_eq!(roles[0], GRASS);
+        assert_eq!(roles[1], ROLE_NONE, "the second grass must not also be automatic");
+        assert_eq!(roles[2], ROCK);
     }
 
     #[test]
-    fn grass_stands_prouder_than_soil() {
-        // The premise of the stack: at a boundary, grass wins.
-        let mean = |layer: u32| {
-            let r = recipe(layer);
-            let seed = layer * 7919 + 13;
-            let n = 64;
-            let mut sum = 0.0;
-            for i in 0..n * n {
-                let u = (i % n) as f32 / n as f32;
-                let v = (i / n) as f32 / n as f32;
-                sum += layer_height(layer, u, v, &r, seed);
-            }
-            sum / (n * n) as f32
-        };
-        assert!(mean(GRASS) > mean(SOIL), "grass must sit above soil to break through it");
+    fn layer_params_matches_the_wgsl_layout() {
+        // The bug this exists for: WGSL aligns `vec3<f32>` to 16 bytes, so `tint`
+        // sits at offset 32 in the shader. `repr(C)` put it at 24, and the shader
+        // read `(tint[2], pad, pad)` = `(1, 0, 0)` -- the terrain came out pure
+        // red, and only on the menu backdrop, because that is the one terrain with
+        // a non-empty palette.
+        //
+        // Offsets, not just the size. The size was already correct.
+        assert_eq!(std::mem::offset_of!(LayerParams, tiling_m), 0);
+        assert_eq!(std::mem::offset_of!(LayerParams, normal_strength), 4);
+        assert_eq!(std::mem::offset_of!(LayerParams, roughness), 8);
+        assert_eq!(std::mem::offset_of!(LayerParams, height_blend), 12);
+        assert_eq!(std::mem::offset_of!(LayerParams, parallax_m), 16);
+        assert_eq!(std::mem::offset_of!(LayerParams, ao), 20);
+        assert_eq!(std::mem::offset_of!(LayerParams, tint), 32, "the vec3 must be 16-aligned");
+        assert_eq!(std::mem::size_of::<LayerParams>(), 48);
+    }
+
+    #[test]
+    fn a_default_layer_reads_as_untinted_through_the_shader_layout() {
+        // Read the bytes the way the shader does -- three floats from offset 32 --
+        // rather than through the Rust field. Reading the field would have passed
+        // while the shader saw red.
+        let p = LayerParams::default();
+        let bytes = bytemuck::bytes_of(&p);
+        let tint: &[f32] = bytemuck::cast_slice(&bytes[32..44]);
+        assert_eq!(tint, [1.0, 1.0, 1.0], "the shader sees {tint:?}, not white");
+    }
+
+    #[test]
+    fn every_vector_member_sits_on_a_sixteen_byte_boundary() {
+        // The general rule, stated so the next vector added to this struct is
+        // checked by something rather than by whoever remembers. `tint` is the
+        // only one today; extend the list when another arrives.
+        const VECTOR_OFFSETS: &[usize] = &[std::mem::offset_of!(LayerParams, tint)];
+        assert!(
+            VECTOR_OFFSETS.iter().all(|o| o.is_multiple_of(16)),
+            "a vector member is misaligned: {VECTOR_OFFSETS:?}"
+        );
+    }
+
+    #[test]
+    fn role_labels_cover_every_role() {
+        for r in [SOIL, GRASS, ROCK, GRAVEL, SNOW, MUD, ROLE_NONE] {
+            assert!(!role_label(r).is_empty());
+        }
     }
 }

@@ -15,7 +15,12 @@ pub struct Sky {
 }
 
 impl Sky {
-    pub fn new(ctx: &RenderContext, lighting: &crate::lighting::Lighting) -> Self {
+    pub fn new(
+        ctx: &RenderContext,
+        lighting: &crate::lighting::Lighting,
+        env: &crate::environment::EnvironmentGpu,
+        clouds: &crate::clouds::Clouds,
+    ) -> Self {
         let device = &ctx.device;
 
         let camera_ub = device.create_buffer(&wgpu::BufferDescriptor {
@@ -53,8 +58,10 @@ impl Sky {
             source: wgpu::ShaderSource::Wgsl(
                 format!(
                     "{}
+{}
 {}",
                     include_str!("../../../assets/shaders/common/lighting.wgsl"),
+                    include_str!("../../../assets/shaders/common/atmosphere.wgsl"),
                     include_str!("../../../assets/shaders/render/sky.wgsl"),
                 )
                 .into(),
@@ -63,7 +70,12 @@ impl Sky {
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("sky-layout"),
-            bind_group_layouts: &[Some(&bgl), Some(&lighting.layout)],
+            bind_group_layouts: &[
+                Some(&bgl),
+                Some(&lighting.layout),
+                Some(&env.layout),
+                Some(&clouds.sample_layout),
+            ],
             immediate_size: 0,
         });
 
@@ -112,10 +124,18 @@ impl Sky {
         queue.write_buffer(&self.camera_ub, 0, bytemuck::bytes_of(&cam.uniform(aspect)));
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, lighting: &crate::lighting::Lighting) {
+    pub fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        lighting: &crate::lighting::Lighting,
+        env: &crate::environment::EnvironmentGpu,
+        clouds: &crate::clouds::Clouds,
+    ) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_bind_group(1, &lighting.bind_group, &[]);
+        pass.set_bind_group(2, &env.bind_group, &[]);
+        pass.set_bind_group(3, clouds.sample_bind_group(), &[]);
         pass.draw(0..3, 0..1);
     }
 }

@@ -5,10 +5,11 @@
 
 pub mod camera;
 pub mod cdlod;
+pub mod clouds;
 pub mod context;
-pub mod grass;
-pub mod instancing;
+pub mod environment;
 pub mod hiz;
+pub mod instancing;
 pub mod lighting;
 pub mod material;
 pub mod mesh;
@@ -19,11 +20,13 @@ pub mod stats;
 pub mod taa;
 pub mod terrain;
 pub mod texture_set;
+pub mod view_mode;
 pub mod volumetrics;
 
 pub use camera::Camera;
+pub use clouds::Clouds;
 pub use context::RenderContext;
-pub use grass::{Grass, GrassSettings};
+pub use environment::{CloudQuality, Environment, EnvironmentGpu, EnvironmentUniform, ToneMapper};
 pub use lighting::{Lighting, ShadowQuality, SkySettings, Sun};
 pub use material::Materials;
 pub use mesh::{Instance, MeshRenderer};
@@ -33,4 +36,5 @@ pub use sky::Sky;
 pub use stats::{FrameStats, GpuTimer, Ring};
 pub use taa::Taa;
 pub use terrain::{SculptMode, Terrain};
+pub use view_mode::ViewMode;
 pub use volumetrics::{FogSettings, FroxelGrids, Volumetrics};

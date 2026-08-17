@@ -40,6 +40,25 @@ const MAX_INSTANCES: usize = 300_000;
 /// 12k-triangle tree is already 240 M triangles a frame before culling.
 const MAX_TRIS_PER_SPECIES: usize = 6_000;
 
+/// Palette slots. Eight is what the UI grid shows and what the density masks cost:
+/// one `DENSITY_RES` byte mask each, so the ceiling is memory, not a shader limit.
+const MAX_SPECIES: usize = 8;
+
+/// Tag at the head of a saved foliage file.
+///
+/// Added when `Rules` grew the Unreal-shaped fields. The previous format had no
+/// header at all, so without this an old file's first four bytes -- a species count --
+/// would be read as a version and the rest as nonsense floats. With it, an old file is
+/// recognised, refused, and the species keep their defaults.
+const FOLIAGE_MAGIC: [u8; 4] = *b"TFOL";
+const FOLIAGE_VERSION: u32 = 2;
+
+/// Floats in one species' rules, in the order `encode_rules` writes them.
+const FLOAT_FIELDS: usize = 14;
+
+/// Bytes one species' rules occupy: the floats, three bools, one seed.
+const RULES_BYTES: usize = FLOAT_FIELDS * 4 + 3 + 4;
+
 /// Strip the resolution suffix downloads carry, so the palette reads as names.
 fn pretty_name(file_stem: &str) -> String {
     let base = file_stem
@@ -83,38 +102,90 @@ fn default_height(name: &str) -> f32 {
     }
 }
 
-/// Everything about how one species is placed. Serialised with the world;
-/// the instances themselves never are.
+/// Everything about how one species is placed. Serialised with the world; the
+/// instances themselves never are.
+///
+/// Field for field this is Unreal's Foliage Type, including the units, because the
+/// units are half the meaning: a slope stated in degrees is something you can reason
+/// about from a screenshot, and the same slope as an abstract 0..1 is not.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rules {
     /// Instances per hectare at full painted density.
     pub density: f32,
+    /// Minimum metres between two instances -- Unreal's Radius.
+    ///
+    /// Density alone cannot express "sparse but never touching": raising density
+    /// packs instances until they interpenetrate, and lowering it thins the whole
+    /// distribution. This sets a floor on the spacing independently.
+    pub radius_m: f32,
+    /// Real-world height of one instance, in metres, before the scale variation
+    /// below is applied.
+    ///
+    /// The size control the tool was missing. Every imported mesh is normalised to one
+    /// metre tall at load, so this *is* the instance's height and the number in the
+    /// panel is the number on screen. Previously the height came from a guess about the
+    /// file name and could not be changed at all: an asset the guess did not recognise
+    /// arrived 1.2 m tall whatever it actually was, and the only recourse was to abuse
+    /// the scale range.
+    pub height_m: f32,
+    /// Random size variation, as a multiple of `height_m`. Unreal's Scale min/max.
     pub scale_min: f32,
     pub scale_max: f32,
-    /// 0 = always upright, 1 = fully normal-aligned. Trees want near zero --
-    /// a tree grows toward the light, not perpendicular to the hillside -- and
-    /// rocks want most of the way up.
-    pub align_to_normal: f32,
-    /// Steepest ground, as the same 0..1 slope the terrain shader uses.
-    pub slope_max: f32,
+
+    /// Tilt instances to stand perpendicular to the ground rather than straight up.
+    ///
+    /// A bool, matching Unreal, and off by default -- which is the "point to sky"
+    /// behaviour. It matters most on exactly the ground that makes it visible: on a
+    /// cliff face, an aligned tree grows sideways out of the rock, while an unaligned
+    /// one stands vertically as a real tree does, because a tree grows toward the
+    /// light and not perpendicular to the hillside. Rocks and ground cover want the
+    /// opposite, which is why it is per species.
+    pub align_to_normal: bool,
+    /// Cap on that tilt, in degrees from vertical. Unreal's Align Max Angle.
+    ///
+    /// Alignment on a 70-degree cliff would lay an instance almost horizontal; this
+    /// is how a species leans into moderate ground without falling over on severe
+    /// ground. Ignored entirely when `align_to_normal` is off.
+    pub align_max_angle_deg: f32,
+    /// Spin each instance to a random heading. Unreal's Random Yaw.
+    ///
+    /// Wanted for anything organic and unwanted for anything with a facing --
+    /// a fence post, a sign, a row of vines.
+    pub random_yaw: bool,
+    /// Extra random tilt in degrees, applied after alignment. Unreal's Random Pitch
+    /// Angle. A few degrees stops a stand of trees looking like a comb.
+    pub random_pitch_deg: f32,
+
+    /// Shallowest ground this species will grow on, in degrees. Unreal's Ground
+    /// Slope Angle minimum.
+    ///
+    /// Not redundant with the maximum: a minimum is what puts a species *only* on
+    /// cliffs, which is otherwise impossible to express.
+    pub slope_min_deg: f32,
+    /// Steepest ground, in degrees. 90 accepts a vertical face.
+    pub slope_max_deg: f32,
     pub altitude_min: f32,
     pub altitude_max: f32,
-    /// Sunk into the ground by this fraction of the instance's height, so a
-    /// rock beds in instead of resting on the surface like a prop.
-    pub sink: f32,
+    /// Metres to shift each instance vertically. Unreal's Z Offset.
+    ///
+    /// Negative beds an instance into the ground, which is what stops a rock from
+    /// resting on the surface like a dropped prop. In metres rather than the old
+    /// fraction-of-height, so the number means the same thing for a 14 m tree and a
+    /// 0.3 m tuft.
+    pub z_offset_m: f32,
+
     /// Whether this species casts. Ground cover casting into a shadow map that
     /// covers hundreds of metres produces noise, not shadows.
     pub cast_shadow: bool,
-    /// Radius of the collider stand-in, as a fraction of the instance's
-    /// height. Zero means the species is not solid -- grass and ferns should
-    /// not stop a car.
+    /// Radius of the collider stand-in, as a fraction of the instance's height. Zero
+    /// means the species is not solid -- grass and ferns should not stop a car.
     pub collide_radius: f32,
     /// Metres beyond which instances stop being drawn.
     ///
-    /// The lever that makes scatter affordable. Without it a bush 3 km away
-    /// costs exactly what one at your feet costs, and the whole map is
-    /// submitted every frame. Small props can be culled hard because nobody
-    /// can resolve them anyway; a skyline of trees cannot.
+    /// The lever that makes scatter affordable. Without it a bush 3 km away costs
+    /// exactly what one at your feet costs, and the whole map is submitted every
+    /// frame. Small props can be culled hard because nobody can resolve them anyway;
+    /// a skyline of trees cannot.
     pub cull_distance: f32,
     pub seed: u32,
 }
@@ -123,18 +194,87 @@ impl Default for Rules {
     fn default() -> Self {
         Self {
             density: 40.0,
+            radius_m: 0.0,
+            height_m: 2.0,
             scale_min: 0.8,
             scale_max: 1.35,
-            align_to_normal: 0.15,
-            slope_max: 0.55,
+            // Off, so an imported mesh stands up straight on any ground until asked
+            // to do otherwise. Unreal's default, and the safe one: a mesh authored
+            // upright looks right upright, and looks broken lying on a slope.
+            align_to_normal: false,
+            align_max_angle_deg: 45.0,
+            random_yaw: true,
+            random_pitch_deg: 3.0,
+            slope_min_deg: 0.0,
+            slope_max_deg: 40.0,
             altitude_min: -10_000.0,
             altitude_max: 10_000.0,
-            sink: 0.04,
+            z_offset_m: 0.0,
             collide_radius: 0.0,
             cast_shadow: true,
             cull_distance: 900.0,
             seed: 1,
         }
+    }
+}
+
+impl Rules {
+    /// The slope acceptance test, as a surface normal's `y` component.
+    ///
+    /// Kept beside the fields because the conversion is the easy thing to get
+    /// backwards: a *larger* slope angle is a *smaller* normal `y`, so the maximum
+    /// angle becomes the minimum `y` and the comparison inverts.
+    pub fn accepts_slope(&self, normal_y: f32) -> bool {
+        let angle_deg = normal_y.clamp(-1.0, 1.0).acos().to_degrees();
+        angle_deg >= self.slope_min_deg - 1e-3 && angle_deg <= self.slope_max_deg + 1e-3
+    }
+
+    /// Orientation for one instance on ground with this `normal`.
+    ///
+    /// `hash` is the cell's own random word, so the result is reproducible from the
+    /// seed and no instance needs storing.
+    ///
+    /// Order matters and is Unreal's: align the up-axis first, then apply random
+    /// pitch, then yaw *about the instance's own new up*. Yawing first and aligning
+    /// second would turn the yaw into a lean whose direction depends on the slope,
+    /// which reads as instances all leaning downhill.
+    pub fn orientation(&self, normal: Vec3, hash: u32) -> Quat {
+        let up = if self.align_to_normal {
+            // Clamp the tilt to the configured angle. Slerping toward the normal by a
+            // ratio would look similar and be wrong: it would let a 70-degree cliff
+            // still tilt an instance 35 degrees under a 20-degree cap.
+            let tilt_deg = normal.y.clamp(-1.0, 1.0).acos().to_degrees();
+            let cap = self.align_max_angle_deg.max(0.0);
+            if tilt_deg <= cap + 1e-4 {
+                Quat::from_rotation_arc(Vec3::Y, normal)
+            } else if tilt_deg > 1e-4 {
+                Quat::from_rotation_arc(Vec3::Y, normal.normalize_or(Vec3::Y))
+                    .normalize()
+                    .slerp(Quat::IDENTITY, 1.0 - cap / tilt_deg)
+            } else {
+                Quat::IDENTITY
+            }
+        } else {
+            // Point to sky: the instance's up-axis is world up, whatever the ground
+            // beneath it does. On a cliff this is the difference between a tree
+            // growing out of the rock face and one standing on the ledge.
+            Quat::IDENTITY
+        };
+
+        let mut rot = up;
+        if self.random_pitch_deg > 0.0 {
+            // Two words: one for how far, one for which way, or every instance would
+            // tilt in the same direction.
+            let amount = (hash & 0xFFFF) as f32 / 65535.0 * 2.0 - 1.0;
+            let dir = ((hash >> 16) & 0xFFFF) as f32 / 65535.0 * std::f32::consts::TAU;
+            let axis = Vec3::new(dir.cos(), 0.0, dir.sin());
+            rot *= Quat::from_axis_angle(axis, amount * self.random_pitch_deg.to_radians());
+        }
+        if self.random_yaw {
+            let yaw = (hash.rotate_left(11) & 0xFFFF) as f32 / 65535.0 * std::f32::consts::TAU;
+            rot *= Quat::from_rotation_y(yaw);
+        }
+        rot.normalize()
     }
 }
 
@@ -148,8 +288,6 @@ pub struct Species {
     /// asks once per species per frame.
     painted: bool,
     pub color: Vec3,
-    /// Height of the source mesh in metres, after import normalisation.
-    pub height_m: f32,
     /// Palette preview, RGBA, `THUMB` square.
     pub thumbnail: Vec<u8>,
     mesh: Mesh,
@@ -302,13 +440,44 @@ impl Scatter {
             cache: None,
         });
 
+        let mut me = Self {
+            species: Vec::new(),
+            props: Vec::new(),
+            props_buf: None,
+            prop_runs: Vec::new(),
+            props_dirty: false,
+            pipeline,
+            cull_bgl,
+        };
+        me.reload(device, queue, meshes, dir);
+        me
+    }
+
+    /// Rebuild the palette from `dir`, keeping the pipeline and its layout.
+    ///
+    /// Separate from [`Self::load`] because the palette changes during a session and
+    /// the pipeline does not: a model imported through the content browser has to
+    /// appear without restarting, which for a content browser is the difference
+    /// between the import working and not.
+    ///
+    /// Painting is *not* carried across. Density masks are keyed by species name and
+    /// restored from the world file by [`Self::restore`]; guessing which of the new
+    /// entries inherits an old mask would eventually hand one species' forest to
+    /// another.
+    pub fn reload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        meshes: &MeshRenderer,
+        dir: &std::path::Path,
+    ) {
         let files = terra_assets::mesh::discover(dir);
         let mut species = Vec::new();
 
         // Decode, decimate and preview each model on its own thread. Eight
         // scanned assets is seconds of work and none of it touches the others;
         // only the GPU upload has to be serial.
-        let decoded: Vec<(String, terra_assets::MeshData, f32, Rules)> = files
+        let decoded: Vec<(String, terra_assets::MeshData, Rules)> = files
             .par_iter()
             .filter_map(|path| {
                 let name = path
@@ -322,8 +491,11 @@ impl Scatter {
                         // source density is not possible, and the detail is gone
                         // by the second mip regardless.
                         data.decimate(MAX_TRIS_PER_SPECIES);
-                        let height = default_height(&name);
-                        data.normalize_height(height);
+                        // One metre, always. That makes an instance's scale factor its
+                        // height in metres, so `Rules::height_m` is the single place
+                        // size is decided and the collider maths needs no per-species
+                        // constant to multiply by.
+                        data.normalize_height(1.0);
                         if data.triangle_count() < raw {
                             log::info!(
                                 "model '{name}': {raw} -> {} triangles",
@@ -332,8 +504,11 @@ impl Scatter {
                         } else {
                             log::info!("model '{name}': {raw} triangles");
                         }
-                        let rules = guess_rules(path);
-                        Some((pretty_name(&name), data, height, rules))
+                        let mut rules = guess_rules(path);
+                        // The name-based height is now a starting value the user can
+                        // change, not a fixed property of the import.
+                        rules.height_m = default_height(&name);
+                        Some((pretty_name(&name), data, rules))
                     }
                     Err(e) => {
                         log::error!("{e:#}");
@@ -343,38 +518,33 @@ impl Scatter {
             })
             .collect();
 
-        for (name, data, height, rules) in decoded {
-            species.push(Species::new(device, queue, meshes, name, data, height, rules));
+        for (name, data, rules) in decoded {
+            species.push(Species::new(device, queue, meshes, name, data, rules));
         }
 
+        // No fallback. An empty folder yields an empty palette, and the Foliage tool
+        // says so rather than quietly filling itself with engine-made trees -- which
+        // is what it used to do, and what made "nothing ships prebuilt" untrue for
+        // meshes even after it was true for textures.
+        //
+        // Sorted by name so the palette order, and therefore the index the world file
+        // remembers, does not depend on the order the filesystem happened to list.
+        species.sort_by_key(|s| s.name.to_lowercase());
+        species.truncate(MAX_SPECIES);
         if species.is_empty() {
-            log::info!("{}: no models found, using generated species", dir.display());
-            for b in terra_assets::Builtin::ALL {
-                let mut data = b.build();
-                data.normalize_height(b.height_m());
-                let rules = builtin_rules(b);
-                species.push(Species::new(
-                    device,
-                    queue,
-                    meshes,
-                    b.name().into(),
-                    data,
-                    b.height_m(),
-                    rules,
-                ));
-            }
+            log::info!("{}: no models, foliage palette is empty", dir.display());
+        } else {
+            log::info!("{}: {} species", dir.display(), species.len());
         }
 
-        species.truncate(8);
-        Self {
-            species,
-            props: Vec::new(),
-            props_buf: None,
-            prop_runs: Vec::new(),
-            props_dirty: false,
-            pipeline,
-            cull_bgl,
-        }
+        // Props reference species by index, and those indices have just moved.
+        // Dropping them is wrong and keeping them blindly is worse; the editor
+        // re-resolves placed props by species *name* after a reload, which is why this
+        // clears rather than remaps.
+        self.props.clear();
+        self.prop_runs.clear();
+        self.props_dirty = true;
+        self.species = species;
     }
 
     // --- hand-placed props ---
@@ -408,8 +578,8 @@ impl Scatter {
             let Some(sp) = self.species.get(p.species) else { continue };
             // Centre the sphere on the mesh's middle, not its base, or tall
             // props are only clickable around their feet.
-            let centre = p.pos + Vec3::Y * (sp.height_m * p.scale * 0.5);
-            let radius = (sp.radius * p.scale).max(sp.height_m * p.scale * 0.5);
+            let centre = p.pos + Vec3::Y * (p.scale * 0.5);
+            let radius = (sp.radius * p.scale).max(p.scale * 0.5);
 
             let to = centre - origin;
             let along = to.dot(dir);
@@ -721,7 +891,6 @@ impl Species {
         meshes: &MeshRenderer,
         name: String,
         data: MeshData,
-        height_m: f32,
         rules: Rules,
     ) -> Self {
         let radius = data.bounding_radius();
@@ -735,7 +904,6 @@ impl Species {
             density: vec![0; (DENSITY_RES * DENSITY_RES) as usize],
             painted: false,
             color,
-            height_m,
             thumbnail,
             mesh: meshes.upload_mesh(device, queue, &data),
             radius,
@@ -768,7 +936,22 @@ impl Species {
         if wanted == 0 {
             return None;
         }
-        let side = (wanted as f32).sqrt().ceil().max(1.0) as u32;
+        let mut side = (wanted as f32).sqrt().ceil().max(1.0) as u32;
+
+        // Enforce the minimum spacing by coarsening the grid, because one cell
+        // produces at most one instance and a cell is jittered only within itself.
+        // That makes `radius_m` a guarantee rather than a rejection pass: no instance
+        // can land closer than one cell to another, so nothing has to be thrown away
+        // after the fact and the placement stays a pure function of the coordinate.
+        //
+        // The jitter within a cell means two neighbours can still end up nearer than
+        // the full cell width -- worst case they meet at a shared corner -- so the
+        // cell is sized at `radius_m`, not `radius_m / 2`, to keep the typical
+        // spacing at the requested figure.
+        if self.rules.radius_m > 0.0 {
+            let max_side = (extent / self.rules.radius_m).floor().max(1.0) as u32;
+            side = side.min(max_side);
+        }
         Some((side, extent / side as f32))
     }
 
@@ -813,21 +996,18 @@ impl Species {
             return None;
         }
         let normal = terrain.normal_at(x, z);
-        if 1.0 - normal.y.clamp(0.0, 1.0) > self.rules.slope_max {
+        if !self.rules.accepts_slope(normal.y) {
             return None;
         }
 
         let r2 = hash3(gx, gz, self.rules.seed.wrapping_add(31));
         let s01 = (r2 & 0xFFFF) as f32 / 65535.0;
-        let scale = self.rules.scale_min + (self.rules.scale_max - self.rules.scale_min) * s01;
-        let yaw = ((r2 >> 16) & 0xFFFF) as f32 / 65535.0 * std::f32::consts::TAU;
+        // The mesh is one metre tall, so the scale factor *is* the height in metres.
+        let variation = self.rules.scale_min + (self.rules.scale_max - self.rules.scale_min) * s01;
+        let scale = self.rules.height_m * variation;
 
-        // Lean toward the surface normal by the configured amount.
-        let upright = Quat::from_rotation_y(yaw);
-        let lean = Quat::from_rotation_arc(Vec3::Y, normal);
-        let rot = Quat::IDENTITY.slerp(lean, self.rules.align_to_normal) * upright;
-
-        let pos = Vec3::new(x, y - self.height_m * scale * self.rules.sink, z);
+        let rot = self.rules.orientation(normal, hash3(gx, gz, self.rules.seed.wrapping_add(101)));
+        let pos = Vec3::new(x, y + self.rules.z_offset_m, z);
         Some((pos, scale, rot))
     }
 
@@ -858,10 +1038,10 @@ impl Species {
         let r2 = radius * radius;
         for gz in z0..=z1 {
             for gx in x0..=x1 {
-                if let Some((pos, scale, rot)) = self.place_at(terrain, gx, gz, step, extent) {
-                    if (pos.x - centre.x).powi(2) + (pos.z - centre.z).powi(2) <= r2 {
-                        f(pos, scale, rot);
-                    }
+                if let Some((pos, scale, rot)) = self.place_at(terrain, gx, gz, step, extent)
+                    && (pos.x - centre.x).powi(2) + (pos.z - centre.z).powi(2) <= r2
+                {
+                    f(pos, scale, rot);
                 }
             }
         }
@@ -978,63 +1158,63 @@ impl Species {
     }
 }
 
-/// Sensible starting rules for a generated species.
-fn builtin_rules(b: terra_assets::Builtin) -> Rules {
-    use terra_assets::Builtin as B;
-    match b {
-        // Trees stand up regardless of the hillside and give up on steep ground.
-        B::PineTree => {
-            Rules {
-                density: 22.0,
-                align_to_normal: 0.08,
-                slope_max: 0.5,
-                // Trees make the skyline; culling them at the default distance
-                // pops a whole ridgeline in and out as you turn.
-                cull_distance: 1800.0,
-                collide_radius: 0.035,
-                ..Default::default()
-            }
-        }
-        B::BroadleafTree => Rules {
-            density: 14.0,
-            align_to_normal: 0.06,
-            slope_max: 0.42,
-            cull_distance: 1800.0,
-            ..Default::default()
-        },
-        // Rocks bed into the ground and do not care how steep it is.
-        B::Rock => Rules {
-            density: 30.0,
-            cull_distance: 500.0,
-            collide_radius: 0.45,
-            align_to_normal: 0.75,
-            slope_max: 0.95,
-            sink: 0.28,
-            scale_min: 0.5,
-            scale_max: 2.2,
-            ..Default::default()
-        },
-        B::Bush => Rules {
-            density: 55.0,
-            align_to_normal: 0.4,
-            slope_max: 0.6,
-            cull_distance: 380.0,
-            ..Default::default()
-        },
-    }
-}
-
-/// Guess rules for an imported model from its file name, the same way material
-/// roles are guessed. Wrong guesses cost one slider drag.
+/// Starting rules for a newly imported mesh, guessed from its file name.
+///
+/// The same trick the material loader uses for roles, and for the same reason: the
+/// alternative is that every import lands on one set of numbers and the user tunes
+/// six sliders before seeing anything sensible. A wrong guess costs one slider drag,
+/// and an unrecognised name simply gets the defaults.
+///
+/// These are starting points, not presets in the sense that was removed -- no
+/// geometry is invented, and nothing appears in the palette that the user did not
+/// import.
 fn guess_rules(path: &std::path::Path) -> Rules {
     let n = path.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
     let has = |keys: &[&str]| keys.iter().any(|k| n.contains(k));
-    if has(&["rock", "stone", "boulder", "cliff"]) {
-        builtin_rules(terra_assets::Builtin::Rock)
-    } else if has(&["bush", "shrub", "fern", "grass", "plant"]) {
-        builtin_rules(terra_assets::Builtin::Bush)
-    } else if has(&["tree", "pine", "spruce", "oak", "birch"]) {
-        builtin_rules(terra_assets::Builtin::PineTree)
+
+    if has(&["rock", "stone", "boulder", "pebble"]) {
+        // Rocks bed into the ground, sit at any angle, and do not care how steep it
+        // is -- the one thing that genuinely wants normal alignment.
+        Rules {
+            density: 30.0,
+            align_to_normal: true,
+            align_max_angle_deg: 60.0,
+            random_pitch_deg: 12.0,
+            slope_max_deg: 75.0,
+            z_offset_m: -0.5,
+            scale_min: 0.5,
+            scale_max: 2.2,
+            cull_distance: 500.0,
+            collide_radius: 0.45,
+            ..Default::default()
+        }
+    } else if has(&["bush", "shrub", "fern", "grass", "plant", "weed", "flower"]) {
+        Rules {
+            density: 55.0,
+            align_to_normal: true,
+            align_max_angle_deg: 25.0,
+            random_pitch_deg: 8.0,
+            slope_max_deg: 40.0,
+            cull_distance: 380.0,
+            // Ground cover casting into a cascade that spans hundreds of metres is
+            // noise, not shadow.
+            cast_shadow: false,
+            ..Default::default()
+        }
+    } else if has(&["tree", "pine", "spruce", "oak", "birch", "palm", "trunk", "log"]) {
+        Rules {
+            density: 22.0,
+            // Upright: a tree grows toward the light. This is the case the "point to
+            // sky" default exists for.
+            align_to_normal: false,
+            random_pitch_deg: 2.5,
+            slope_max_deg: 35.0,
+            // Trees make the skyline; culling them at the default distance pops a
+            // whole ridgeline in and out as you turn.
+            cull_distance: 1800.0,
+            collide_radius: 0.035,
+            ..Default::default()
+        }
     } else {
         Rules::default()
     }
@@ -1088,47 +1268,42 @@ impl Scatter {
     /// megabytes.
     pub fn save(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        out.extend_from_slice(&FOLIAGE_MAGIC);
+        out.extend_from_slice(&FOLIAGE_VERSION.to_le_bytes());
         out.extend_from_slice(&(self.species.len() as u32).to_le_bytes());
         out.extend_from_slice(&DENSITY_RES.to_le_bytes());
         for s in &self.species {
             let name = s.name.as_bytes();
             out.extend_from_slice(&(name.len() as u32).to_le_bytes());
             out.extend_from_slice(name);
-            let r = &s.rules;
-            for f in [
-                r.density,
-                r.scale_min,
-                r.scale_max,
-                r.align_to_normal,
-                r.slope_max,
-                r.altitude_min,
-                r.altitude_max,
-                r.sink,
-                r.cull_distance,
-                r.collide_radius,
-            ] {
-                out.extend_from_slice(&f.to_le_bytes());
-            }
-            out.extend_from_slice(&r.seed.to_le_bytes());
+            out.extend_from_slice(&encode_rules(&s.rules));
             out.extend_from_slice(&s.density);
         }
         out
     }
 
-    /// Restore by name, so reordering or removing a model folder cannot hand
-    /// one species' forest to another.
+    /// Restore by name, so reordering or removing a model folder cannot hand one
+    /// species' forest to another.
+    ///
+    /// A file this cannot read is ignored rather than partly applied. Half-restored
+    /// rules would be worse than defaults, because they would look deliberate.
     pub fn restore(&mut self, bytes: &[u8]) {
-        let mut p = 0usize;
         let u32_at = |p: &mut usize| -> Option<u32> {
             let v = bytes.get(*p..*p + 4)?;
             *p += 4;
             Some(u32::from_le_bytes(v.try_into().ok()?))
         };
-        let f32_at = |p: &mut usize| -> Option<f32> {
-            let v = bytes.get(*p..*p + 4)?;
-            *p += 4;
-            Some(f32::from_le_bytes(v.try_into().ok()?))
+
+        let Some(version) = foliage_version(bytes) else {
+            log::warn!("foliage file predates the Unreal-style rules; keeping defaults");
+            return;
         };
+        if version != FOLIAGE_VERSION {
+            log::warn!("foliage file is version {version}, expected {FOLIAGE_VERSION}; ignoring");
+            return;
+        }
+        let mut p = 8usize;
+
         let Some(count) = u32_at(&mut p) else { return };
         let Some(res) = u32_at(&mut p) else { return };
         if res != DENSITY_RES {
@@ -1145,33 +1320,15 @@ impl Scatter {
                 return;
             };
             p += n as usize;
-            let mut vals = [0.0f32; 10];
-            for v in &mut vals {
-                let Some(f) = f32_at(&mut p) else { return };
-                *v = f;
-            }
-            let Some(seed) = u32_at(&mut p) else { return };
+            let Some(rules) = bytes.get(p..p + RULES_BYTES).and_then(decode_rules) else {
+                return;
+            };
+            p += RULES_BYTES;
             let Some(mask) = bytes.get(p..p + mask_len) else { return };
             p += mask_len;
 
             if let Some(s) = self.species.iter_mut().find(|s| s.name == name) {
-                let cast_shadow = s.rules.cast_shadow;
-                s.rules = Rules {
-                    density: vals[0],
-                    scale_min: vals[1],
-                    scale_max: vals[2],
-                    align_to_normal: vals[3],
-                    slope_max: vals[4],
-                    altitude_min: vals[5],
-                    altitude_max: vals[6],
-                    sink: vals[7],
-                    cull_distance: vals[8],
-                    collide_radius: vals[9],
-                    // Not persisted: it is a rendering choice tied to the
-                    // species, not to the world someone painted.
-                    cast_shadow,
-                    seed,
-                };
+                s.rules = rules;
                 s.density.copy_from_slice(mask);
                 s.painted = s.density.iter().any(|&d| d != 0);
                 s.dirty = true;
@@ -1212,7 +1369,8 @@ impl Scatter {
             .flat_map_iter(|s| {
                 let mut local = Vec::new();
                 s.for_each_near(terrain, centre, radius, |pos, scale, _rot| {
-                    let height = s.height_m * scale;
+                    // Unit mesh, so the scale factor is the height.
+                    let height = scale;
                     local.push(Solid {
                         pos,
                         radius: height * s.rules.collide_radius,
@@ -1233,7 +1391,7 @@ impl Scatter {
             if (p.pos.x - centre.x).powi(2) + (p.pos.z - centre.z).powi(2) > r2 {
                 continue;
             }
-            let height = sp.height_m * p.scale;
+            let height = p.scale;
             let rad = height * sp.rules.collide_radius;
             out.push(Solid {
                 pos: p.pos,
@@ -1244,6 +1402,85 @@ impl Scatter {
         }
         out
     }
+}
+
+/// One species' rules, as bytes.
+///
+/// A pure function, and the only place the wire order is written down. `save` and
+/// `restore` used to each spell the field order out inline, which is two lists that
+/// have to agree: adding a field in one and not the other silently shifts every
+/// value after it into the wrong slot.
+fn encode_rules(r: &Rules) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RULES_BYTES);
+    for f in [
+        r.density,
+        r.radius_m,
+        r.height_m,
+        r.scale_min,
+        r.scale_max,
+        r.align_max_angle_deg,
+        r.random_pitch_deg,
+        r.slope_min_deg,
+        r.slope_max_deg,
+        r.altitude_min,
+        r.altitude_max,
+        r.z_offset_m,
+        r.cull_distance,
+        r.collide_radius,
+    ] {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    // One byte a bool rather than a bitfield: packing would save six bytes out of a
+    // 65 kB density mask and cost the next reader an hour.
+    out.push(r.align_to_normal as u8);
+    out.push(r.random_yaw as u8);
+    out.push(r.cast_shadow as u8);
+    out.extend_from_slice(&r.seed.to_le_bytes());
+    debug_assert_eq!(out.len(), RULES_BYTES);
+    out
+}
+
+/// Inverse of [`encode_rules`]. `None` if the slice is short.
+fn decode_rules(b: &[u8]) -> Option<Rules> {
+    if b.len() < RULES_BYTES {
+        return None;
+    }
+    let f = |i: usize| f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+    let bools = FLOAT_FIELDS * 4;
+    Some(Rules {
+        density: f(0),
+        radius_m: f(1),
+        height_m: f(2),
+        scale_min: f(3),
+        scale_max: f(4),
+        align_max_angle_deg: f(5),
+        random_pitch_deg: f(6),
+        slope_min_deg: f(7),
+        slope_max_deg: f(8),
+        altitude_min: f(9),
+        altitude_max: f(10),
+        z_offset_m: f(11),
+        cull_distance: f(12),
+        collide_radius: f(13),
+        align_to_normal: b[bools] != 0,
+        random_yaw: b[bools + 1] != 0,
+        cast_shadow: b[bools + 2] != 0,
+        seed: u32::from_le_bytes(b[bools + 3..bools + 7].try_into().unwrap()),
+    })
+}
+
+/// Version at the head of a saved foliage file, or `None` if these bytes are not one.
+///
+/// The magic is what lets a file written before the Unreal-shaped rules be recognised
+/// and skipped. The previous format had no header at all, so without it an old file's
+/// leading species count would be read as a version and the rest as nonsense floats --
+/// every species would come back with a plausible-looking but wrong slope and scale,
+/// which reads as deliberate and is far worse than falling back to defaults.
+fn foliage_version(bytes: &[u8]) -> Option<u32> {
+    if bytes.get(0..4)? != FOLIAGE_MAGIC {
+        return None;
+    }
+    Some(u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?))
 }
 
 #[cfg(test)]
@@ -1272,20 +1509,16 @@ mod tests {
         assert!(f.contains_sphere(Vec3::new(-2.0, 0.0, 0.0), 40.0), "straddling must survive");
     }
 
-    /// A full-coverage fill on a normal world must not produce an instance
-    /// count nothing can draw. This is the guard on the density defaults.
+    /// A full-coverage fill on a normal world must not produce an instance count
+    /// nothing can draw. This is the guard on the guessed density figures.
     #[test]
     fn filling_a_medium_world_stays_within_budget() {
         let hectares = (4000.0 * 4000.0) / 10_000.0;
-        for b in terra_assets::Builtin::ALL {
-            let r = builtin_rules(b);
+        for name in ["rock.glb", "bush.glb", "pine_tree.glb", "unrecognised.glb"] {
+            let r = guess_rules(std::path::Path::new(name));
             let n = r.density * hectares;
-            assert!(
-                n <= 120_000.0,
-                "{} would place {n:.0} instances covering a 4 km world",
-                b.name()
-            );
-            assert!(r.cull_distance > 0.0, "{} must cull somewhere", b.name());
+            assert!(n <= 120_000.0, "{name} would place {n:.0} instances over a 4 km world");
+            assert!(r.cull_distance > 0.0, "{name} must cull somewhere");
         }
     }
 
@@ -1294,6 +1527,346 @@ mod tests {
         let r = Rules::default();
         assert!(r.scale_min <= r.scale_max);
         assert!(r.density > 0.0);
-        assert!((0.0..=1.0).contains(&r.align_to_normal));
+        assert!(r.slope_min_deg <= r.slope_max_deg);
+    }
+
+    // --- alignment: "point to sky" ---
+    //
+    // The behaviour is only visible on ground steep enough to matter, so every test
+    // here uses a real cliff normal rather than a gentle slope.
+
+    /// The normal of ground at `deg` from horizontal, tilted toward +X.
+    fn slope_normal(deg: f32) -> Vec3 {
+        let r = deg.to_radians();
+        Vec3::new(r.sin(), r.cos(), 0.0).normalize()
+    }
+
+    /// Where an instance's own up-axis ends up pointing.
+    fn up_axis(r: &Rules, normal: Vec3) -> Vec3 {
+        r.orientation(normal, 0x1234_5678) * Vec3::Y
+    }
+
+    #[test]
+    fn unaligned_instances_point_at_the_sky_on_any_cliff() {
+        // The requested behaviour, and the default. A tree grows toward the light, so
+        // on a 75-degree rock face it must still stand vertically rather than sprout
+        // sideways out of the wall.
+        let r = Rules { align_to_normal: false, random_pitch_deg: 0.0, ..Default::default() };
+        for deg in [0.0f32, 20.0, 45.0, 75.0, 89.0] {
+            let up = up_axis(&r, slope_normal(deg));
+            let off = up.angle_between(Vec3::Y).to_degrees();
+            assert!(off < 0.01, "on {deg}-degree ground the up-axis is {off} degrees off vertical");
+        }
+    }
+
+    #[test]
+    fn random_yaw_does_not_tip_an_upright_instance_over() {
+        // Yaw has to be applied about the instance's *own* up-axis. Compose it the
+        // other way and the spin becomes a lean whose direction follows the slope,
+        // which reads as every instance leaning downhill.
+        let r = Rules { align_to_normal: false, random_pitch_deg: 0.0, ..Default::default() };
+        assert!(r.random_yaw);
+        for h in [0u32, 1, 0xDEAD_BEEF, 0x7FFF_FFFF, u32::MAX] {
+            let up = (r.orientation(slope_normal(60.0), h) * Vec3::Y).normalize();
+            assert!(
+                up.angle_between(Vec3::Y).to_degrees() < 0.01,
+                "hash {h:#x} tipped an upright instance to {up}"
+            );
+        }
+    }
+
+    #[test]
+    fn aligned_instances_follow_the_ground() {
+        // The other half of the toggle: with it on, a rock lies against the hillside.
+        let r = Rules {
+            align_to_normal: true,
+            align_max_angle_deg: 90.0,
+            random_pitch_deg: 0.0,
+            ..Default::default()
+        };
+        for deg in [10.0f32, 30.0, 60.0] {
+            let n = slope_normal(deg);
+            let up = up_axis(&r, n);
+            let off = up.angle_between(n).to_degrees();
+            assert!(
+                off < 0.5,
+                "on {deg}-degree ground the up-axis is {off} degrees off the normal"
+            );
+        }
+    }
+
+    #[test]
+    fn the_align_cap_is_an_angle_and_not_a_ratio() {
+        // The trap: slerping toward the normal by `cap / tilt` looks like a cap and is
+        // not one -- a 70-degree slope under a 20-degree cap would still tilt the
+        // instance 35 degrees. The cap has to hold as an absolute angle.
+        let cap = 20.0;
+        let r = Rules {
+            align_to_normal: true,
+            align_max_angle_deg: cap,
+            random_pitch_deg: 0.0,
+            ..Default::default()
+        };
+        for deg in [25.0f32, 45.0, 70.0, 89.0] {
+            let tilt = up_axis(&r, slope_normal(deg)).angle_between(Vec3::Y).to_degrees();
+            assert!(tilt <= cap + 0.5, "{deg}-degree ground tilted the instance {tilt} degrees");
+            // And it does use the whole allowance, rather than giving up and standing
+            // straight: a cap that silently disabled alignment would pass the line above.
+            assert!(tilt > cap - 1.0, "{deg}-degree ground only tilted {tilt}, cap is {cap}");
+        }
+        // Below the cap, alignment is exact.
+        let tilt = up_axis(&r, slope_normal(12.0)).angle_between(Vec3::Y).to_degrees();
+        assert!((tilt - 12.0).abs() < 0.5, "gentle ground should align fully, got {tilt}");
+    }
+
+    #[test]
+    fn a_zero_align_cap_is_the_same_as_not_aligning() {
+        // Reachable from the slider, and it must not produce a NaN orientation.
+        let r = Rules {
+            align_to_normal: true,
+            align_max_angle_deg: 0.0,
+            random_pitch_deg: 0.0,
+            ..Default::default()
+        };
+        let up = up_axis(&r, slope_normal(50.0));
+        assert!(up.is_finite(), "a zero cap produced {up}");
+        assert!(up.angle_between(Vec3::Y).to_degrees() < 0.5);
+    }
+
+    #[test]
+    fn every_orientation_is_a_usable_rotation() {
+        // A denormalised or NaN quaternion becomes a collapsed or vanished instance,
+        // and it would show as foliage flickering rather than as an error.
+        for align in [false, true] {
+            for pitch in [0.0f32, 5.0, 30.0] {
+                let r = Rules {
+                    align_to_normal: align,
+                    align_max_angle_deg: 35.0,
+                    random_pitch_deg: pitch,
+                    ..Default::default()
+                };
+                for deg in [0.0f32, 1.0, 45.0, 90.0] {
+                    for h in [0u32, 12_345, u32::MAX] {
+                        let q = r.orientation(slope_normal(deg), h);
+                        assert!(q.is_finite(), "align {align} pitch {pitch} deg {deg}: {q}");
+                        assert!(
+                            (q.length() - 1.0).abs() < 1e-3,
+                            "align {align} pitch {pitch} deg {deg}: length {}",
+                            q.length()
+                        );
+                    }
+                }
+            }
+        }
+        // A flat-up normal is the degenerate case for `from_rotation_arc`, and a
+        // straight-down one is the antipodal case that makes the axis ambiguous.
+        let r = Rules { align_to_normal: true, align_max_angle_deg: 180.0, ..Default::default() };
+        assert!(r.orientation(Vec3::Y, 7).is_finite());
+        assert!(r.orientation(-Vec3::Y, 7).is_finite());
+        assert!(r.orientation(Vec3::ZERO, 7).is_finite(), "a zero normal must not NaN");
+    }
+
+    #[test]
+    fn random_pitch_tilts_in_every_direction_not_just_one() {
+        // One hash word cannot drive both how far and which way; using the same bits
+        // for each makes the whole stand lean the same way, which is the comb look
+        // random pitch exists to break up.
+        let r = Rules { align_to_normal: false, random_pitch_deg: 15.0, ..Default::default() };
+        let mut min_x = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut min_z = f32::MAX;
+        let mut max_z = f32::MIN;
+        for i in 0..500u32 {
+            let up = r.orientation(Vec3::Y, hash3(i, i * 7 + 1, 3)) * Vec3::Y;
+            min_x = min_x.min(up.x);
+            max_x = max_x.max(up.x);
+            min_z = min_z.min(up.z);
+            max_z = max_z.max(up.z);
+        }
+        assert!(min_x < -0.05 && max_x > 0.05, "pitch never tilted both ways in x");
+        assert!(min_z < -0.05 && max_z > 0.05, "pitch never tilted both ways in z");
+    }
+
+    // --- slope filtering ---
+
+    #[test]
+    fn slope_filtering_reads_in_degrees() {
+        // Degrees, not an abstract 0..1, and the conversion inverts: a larger angle is
+        // a smaller normal y, so the maximum angle becomes the minimum y. Getting that
+        // backwards puts every species on exactly the ground it was excluded from.
+        let r = Rules { slope_min_deg: 0.0, slope_max_deg: 30.0, ..Default::default() };
+        assert!(r.accepts_slope(slope_normal(0.0).y), "flat ground must pass a 0-30 filter");
+        assert!(r.accepts_slope(slope_normal(29.0).y));
+        assert!(!r.accepts_slope(slope_normal(31.0).y), "31 degrees must fail a 30 degree cap");
+        assert!(!r.accepts_slope(slope_normal(80.0).y));
+    }
+
+    #[test]
+    fn a_minimum_slope_puts_a_species_only_on_cliffs() {
+        // What the minimum is for, and the reason it is not redundant with the maximum.
+        let cliff = Rules { slope_min_deg: 55.0, slope_max_deg: 90.0, ..Default::default() };
+        assert!(!cliff.accepts_slope(slope_normal(0.0).y), "flat ground is not a cliff");
+        assert!(!cliff.accepts_slope(slope_normal(40.0).y));
+        assert!(cliff.accepts_slope(slope_normal(60.0).y));
+        assert!(cliff.accepts_slope(slope_normal(89.0).y));
+    }
+
+    #[test]
+    fn the_slope_filter_accepts_its_own_boundaries() {
+        // A filter that rejects exactly the angle it was set to leaves a species
+        // mysteriously absent from ground that reads as in range.
+        let r = Rules { slope_min_deg: 20.0, slope_max_deg: 60.0, ..Default::default() };
+        assert!(r.accepts_slope(slope_normal(20.0).y), "the minimum itself must pass");
+        assert!(r.accepts_slope(slope_normal(60.0).y), "the maximum itself must pass");
+    }
+
+    // --- size ---
+
+    #[test]
+    fn the_height_setting_is_the_height_on_screen() {
+        // Meshes are normalised to one metre at import, so an instance's scale factor
+        // is its height in metres. That equivalence is what lets the panel show a real
+        // number and what the collider maths relies on; if it breaks, foliage silently
+        // renders at the wrong size and colliders stop matching what is drawn.
+        let r = Rules { height_m: 12.0, scale_min: 1.0, scale_max: 1.0, ..Default::default() };
+        let variation = r.scale_min;
+        assert_eq!(r.height_m * variation, 12.0);
+
+        // With variation, the range is the height times the range.
+        let r = Rules { height_m: 10.0, scale_min: 0.5, scale_max: 2.0, ..Default::default() };
+        assert_eq!(r.height_m * r.scale_min, 5.0);
+        assert_eq!(r.height_m * r.scale_max, 20.0);
+    }
+
+    #[test]
+    fn an_unrecognised_mesh_still_gets_a_usable_height() {
+        // The old behaviour was a fixed 1.2 m for anything the name guess missed, with
+        // no way to change it. The guess remains, but only as a starting value.
+        for name in ["tree_01", "boulder", "fern", "widget_xyz"] {
+            let h = default_height(name);
+            assert!(h > 0.0 && h < 60.0, "{name} guessed {h} m");
+        }
+        assert!(default_height("oak_tree") > default_height("fern"), "a tree beats a fern");
+    }
+
+    // --- persistence ---
+
+    #[test]
+    fn an_authored_rule_set_survives_a_round_trip() {
+        // Every field off its default, so one that failed to encode shows up as a
+        // difference rather than coincidentally matching.
+        let want = Rules {
+            density: 73.5,
+            radius_m: 4.25,
+            height_m: 17.5,
+            scale_min: 0.35,
+            scale_max: 2.75,
+            align_to_normal: true,
+            align_max_angle_deg: 62.5,
+            random_yaw: false,
+            random_pitch_deg: 11.5,
+            slope_min_deg: 22.0,
+            slope_max_deg: 81.0,
+            altitude_min: -45.0,
+            altitude_max: 1320.0,
+            z_offset_m: -0.85,
+            cast_shadow: false,
+            collide_radius: 0.33,
+            cull_distance: 1450.0,
+            seed: 0xC0FF_EE01,
+        };
+        let bytes = encode_rules(&want);
+        assert_eq!(bytes.len(), RULES_BYTES);
+        assert_eq!(decode_rules(&bytes), Some(want));
+    }
+
+    #[test]
+    fn every_bool_survives_independently() {
+        // Three bools packed next to each other is exactly where an off-by-one shows
+        // up, and it would present as "cast shadow toggles align to normal".
+        for (a, b, c) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let r =
+                Rules { align_to_normal: a, random_yaw: b, cast_shadow: c, ..Default::default() };
+            let got = decode_rules(&encode_rules(&r)).expect("decode");
+            assert_eq!((got.align_to_normal, got.random_yaw, got.cast_shadow), (a, b, c));
+        }
+    }
+
+    #[test]
+    fn a_truncated_rule_block_decodes_to_nothing() {
+        // Better to keep defaults than to apply half a rule set, which would look
+        // deliberate.
+        let bytes = encode_rules(&Rules::default());
+        for cut in [0, 1, RULES_BYTES / 2, RULES_BYTES - 1] {
+            assert_eq!(decode_rules(&bytes[..cut]), None, "{cut} bytes should not decode");
+        }
+    }
+
+    #[test]
+    fn an_old_foliage_file_is_recognised_and_refused() {
+        // The pre-versioning format opened with a species count. Read as a header that
+        // is not a version, and it must be rejected rather than reinterpreted.
+        let mut old = Vec::new();
+        old.extend_from_slice(&2u32.to_le_bytes());
+        old.extend_from_slice(&DENSITY_RES.to_le_bytes());
+        assert_eq!(foliage_version(&old), None, "an old file must not look like a versioned one");
+
+        let mut current = Vec::new();
+        current.extend_from_slice(&FOLIAGE_MAGIC);
+        current.extend_from_slice(&FOLIAGE_VERSION.to_le_bytes());
+        assert_eq!(foliage_version(&current), Some(FOLIAGE_VERSION));
+
+        // And nothing shorter than a header is mistaken for one.
+        assert_eq!(foliage_version(&[]), None);
+        assert_eq!(foliage_version(b"TFO"), None);
+        assert_eq!(foliage_version(b"TFOL"), None, "magic without a version is not a file");
+    }
+
+    #[test]
+    fn the_saved_layout_is_the_size_it_claims() {
+        // `RULES_BYTES` is used to advance the read cursor, so if it disagrees with what
+        // `encode_rules` writes then every species after the first reads from the wrong
+        // offset -- and the first one would look fine, which is the worst case.
+        assert_eq!(encode_rules(&Rules::default()).len(), RULES_BYTES);
+    }
+
+    // --- guessed starting rules ---
+
+    #[test]
+    fn an_imported_tree_stands_up_and_an_imported_rock_lies_down() {
+        // The guess exists so an import looks sensible before any slider is touched.
+        // These two are the cases where a wrong default is immediately obvious.
+        let tree = guess_rules(std::path::Path::new("scots_pine_tree.glb"));
+        assert!(!tree.align_to_normal, "a tree must point at the sky");
+        let rock = guess_rules(std::path::Path::new("granite_boulder.glb"));
+        assert!(rock.align_to_normal, "a rock must sit against the ground");
+        assert!(rock.z_offset_m < 0.0, "a rock must bed in rather than perch");
+        // An unrecognised name gets the defaults, which are upright.
+        let other = guess_rules(std::path::Path::new("fence_post_01.glb"));
+        assert_eq!(other, Rules::default());
+        assert!(!other.align_to_normal);
+    }
+
+    #[test]
+    fn every_guess_stays_within_its_own_slider_ranges() {
+        // The panel clamps to these, so a guess outside them would jump the moment the
+        // user touched an unrelated control.
+        for name in ["rock.glb", "fern.glb", "oak_tree.glb", "thing.glb"] {
+            let r = guess_rules(std::path::Path::new(name));
+            assert!((1.0..=600.0).contains(&r.density), "{name} density {}", r.density);
+            assert!((0.0..=90.0).contains(&r.slope_min_deg), "{name}");
+            assert!((0.0..=90.0).contains(&r.slope_max_deg), "{name}");
+            assert!(r.slope_min_deg <= r.slope_max_deg, "{name} has an inverted slope range");
+            assert!((0.0..=90.0).contains(&r.align_max_angle_deg), "{name}");
+            assert!((0.0..=30.0).contains(&r.random_pitch_deg), "{name}");
+            assert!((-3.0..=3.0).contains(&r.z_offset_m), "{name} z offset {}", r.z_offset_m);
+            assert!(r.scale_min <= r.scale_max, "{name}");
+        }
     }
 }

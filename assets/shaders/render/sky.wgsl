@@ -17,6 +17,11 @@ struct Camera {
 @group(1) @binding(3) var fog_grid: texture_3d<f32>;
 @group(1) @binding(4) var fog_samp: sampler;
 
+// The half-res cloud buffer: rgb scattered radiance, a transmittance. Sampled
+// rather than marched here -- see `clouds.wgsl` for why the march moved out.
+@group(3) @binding(0) var cloud_tex: texture_2d<f32>;
+@group(3) @binding(1) var cloud_samp: sampler;
+
 struct VsOut {
     @builtin(position) clip: vec4f,
     @location(0) ndc: vec2f,
@@ -47,10 +52,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let p = cam.inv_view_proj * vec4f(in.ndc, 1.0, 1.0);
     let dir = normalize(p.xyz / p.w - cam.eye.xyz);
 
-    var color = sky_color(dir);
+    // Single-scattered atmosphere from the mixer's coefficients, not a
+    // gradient: see `atmosphere.wgsl`. `atmosphere_enabled` falls back to the
+    // old two-stage gradient so switching Sky Atmosphere off is still a sky.
+    let sun = normalize(env.sun_direction.xyz);
+    var color: vec3f;
+    if (env.mie.w > 0.5) {
+        color = atmosphere(cam.eye.xyz, dir, sun);
+        color += sun_disc(dir, sun);
+    } else {
+        color = sky_color(dir);
+    }
+
+    // Clouds, composited so they dim what is behind them rather than being
+    // painted over it. Bilinear from the half-res buffer: the layer is soft and
+    // 2 km out, so the upsample costs nothing visible.
+    let cuv = vec2f(in.ndc.x * 0.5 + 0.5, 0.5 - in.ndc.y * 0.5);
+    let cl = textureSampleLevel(cloud_tex, cloud_samp, cuv, 0.0);
+    color = color * cl.a + cl.rgb;
 
     // Below the horizon, fade to the ground haze the terrain fogs into.
-    color = mix(color, light.ambient.rgb * 0.4, smoothstep(0.0, -0.10, dir.y));
+    // Widened from -0.10: a tenth of a unit in `dir.y` is under six degrees, and
+    // the transition read as a drawn line across the frame rather than as the
+    // ground haze the terrain fogs into.
+    color = mix(color, env.ambient_ground.rgb + env.ambient_horizon.rgb * 0.35,
+        smoothstep(0.0, -0.28, dir.y));
 
     // The sky is behind everything, so it takes the fog of the entire column.
     if (fog_enabled()) {

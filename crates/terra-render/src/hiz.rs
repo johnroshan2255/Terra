@@ -276,15 +276,16 @@ fn cull_group(
     texture: &wgpu::Texture,
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
-    let view = texture.create_view(&wgpu::TextureViewDescriptor {
-        label: Some("hiz-all"),
-        ..Default::default()
-    });
+    let view = texture
+        .create_view(&wgpu::TextureViewDescriptor { label: Some("hiz-all"), ..Default::default() });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("hiz-cull-bg"),
         layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
         ],
     })

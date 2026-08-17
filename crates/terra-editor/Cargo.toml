@@ -9,6 +9,12 @@ license.workspace = true
 name = "terra-editor"
 path = "src/main.rs"
 
+# The UI is exercised by headless tests, which need to link it as a library.
+# A bin-only crate cannot be a test dependency of itself.
+[lib]
+name = "terra_editor"
+path = "src/lib.rs"
+
 [dependencies]
 terra-core.workspace = true
 terra-project.workspace = true
@@ -16,15 +22,21 @@ terra-gen.workspace = true
 terra-render.workspace = true
 terra-assets.workspace = true
 terra-physics.workspace = true
+terra-voxel.workspace = true
 
 wgpu.workspace = true
 winit.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true
+egui_dock.workspace = true
 glam.workspace = true
 rfd.workspace = true
+image.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 pollster.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true

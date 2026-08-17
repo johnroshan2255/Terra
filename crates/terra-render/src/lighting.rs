@@ -59,7 +59,7 @@ impl ShadowQuality {
 /// One dial that moves everything that costs frame time.
 ///
 /// Presets rather than a slider: the settings interact, and a player who turns
-/// shadows to Ultra and grass to nothing has not chosen a quality level, they
+/// shadows to Ultra and fog to nothing has not chosen a quality level, they
 /// have chosen a strange-looking one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
@@ -100,21 +100,6 @@ impl Quality {
             Quality::Ultra => (true, 1100.0),
         }
     }
-
-    /// `(grass on, clumps per m2, draw distance)`
-    pub fn grass(self) -> (bool, f32, f32) {
-        match self {
-            // Blades per square metre in the near field, and how far the field
-            // reaches. Placement is per blade now, so density buys screen
-            // coverage directly rather than tufts of eight -- and the rings
-            // thin with distance, so raising the range costs far less than the
-            // numbers here suggest.
-            Quality::Low => (false, 900.0, 16.0),
-            Quality::Medium => (true, 2600.0, 34.0),
-            Quality::High => (true, 4200.0, 46.0),
-            Quality::Ultra => (true, 6500.0, 60.0),
-        }
-    }
 }
 
 /// Which sun a viewport shows.
@@ -152,7 +137,7 @@ pub struct SkySettings {
     /// fixed sun. Off by default: the time is authored for play, and previewing
     /// it while building fights the work.
     pub editor_preview: bool,
-    /// Temporal anti-aliasing. Also what resolves the grass dissolve: without
+    /// Temporal anti-aliasing. Also what resolves the scatter dissolve: without
     /// it the fade band is a stipple rather than a fade.
     pub temporal_aa: bool,
 }
@@ -272,9 +257,22 @@ pub struct CascadeUniform {
 /// and 256 satisfies every backend without querying.
 const SLOT: u64 = 256;
 
+/// Light values taken from the Environment Light Mixer, replacing the ones this
+/// module would otherwise derive from its own tables.
+#[derive(Debug, Clone, Copy)]
+struct EnvOverride {
+    sun_color: Vec3,
+    zenith: Vec3,
+    horizon: Vec3,
+    ground: Vec3,
+}
+
 pub struct Lighting {
     pub settings: SkySettings,
     pub sun: Sun,
+    /// `None` until the mixer has pushed its values, so the old derivation is the
+    /// fallback rather than a hard dependency.
+    env_override: Option<EnvOverride>,
 
     uniform: wgpu::Buffer,
     /// One `CascadeUniform` per cascade, addressed by dynamic offset.
@@ -432,6 +430,7 @@ impl Lighting {
         Self {
             settings,
             sun: Sun::at(settings.time_of_day),
+            env_override: None,
             uniform,
             cascade_ub,
             shadow_map,
@@ -491,6 +490,23 @@ impl Lighting {
 
     /// Fit the cascades to the camera and upload everything the shaders read.
     #[allow(clippy::too_many_arguments)]
+    /// Override the derived sun colour and ambient with the mixer's.
+    ///
+    /// Without this the sky shader and the terrain disagree about the time of
+    /// day: the sky computes real scattering from the atmosphere coefficients
+    /// while the terrain was lit from a separate table of hardcoded day, dusk and
+    /// night colours. At noon they roughly agree and at dusk they do not, which
+    /// is what made running the clock look wrong -- an orange sky over ground lit
+    /// as though it were midday.
+    ///
+    /// Called before [`Self::upload`]; the sun *direction* still comes from the
+    /// clock, which both already shared.
+    pub fn set_environment(&mut self, env: &crate::environment::Environment) {
+        let (zenith, horizon, ground) = env.ambient_tints();
+        self.env_override =
+            Some(EnvOverride { sun_color: env.sun.radiance(), zenith, horizon, ground });
+    }
+
     pub fn upload(
         &self,
         queue: &wgpu::Queue,
@@ -529,11 +545,20 @@ impl Lighting {
         let dusk = 1.0 - smoothstep(0.02, 0.30, elevation);
         let horizon = day_horizon.lerp(dusk_horizon, dusk).lerp(night_horizon, 1.0 - sun.daylight);
         let zenith = day_zenith.lerp(night_zenith, 1.0 - sun.daylight);
-        let ambient = (zenith * 0.55 + horizon * 0.25) * (0.25 + 0.75 * sun.daylight);
+        let (zenith, horizon, ambient) = match self.env_override {
+            // From the mixer, so the ground is lit by the same model the sky is
+            // drawn with. The ground bounce is folded into the ambient term
+            // because the terrain has no separate downward-facing lookup.
+            Some(o) => (o.zenith, o.horizon, o.zenith * 0.55 + o.horizon * 0.25 + o.ground * 0.20),
+            None => {
+                (zenith, horizon, (zenith * 0.55 + horizon * 0.25) * (0.25 + 0.75 * sun.daylight))
+            }
+        };
+        let sun_color = self.env_override.map_or(sun.color, |o| o.sun_color);
 
         let u = LightUniform {
             sun_direction: sun.direction.extend(sun.daylight).to_array(),
-            sun_color: (sun.color * sun.intensity()).extend(sun.intensity()).to_array(),
+            sun_color: (sun_color * sun.intensity()).extend(sun.intensity()).to_array(),
             sky_zenith: zenith.extend(0.0).to_array(),
             sky_horizon: horizon.extend(0.0).to_array(),
             ambient: ambient.extend(self.settings.exposure).to_array(),

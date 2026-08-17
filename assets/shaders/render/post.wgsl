@@ -20,6 +20,12 @@ struct Post {
     exposure: f32,
     density: f32,
     decay: f32,
+    tone_mapper: u32,
+    contrast: f32,
+    saturation: f32,
+    white_balance_k: f32,
+    // Eleven scalars come to 44 bytes; one more takes the block to 48 and keeps
+    // it 16-aligned, matching what Rust packs.
     _pad: f32,
 };
 
@@ -82,6 +88,50 @@ fn fs_rays(in: VsOut) -> @location(0) vec4f {
     return vec4f(accum / f32(STEPS), 1.0);
 }
 
+/// Blackbody colour at a temperature, normalized so 6500 K is white.
+///
+/// White balance means correcting for the colour of the light: if the scene is
+/// lit at 3000 K it arrives warm, so it is *divided* by the warm cast to come
+/// back neutral. Dividing rather than multiplying is the whole point -- getting
+/// it backwards makes the "warmer" end of the slider cooler.
+fn blackbody(kelvin: f32) -> vec3f {
+    // Tanner Helland's piecewise fit, in the 1000-40000 K range it is valid for.
+    let t = clamp(kelvin, 1000.0, 40000.0) / 100.0;
+    var r: f32;
+    var g: f32;
+    var b: f32;
+    if (t <= 66.0) {
+        r = 1.0;
+        g = clamp(0.39008158 * log(t) - 0.63184144, 0.0, 1.0);
+    } else {
+        r = clamp(1.29293618 * pow(t - 60.0, -0.1332047592), 0.0, 1.0);
+        g = clamp(1.12989086 * pow(t - 60.0, -0.0755148492), 0.0, 1.0);
+    }
+    if (t >= 66.0) {
+        b = 1.0;
+    } else if (t <= 19.0) {
+        b = 0.0;
+    } else {
+        b = clamp(0.54320678 * log(t - 10.0) - 1.19625409, 0.0, 1.0);
+    }
+    return vec3f(r, g, b);
+}
+
+fn white_balance(color: vec3f, kelvin: f32) -> vec3f {
+    // Not named `cast`: that is a reserved WGSL keyword and the shader will not
+    // parse with it, the same trap `enabled` hit in the uniform above.
+    let light_tint = blackbody(kelvin);
+    let neutral = blackbody(6500.0);
+    // Guard the divide: the fit returns 0 for blue below 1900 K.
+    return color * (neutral / max(light_tint, vec3f(1e-3)));
+}
+
+/// Reinhard. Never clips, and desaturates highlights badly -- offered because it
+/// is the reference everyone recognises, not because it is a good default.
+fn reinhard(x: vec3f) -> vec3f {
+    return x / (1.0 + x);
+}
+
 /// Narkowicz's fit to the ACES filmic curve.
 fn aces(x: vec3f) -> vec3f {
     let a = 2.51;
@@ -116,15 +166,36 @@ fn fs_resolve(in: VsOut) -> @location(0) vec4f {
 
     color *= post.exposure;
 
-    // ACES filmic, rather than Reinhard.
+    // Grade in linear, before the curve. Doing it after means operating on
+    // display-referred values where a "1.2x contrast" pivots around whatever the
+    // curve happened to put at mid grey.
+    color = white_balance(color, post.white_balance_k);
+
+    // Saturation against luminance, using Rec. 709 weights so desaturating does
+    // not change perceived brightness.
+    let luma = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+    color = mix(vec3f(luma), color, post.saturation);
+
+    // Contrast about 0.18, the mid grey a correctly exposed scene sits at.
+    // Pivoting about 0.5 instead darkens everything as contrast rises, because
+    // almost nothing in a linear HDR frame is above 0.5.
+    color = max(vec3f(0.0), (color - 0.18) * post.contrast + 0.18);
+
+    // ACES filmic by default, rather than Reinhard.
     //
     // Plain Reinhard maps 1.0 to 0.5: a correctly exposed white comes out mid
     // grey, and everything below it is compressed toward the same place. The
-    // result is a scene that is technically correct and looks flat at every
-    // time of day, which is exactly what it was doing. This curve keeps its
-    // toe and shoulder but leaves the midtones alone -- 0.18 in comes out at
-    // 0.27, and white lands at 0.80 rather than half way.
-    color = aces(color);
+    // result is technically correct and looks flat at every time of day. ACES
+    // keeps its toe and shoulder but leaves the midtones alone -- 0.18 in comes
+    // out at 0.27, and white lands at 0.80 rather than half way.
+    //
+    // The other two are selectable from the Environment mixer: None to see what
+    // is clipping, Reinhard because it is the reference people recognise.
+    switch (post.tone_mapper) {
+        case 0u: { color = clamp(color, vec3f(0.0), vec3f(1.0)); }
+        case 1u: { color = reinhard(color); }
+        default: { color = aces(color); }
+    }
 
     return vec4f(linear_to_srgb(color), 1.0);
 }

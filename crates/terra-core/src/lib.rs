@@ -6,6 +6,7 @@ pub mod coords;
 pub mod error;
 pub mod grid;
 pub mod units;
+pub mod vehicle;
 
 pub use coords::{TileBounds, TileCoord};
 pub use error::{CoreError, Result};
@@ -13,3 +14,4 @@ pub use grid::HeightGrid;
 pub use units::{
     BASE_ELEVATION_M, HEIGHT_RANGE_M, METERS_PER_TEXEL, TEXELS_PER_TILE, TILE_SIZE_M, WorldSize,
 };
+pub use vehicle::VehicleDims;

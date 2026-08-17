@@ -6,6 +6,8 @@
 
 pub mod db;
 pub mod mesh;
+pub mod rig;
 
 pub use db::{AssetDb, AssetId};
-pub use mesh::{Builtin, MeshData};
+pub use mesh::MeshData;
+pub use rig::VehicleRig;

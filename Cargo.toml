@@ -5,7 +5,10 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.95 is the floor for egui_dock 0.21 and egui_kittest 0.36, which are the
+# panel docking and the headless UI test harness respectively. Both track egui
+# 0.36 exactly, so neither can be held back to keep an older floor.
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -16,6 +19,7 @@ terra-gen     = { path = "crates/terra-gen" }
 terra-render  = { path = "crates/terra-render" }
 terra-assets  = { path = "crates/terra-assets" }
 terra-physics = { path = "crates/terra-physics" }
+terra-voxel   = { path = "crates/terra-voxel" }
 
 # --- gpu / windowing ---
 wgpu       = "30.0"
@@ -23,6 +27,11 @@ winit      = "0.30.13"
 egui       = "0.36.1"
 egui-wgpu  = "0.36.1"
 egui-winit = "0.36.1"
+# Unreal-style docking: tab bars, drag a panel out to float it, drop to re-dock.
+egui_dock  = "0.21.1"
+# Headless UI testing, via AccessKit. Lets panel layout and the contextual tool
+# settings be asserted in `cargo test` without opening a window.
+egui_kittest = { version = "0.36.1", features = ["wgpu", "snapshot"] }
 
 # --- math / plain data ---
 glam     = { version = "0.33", features = ["serde", "bytemuck"] }

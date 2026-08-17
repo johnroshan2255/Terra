@@ -9,6 +9,7 @@ license.workspace = true
 terra-core.workspace = true
 terra-project.workspace = true
 terra-assets.workspace = true
+terra-voxel.workspace = true
 
 wgpu.workspace = true
 winit.workspace = true
@@ -17,4 +18,10 @@ bytemuck.workspace = true
 anyhow.workspace = true
 log.workspace = true
 rayon.workspace = true
+serde.workspace = true
+ron.workspace = true
 image.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
+half.workspace = true

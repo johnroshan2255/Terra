@@ -1,9 +1,14 @@
-//! Instanced solid meshes: the car chassis and its wheels.
+//! Instanced solid meshes: the player's vehicle body and its four wheels.
 //!
-//! Geometry is generated in code -- a box and a cylinder -- rather than loaded.
-//! A driveable car needs correct physics, not a nice model, and building the
-//! asset pipeline first would delay the part that actually has to be right.
-//! glTF import replaces the generators later without touching this pipeline.
+//! The geometry comes from the vehicle model on disk, split into a body and four wheels by
+//! `terra_assets::VehicleRig`, so the thing drawn here is the same thing the collider was
+//! measured from. `box_mesh` and `cylinder_mesh` remain only as the placeholder used when
+//! that model cannot be read.
+//!
+//! That replacement was the plan from the start: the generators existed because a driveable
+//! vehicle needs correct physics before it needs a nice model, and building the asset
+//! pipeline first would have delayed the part that had to be right. The pipeline here did
+//! not have to change to accept the real mesh, which is what that bet was for.
 
 use crate::camera::{Camera, CameraUniform};
 use crate::context::{DEPTH_FORMAT, RenderContext};
@@ -140,18 +145,28 @@ pub struct MeshRenderer {
     sampler: wgpu::Sampler,
     instances: wgpu::Buffer,
     capacity: usize,
-    pub chassis: Mesh,
-    pub wheel: Mesh,
+    /// The vehicle body, one entry per part so each keeps its own material. Every part is
+    /// drawn at the same chassis transform.
+    pub chassis: Vec<Mesh>,
+    /// One mesh per corner, front-left, front-right, rear-left, rear-right.
+    ///
+    /// Four rather than one reused, because the left and right wheels are mirrored copies.
+    /// Reusing one would need a negative scale on the far side, which inverts triangle
+    /// winding and lets back-face culling eat the visible faces -- the tyre turns inside
+    /// out on one side of the vehicle.
+    pub wheels: [Mesh; 4],
 }
 
 /// Instances uploaded per frame. One chassis plus four wheels, with room spare.
 const MAX_INSTANCES: usize = 64;
 
 impl MeshRenderer {
+    /// `rig` is the vehicle's split mesh. `None` falls back to primitives, so a missing or
+    /// unreadable vehicle model leaves the editor runnable instead of refusing to start --
+    /// a box on four cylinders is obviously a placeholder, which is the right way to fail.
     pub fn new(
         ctx: &RenderContext,
-        chassis_half: [f32; 3],
-        wheel_radius: f32,
+        rig: Option<&terra_assets::VehicleRig>,
         lighting: &Lighting,
     ) -> Self {
         let device = &ctx.device;
@@ -331,32 +346,55 @@ impl MeshRenderer {
         sd.primitive.cull_mode = None;
         let shadow_pipeline = device.create_render_pipeline(&sd);
 
-        let (cv, ci) = box_mesh(chassis_half);
-        let (wv, wi) = cylinder_mesh(wheel_radius, 0.16, 20);
-        let chassis = build_mesh(
-            device,
-            queue,
-            &material_bgl,
-            &sampler,
-            "chassis",
-            &cv,
-            &ci,
-            None,
-            None,
-            false,
-        );
-        let wheel = build_mesh(
-            device,
-            queue,
-            &material_bgl,
-            &sampler,
-            "wheel",
-            &wv,
-            &wi,
-            None,
-            None,
-            false,
-        );
+        // Placeholder dimensions, used only when there is no vehicle mesh to load.
+        const FALLBACK_HALF: [f32; 3] = [1.3, 0.8, 2.6];
+        const FALLBACK_WHEEL: f32 = 0.57;
+
+        let (chassis, wheels): (Vec<Mesh>, [Mesh; 4]) = match rig {
+            Some(r) => {
+                let body = r
+                    .body
+                    .iter()
+                    .map(|p| upload(device, queue, &material_bgl, &sampler, "vehicle-body", p))
+                    .collect();
+                let wheels = std::array::from_fn(|i| {
+                    upload(device, queue, &material_bgl, &sampler, "vehicle-wheel", &r.wheels[i])
+                });
+                (body, wheels)
+            }
+            None => {
+                log::warn!("no vehicle mesh: drawing a placeholder box on four cylinders");
+                let (cv, ci) = box_mesh(FALLBACK_HALF);
+                let (wv, wi) = cylinder_mesh(FALLBACK_WHEEL, 0.22, 20);
+                let chassis = vec![build_mesh(
+                    device,
+                    queue,
+                    &material_bgl,
+                    &sampler,
+                    "chassis",
+                    &cv,
+                    &ci,
+                    None,
+                    None,
+                    false,
+                )];
+                let wheels = std::array::from_fn(|_| {
+                    build_mesh(
+                        device,
+                        queue,
+                        &material_bgl,
+                        &sampler,
+                        "wheel",
+                        &wv,
+                        &wi,
+                        None,
+                        None,
+                        false,
+                    )
+                });
+                (chassis, wheels)
+            }
+        };
 
         Self {
             pipeline,
@@ -369,7 +407,7 @@ impl MeshRenderer {
             instances,
             capacity: MAX_INSTANCES,
             chassis,
-            wheel,
+            wheels,
         }
     }
 
@@ -534,11 +572,40 @@ impl MeshRenderer {
     }
 }
 
+/// Upload a `MeshData`, for callers that do not yet have a `MeshRenderer`.
+fn upload(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    material_bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    label: &str,
+    data: &terra_assets::MeshData,
+) -> Mesh {
+    let verts: Vec<Vertex> = (0..data.positions.len())
+        .map(|i| Vertex {
+            position: data.positions[i],
+            normal: *data.normals.get(i).unwrap_or(&[0.0, 1.0, 0.0]),
+            uv: *data.uvs.get(i).unwrap_or(&[0.0, 0.0]),
+        })
+        .collect();
+    build_mesh(
+        device,
+        queue,
+        material_bgl,
+        sampler,
+        label,
+        &verts,
+        &data.indices,
+        data.albedo.as_ref(),
+        data.alpha_cutoff,
+        data.double_sided,
+    )
+}
+
 /// Upload geometry plus its material bindings.
 ///
-/// Meshes with no map get a 1x1 white texture rather than a second pipeline:
-/// the shader multiplies by it, so untextured geometry is unaffected and there
-/// is one code path.
+/// Meshes with no map get a 1x1 white texture rather than a second pipeline: the shader
+/// multiplies by it, so untextured geometry is unaffected and there is one code path.
 #[allow(clippy::too_many_arguments)]
 fn build_mesh(
     device: &wgpu::Device,

@@ -14,11 +14,9 @@ use std::path::PathBuf;
 use terra_core::WorldSize;
 use terra_project::roads::{Road, Surface};
 use terra_project::{Library, TerrainParams};
-use terra_render::grass::{GrassSettings, GrassStyle};
 use terra_render::lighting::{Quality, ShadowQuality, SkySettings};
 use terra_render::stats::FrameStats;
 use terra_render::terrain::SculptMode;
-use terra_render::volumetrics::FogSettings;
 
 /// Which set of controls the rail is showing. The rail itself is never torn
 /// down -- only its contents change.
@@ -359,10 +357,10 @@ pub fn create(root: &mut egui::Ui, form: &mut CreateForm) -> Action {
             // A singleline edit defaults to infinite desired width, which in a
             // horizontal row means it eats the button beside it.
             let w = (ui.available_width() - 104.0).max(60.0);
-            if ui.add_sized([w, FIELD_H], text_field(&mut form.seed_text)).changed() {
-                if let Ok(v) = form.seed_text.trim().parse::<u64>() {
-                    form.seed = v;
-                }
+            if ui.add_sized([w, FIELD_H], text_field(&mut form.seed_text)).changed()
+                && let Ok(v) = form.seed_text.trim().parse::<u64>()
+            {
+                form.seed = v;
             }
             if ui.button("Random").clicked() {
                 form.seed = fresh_seed();
@@ -559,6 +557,7 @@ pub struct PaletteEntry<'a> {
 }
 
 pub struct EditorView<'a> {
+    /// The sculpt mode. Drives both the palette and the brush that runs.
     pub mode: &'a mut SculptMode,
     pub radius: &'a mut f32,
     pub strength: &'a mut f32,
@@ -589,16 +588,41 @@ pub struct EditorView<'a> {
     /// Whether each docked side panel is expanded.
     pub tools_open: &'a mut bool,
     pub inspector_open: &'a mut bool,
-    /// Sun and graphics settings, edited in place.
+    /// Frame-time settings: shadows and temporal AA. Everything that changes how
+    /// the world looks lives in [`Self::env`].
     pub sky: &'a mut SkySettings,
-    pub grass: &'a mut GrassSettings,
-    pub fog: &'a mut FogSettings,
+    /// The Environment Light Mixer: sun, atmosphere, sky light, fog, clouds and
+    /// tone mapping, in one place.
+    pub env: &'a mut terra_render::Environment,
     /// The road being drawn, if any, plus how many roads exist.
     pub active_road: Option<&'a mut Road>,
     pub road_count: usize,
+    /// The non-destructive cave modifier stack, shown in its own pane.
+    pub modifiers: &'a mut terra_voxel::ModifierStack,
+    /// Which stack entry is selected, if any.
+    pub selected_modifier: &'a mut Option<usize>,
+    /// The project's own asset folder, as the content browser sees it.
+    pub content: &'a ContentView<'a>,
+    /// Noise pattern the Noise sculpt brush samples, and the library of
+    /// uploaded patterns to choose from.
+    pub noise: &'a mut terra_voxel::NoiseField,
+    pub noise_library: &'a [String],
+    /// The material being edited, if the Material pane has one.
+    pub material: Option<MaterialView<'a>>,
+    /// Which visualization the viewport is showing.
+    pub view_mode: &'a mut terra_render::ViewMode,
+    /// Written back by the Viewport tab: where the 3D view actually ended up.
+    ///
+    /// With fixed panels this was derivable from a constant width. Under
+    /// docking it is not -- the user can put the viewport anywhere, at any
+    /// size, so anything that needs to sit over the scene has to be told.
+    pub viewport_rect: &'a mut Option<egui::Rect>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Clone` but not `Copy`: `SelectNoise` carries the chosen filename, and
+/// making the whole enum copyable again would mean interning asset names
+/// somewhere just to keep one variant small.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorAction {
     None,
     Save,
@@ -635,11 +659,28 @@ pub enum EditorAction {
     Play,
     /// Leave drive mode and return to editing.
     Stop,
+    /// Switch which shelf the content browser is showing.
+    SelectAssetKind(AssetKind),
+    /// Open a file dialog and copy the chosen file into the project.
+    ImportAsset(AssetKind),
+    /// Make an uploaded greyscale map the Noise brush's pattern.
+    SelectNoise(String),
+    /// Append a tunnel modifier through the view direction.
+    AddTunnel,
+    /// Drop one entry from the modifier stack.
+    DeleteModifier(usize),
+    /// Open the Material pane on a palette slot. Fired by a double-click.
+    OpenMaterial(usize),
+    /// Select the material currently open in the editor for painting.
+    PaintWithSelectedMaterial,
 }
 
-pub fn editor(root: &mut egui::Ui, mut v: EditorView<'_>) -> EditorAction {
+pub fn editor(
+    root: &mut egui::Ui,
+    layout: &mut crate::dock::Layout,
+    mut v: EditorView<'_>,
+) -> EditorAction {
     let mut action = EditorAction::None;
-    let (tools_w, inspector_w) = theme::editor_panels(root.ctx());
     let narrow = root.ctx().viewport_rect().width() < 1100.0;
 
     // --- toolbar ---
@@ -669,6 +710,8 @@ pub fn editor(root: &mut egui::Ui, mut v: EditorView<'_>) -> EditorAction {
                     action = EditorAction::Play;
                 }
                 ui.add_space(8.0);
+                view_menu(ui, layout, v.view_mode, !v.playing);
+                ui.add_space(8.0);
                 // Whatever width the buttons left over belongs to the title.
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.add(
@@ -693,6 +736,26 @@ pub fn editor(root: &mut egui::Ui, mut v: EditorView<'_>) -> EditorAction {
             // Cursor position first, pinned right: it changes as you work, so
             // it is the half worth keeping when the hints have to be cut.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // A debug mode changes every pixel, and forgetting one is on is
+                // the classic way to spend ten minutes debugging a material that
+                // was never broken. So it is named in the status bar until it is
+                // turned off -- and as a button rather than a label, because the
+                // thing you want on seeing it is the way back.
+                // Not while driving: the mode is remembered but not applied, so
+                // announcing it would name something that is not on screen.
+                if *v.view_mode != terra_render::ViewMode::Lit && !v.playing {
+                    let resp = ui
+                        .button(
+                            RichText::new(format!("{}  \u{2715}", v.view_mode.label()))
+                                .size(11.5)
+                                .color(theme::WARN),
+                        )
+                        .on_hover_text("Back to Lit  (Alt+4)");
+                    if resp.clicked() {
+                        *v.view_mode = terra_render::ViewMode::Lit;
+                    }
+                    ui.add_space(10.0);
+                }
                 match v.brush_at {
                     Some((x, z)) => ui.label(theme::small(&format!("{x:.0} m,  {z:.0} m"))),
                     None => ui.label(theme::small("--")),
@@ -706,110 +769,662 @@ pub fn editor(root: &mut egui::Ui, mut v: EditorView<'_>) -> EditorAction {
         });
     });
 
-    // --- tools ---
-    if *v.tools_open {
-        egui::Panel::left("tools")
-            .exact_size(tools_w)
-            .frame(theme::panel(if tools_w < 168.0 { 10 } else { 14 }))
-            .show(root, |ui| {
-                let collapse = collapse_row(ui, "\u{2039}", "TOOLS");
-                // Scrolls, because the tool list plus its mode buttons is taller
-                // than the panel on a short window and the overflow was simply
-                // clipped -- with no indication that anything was missing.
-                egui::ScrollArea::vertical().id_salt("tools-scroll").auto_shrink([false; 2]).show(
-                    ui,
-                    |ui| {
-                        tools_panel(ui, &mut v, &mut action);
-                    },
-                );
-                if collapse {
-                    *v.tools_open = false;
-                }
-            });
-    } else {
-        egui::Panel::left("tools-collapsed")
-            .exact_size(RAIL_COLLAPSED_W)
-            .frame(theme::panel(4))
-            .show(root, |ui| {
-                if reopen_strip(ui, "\u{203A}", "Show tools") {
-                    *v.tools_open = true;
-                }
-            });
-    }
-
-    // --- inspector ---
-    if *v.inspector_open {
-        egui::Panel::right("inspector")
-            .exact_size(inspector_w)
-            .frame(theme::panel(if inspector_w < 220.0 { 10 } else { 14 }))
-            .show(root, |ui| {
-                let collapse = collapse_row(ui, "\u{203A}", "INSPECTOR");
-                egui::ScrollArea::vertical()
-                    .id_salt("inspector-scroll")
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        inspector_panel(ui, &mut v, &mut action);
-                    });
-                if collapse {
-                    *v.inspector_open = false;
-                }
-            });
-    } else {
-        egui::Panel::right("inspector-collapsed")
-            .exact_size(RAIL_COLLAPSED_W)
-            .frame(theme::panel(4))
-            .show(root, |ui| {
-                if reopen_strip(ui, "\u{2039}", "Show inspector") {
-                    *v.inspector_open = true;
-                }
-            });
-    }
+    // --- dockable panes ---
+    //
+    // Everything from here down is one DockArea rather than fixed left/right
+    // panels. Tabs can be dragged to re-dock, dragged out of the window to
+    // float, collapsed to their title bar, and resized by their separators --
+    // all of which comes from egui_dock rather than from anything here.
+    let mut viewer = EditorTabs { view: &mut v, action: &mut action };
+    egui_dock::DockArea::new(layout.state_mut())
+        .style(theme::dock_style(root.ctx()))
+        // Adding an arbitrary tab from a "+" button makes no sense when the
+        // tab set is fixed; the View menu is the way panes come back.
+        .show_add_buttons(false)
+        // Every tab already carries its own close button, so the per-leaf
+        // "close all" is a second X beside the first and reads as a bug.
+        .show_leaf_close_all_buttons(false)
+        // Collapse-to-title-bar, for docked leaves and floating windows alike.
+        .show_leaf_collapse_buttons(true)
+        .draggable_tabs(true)
+        // Clamp floating windows to the viewport. Left unset, a panel ejected
+        // into a window can be dragged past the edge of the screen and there is
+        // no way to get it back except View > Reset layout.
+        .window_bounds(root.ctx().viewport_rect())
+        .show_inside(root, &mut viewer);
 
     action
 }
 
-/// Width of a collapsed side panel: just enough for the reopen arrow.
-pub const RAIL_COLLAPSED_W: f32 = 26.0;
-
-/// A vertical strip that reopens a collapsed panel.
-fn reopen_strip(ui: &mut egui::Ui, arrow: &str, tip: &str) -> bool {
-    let (rect, resp) =
-        ui.allocate_exact_size(vec2(ui.available_width(), ui.available_height()), Sense::click());
-    if ui.is_rect_visible(rect) {
-        let color = if resp.hovered() { theme::ACCENT } else { theme::MUTED };
-        ui.painter().text(
-            egui::pos2(rect.center().x, rect.top() + 14.0),
-            Align2::CENTER_CENTER,
-            arrow,
-            FontId::proportional(15.0),
-            color,
-        );
-    }
-    resp.on_hover_text(tip).clicked()
+/// Dispatches each dock tab to the function that draws it.
+///
+/// Holds the whole [`EditorView`] plus the pending action by mutable reference,
+/// because `egui_dock` calls back once per visible tab and each one needs the
+/// same borrows. That is also why the panes take `&mut EditorView` rather than
+/// individual fields: threading a dozen references through a trait impl buys
+/// nothing that one borrow does not.
+struct EditorTabs<'a, 'v> {
+    view: &'a mut EditorView<'v>,
+    action: &'a mut EditorAction,
 }
 
-/// The collapse control at the top of an expanded panel.
-fn collapse_row(ui: &mut egui::Ui, arrow: &str, title: &str) -> bool {
-    let mut hit = false;
-    ui.horizontal(|ui| {
-        ui.label(theme::label(title));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let (rect, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
-            if ui.is_rect_visible(rect) {
-                let color = if resp.hovered() { theme::ACCENT } else { theme::MUTED };
-                ui.painter().text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    arrow,
-                    FontId::proportional(14.0),
-                    color,
-                );
+impl egui_dock::TabViewer for EditorTabs<'_, '_> {
+    type Tab = crate::dock::Tab;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        tab.title().into()
+    }
+
+    fn closeable(&mut self, tab: &mut Self::Tab) -> bool {
+        tab.closeable()
+    }
+
+    /// One stable id per pane. Derived from the title rather than the tab's
+    /// position, so a pane keeps its scroll offset and collapsed state when it
+    /// is dragged somewhere else.
+    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
+        egui::Id::new(tab.title())
+    }
+
+    /// The viewport must not paint a background, or it would cover the 3D scene
+    /// rendered underneath the egui pass. Every other pane wants one.
+    fn clear_background(&self, tab: &Self::Tab) -> bool {
+        *tab != crate::dock::Tab::Viewport
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        use crate::dock::Tab;
+        match tab {
+            // Draws nothing: the scene is already on screen behind this, and
+            // the tab exists to reserve the space. Its rect is the one piece of
+            // information it does produce. See `dock.rs`.
+            Tab::Viewport => {
+                *self.view.viewport_rect = Some(ui.max_rect());
             }
-            hit = resp.on_hover_text("Collapse").clicked();
+            Tab::Tools => {
+                // Scrolls, because the tool list plus its settings is taller
+                // than the pane on a short window and the overflow was simply
+                // clipped -- with no indication anything was missing.
+                egui::ScrollArea::vertical()
+                    .id_salt("tools-scroll")
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| tools_panel(ui, self.view, self.action));
+            }
+            Tab::Inspector => {
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector-scroll")
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| inspector_panel(ui, self.view, self.action));
+            }
+            Tab::Modifiers => {
+                egui::ScrollArea::vertical()
+                    .id_salt("modifiers-scroll")
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| modifiers_panel(ui, self.view, self.action));
+            }
+            Tab::Environment => {
+                egui::ScrollArea::vertical()
+                    .id_salt("environment-scroll")
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| environment_panel(ui, self.view.env));
+            }
+            Tab::Material => {
+                egui::ScrollArea::vertical()
+                    .id_salt("material-scroll")
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| material_panel(ui, self.view, self.action));
+            }
+            Tab::Content => {
+                egui::ScrollArea::vertical()
+                    .id_salt("content-scroll")
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| content_panel(ui, self.view, self.action));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Environment Light Mixer
+// ---------------------------------------------------------------------------
+
+/// The Environment Light Mixer, in the order light physically arrives.
+///
+/// One panel rather than the four it replaces -- FOG, ENVIRONMENT, SHADOWS and
+/// ATMOSPHERE were separate sections with no ordering between them, and they
+/// interact: raising fog density without touching exposure darkens the frame,
+/// and a user adjusting one section at a time could not see why. Sun first, then
+/// what the air does to it, then what fills the shadows, then what sits in
+/// front, then how it all becomes pixels.
+fn environment_panel(ui: &mut egui::Ui, env: &mut terra_render::Environment) {
+    use terra_render::ToneMapper;
+
+    // --- quick create, as in Unreal's mixer ---
+    ui.label(theme::label("QUICK CREATE"));
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        // `apply_preset`, not assignment: a preset sets the look and must not
+        // switch off what the user turned on. See its doc comment.
+        if ui.button("Daylight").clicked() {
+            env.apply_preset(terra_render::Environment::daylight());
+        }
+        if ui.button("Overcast").clicked() {
+            env.apply_preset(terra_render::Environment::overcast());
+        }
+        if ui.button("Night").clicked() {
+            env.apply_preset(terra_render::Environment::night());
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(theme::small(
+        "Presets rather than one slider: these settings interact, and half-overcast \
+         is not a look. A preset sets the lighting and leaves what you switched on \
+         alone -- use Reset environment below to clear everything.",
+    ));
+    ui.add_space(12.0);
+
+    // --- sun ---
+    ui.horizontal(|ui| {
+        ui.label(theme::label("SUN"));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(theme::small(if env.sun.is_night() { "moon is key" } else { "" }));
         });
     });
     ui.add_space(4.0);
-    hit
+    theme::inset(8).show(ui, |ui| {
+        let was = (env.sun.pitch_deg, env.sun.yaw_deg);
+        slider(ui, "Pitch deg", &mut env.sun.pitch_deg, -90.0..=90.0);
+        slider(ui, "Yaw deg", &mut env.sun.yaw_deg, 0.0..=360.0);
+        // Dragging the sun by hand means the clock is no longer driving it, so
+        // stop the cycle rather than letting the next tick snap it back.
+        if (env.sun.pitch_deg, env.sun.yaw_deg) != was {
+            env.cycle_running = false;
+        }
+        ui.label(theme::small("Negative pitch is above the horizon, as in Unreal."));
+        ui.add_space(4.0);
+        slider(ui, "Intensity", &mut env.sun.intensity, 0.0..=4.0);
+        slider(ui, "Disc deg", &mut env.sun.angular_diameter_deg, 0.1..=12.0);
+        ui.label(theme::small(
+            "The real sun is 0.53 deg. Widening it softens every shadow in the \
+             scene at once.",
+        ));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let mut tint = env.sun.tint.to_array();
+            if ui.color_edit_button_rgb(&mut tint).changed() {
+                env.sun.tint = glam::Vec3::from(tint);
+            }
+            ui.label(theme::small("Tint"));
+        });
+        ui.checkbox(&mut env.sun.casts_shadows, "Casts shadows");
+    });
+    ui.add_space(12.0);
+
+    // --- time of day ---
+    ui.label(theme::label("TIME OF DAY"));
+    ui.add_space(4.0);
+    theme::inset(8).show(ui, |ui| {
+        let hours = env.time_of_day;
+        ui.label(theme::muted(&format!(
+            "{:02}:{:02}",
+            hours.floor() as u32,
+            ((hours.fract()) * 60.0) as u32
+        )));
+        if slider_changed(ui, "Hour", &mut env.time_of_day, 0.0..=24.0) {
+            env.sync_sun_to_clock();
+        }
+        ui.checkbox(&mut env.cycle_running, "Run day/night cycle");
+        ui.add_enabled_ui(env.cycle_running, |ui| {
+            slider(ui, "Hours / s", &mut env.day_speed, 0.01..=4.0);
+        });
+        ui.checkbox(&mut env.editor_preview, "Preview in viewport");
+        ui.label(theme::small(
+            "Off by default: the time is authored for play, and a moving sun changes \
+             the ground you are painting while you paint it.",
+        ));
+    });
+    ui.add_space(12.0);
+
+    // --- atmosphere ---
+    ui.checkbox(&mut env.atmosphere.enabled, "Sky Atmosphere");
+    ui.add_space(4.0);
+    ui.add_enabled_ui(env.atmosphere.enabled, |ui| {
+        theme::inset(8).show(ui, |ui| {
+            slider_log(ui, "Haze (Mie)", &mut env.atmosphere.mie_scale, 0.05..=20.0);
+            ui.label(theme::small(
+                "Aerosol against Earth's. Greys the horizon and brightens the sky \
+                 around the sun.",
+            ));
+            ui.add_space(4.0);
+            slider(ui, "Sky (Rayleigh)", &mut env.atmosphere.rayleigh_scale, 0.0..=4.0);
+            slider(ui, "Forward scatter", &mut env.atmosphere.mie_anisotropy, 0.0..=0.95);
+            slider(ui, "Ozone", &mut env.atmosphere.ozone_scale, 0.0..=4.0);
+            ui.add_space(4.0);
+            ui.label(theme::small(
+                "Rayleigh is the real per-metre coefficient for air, which is why the \
+                 sky is this blue rather than a colour someone chose.",
+            ));
+        });
+    });
+    ui.add_space(12.0);
+
+    // --- sky light ---
+    ui.checkbox(&mut env.sky_light.enabled, "Sky Light (ambient bounce)");
+    ui.add_space(4.0);
+    ui.add_enabled_ui(env.sky_light.enabled, |ui| {
+        theme::inset(8).show(ui, |ui| {
+            slider(ui, "Intensity", &mut env.sky_light.intensity, 0.0..=4.0);
+            ui.checkbox(&mut env.sky_light.capture_from_atmosphere, "Capture from atmosphere");
+            ui.label(theme::small(
+                "On, the fill follows the sky it is standing under. Off, it uses the \
+                 colours below.",
+            ));
+            ui.add_enabled_ui(!env.sky_light.capture_from_atmosphere, |ui| {
+                ui.add_space(4.0);
+                for (label, c) in [
+                    ("Zenith", &mut env.sky_light.zenith),
+                    ("Horizon", &mut env.sky_light.horizon),
+                    ("Ground", &mut env.sky_light.ground),
+                ] {
+                    ui.horizontal(|ui| {
+                        let mut rgb = c.to_array();
+                        if ui.color_edit_button_rgb(&mut rgb).changed() {
+                            *c = glam::Vec3::from(rgb);
+                        }
+                        ui.label(theme::small(label));
+                    });
+                }
+            });
+        });
+    });
+    ui.add_space(12.0);
+
+    // --- fog ---
+    ui.checkbox(&mut env.fog.enabled, "Exponential Height Fog");
+    ui.add_space(4.0);
+    ui.add_enabled_ui(env.fog.enabled, |ui| {
+        theme::inset(8).show(ui, |ui| {
+            slider_log(ui, "Density", &mut env.fog.density, 0.00001..=0.05);
+            slider_log(ui, "Height falloff m", &mut env.fog.height_falloff_m, 20.0..=4000.0);
+            slider(ui, "Base height m", &mut env.fog.base_height_m, -100.0..=2000.0);
+            ui.label(theme::small(
+                "Density is quoted at the base height and falls to 1/e one falloff \
+                 above it, so a short falloff pools fog in valleys.",
+            ));
+            ui.add_space(6.0);
+            slider(ui, "God rays", &mut env.fog.god_rays, 0.0..=1.5);
+            ui.label(theme::small(
+                "Shafts are the fog volume marched toward the sun, so they need fog to \
+                 exist. Zero skips the pass.",
+            ));
+            ui.add_space(6.0);
+            slider(ui, "Forward scatter", &mut env.fog.anisotropy, 0.0..=0.95);
+            slider_log(ui, "Valley mist", &mut env.fog.mist_strength, 0.0..=0.01);
+            slider_log(ui, "Distance m", &mut env.fog.distance_m, 100.0..=3000.0);
+            ui.horizontal(|ui| {
+                let mut rgb = env.fog.albedo.to_array();
+                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                    env.fog.albedo = glam::Vec3::from(rgb);
+                }
+                ui.label(theme::small("Medium colour"));
+            });
+        });
+    });
+    ui.add_space(12.0);
+
+    // --- clouds ---
+    ui.checkbox(&mut env.clouds.enabled, "Volumetric Clouds");
+    ui.add_space(4.0);
+    ui.add_enabled_ui(env.clouds.enabled, |ui| {
+        theme::inset(8).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::small("Quality"));
+                for q in terra_render::CloudQuality::ALL {
+                    if ui.selectable_label(env.clouds.quality == q, q.label()).clicked() {
+                        env.clouds.quality = q;
+                    }
+                }
+            });
+            ui.label(theme::small(
+                "The march is the most expensive thing in the sky -- about 10 ms at \
+                 1280x720 on Medium against the clear sky's 2.4. Low halves the samples.",
+            ));
+            ui.add_space(4.0);
+            slider(ui, "Coverage", &mut env.clouds.coverage, 0.0..=1.0);
+            slider_log(ui, "Base m", &mut env.clouds.base_m, 200.0..=8000.0);
+            slider_log(ui, "Thickness m", &mut env.clouds.thickness_m, 100.0..=8000.0);
+            slider_log(ui, "Density", &mut env.clouds.density, 0.001..=0.5);
+            slider_log(ui, "Feature m", &mut env.clouds.feature_scale_m, 500.0..=40000.0);
+        });
+    });
+    ui.add_space(12.0);
+
+    // --- tone mapping ---
+    ui.label(theme::label("TONE MAPPING"));
+    ui.add_space(4.0);
+    theme::inset(8).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            for m in ToneMapper::ALL {
+                if ui.selectable_label(env.tone.mapper == m, m.label()).clicked() {
+                    env.tone.mapper = m;
+                }
+            }
+        });
+        ui.label(theme::small(
+            "ACES rolls highlights off while keeping their hue, so a sun disc stays \
+             yellow instead of becoming a white hole.",
+        ));
+        ui.add_space(6.0);
+        slider(ui, "Exposure EV", &mut env.tone.exposure_ev, -4.0..=4.0);
+        slider(ui, "Contrast", &mut env.tone.contrast, 0.5..=2.0);
+        slider(ui, "Saturation", &mut env.tone.saturation, 0.0..=2.0);
+        slider(ui, "White balance K", &mut env.tone.white_balance_k, 2000.0..=12000.0);
+    });
+
+    ui.add_space(14.0);
+    if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("Reset environment")).clicked()
+    {
+        env.reset();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Material editor
+// ---------------------------------------------------------------------------
+
+/// The selected material, and the settings that drive how it renders.
+pub struct MaterialView<'a> {
+    pub name: &'a str,
+    pub role: &'a str,
+    pub texture: Option<&'a egui::TextureHandle>,
+    pub params: &'a mut terra_render::material::LayerParams,
+}
+
+/// PBR settings for one material.
+///
+/// Opened by double-clicking a texture, in the Content browser or in the Paint
+/// palette. Every value here is per layer rather than global: one tiling scale
+/// across a whole palette leaves gravel blurred and a cliff face visibly
+/// repeating, because the two want repeats an order of magnitude apart.
+fn material_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAction) {
+    let Some(m) = v.material.as_mut() else {
+        ui.label(theme::muted("No material selected."));
+        ui.add_space(4.0);
+        ui.label(theme::small(
+            "Double-click a texture in the Content browser to edit how it renders.",
+        ));
+        return;
+    };
+
+    ui.horizontal(|ui| {
+        if let Some(tex) = m.texture {
+            ui.add(egui::Image::new(tex).fit_to_exact_size(vec2(48.0, 48.0)));
+        }
+        ui.vertical(|ui| {
+            ui.label(theme::heading(m.name));
+            ui.label(theme::small(m.role));
+        });
+    });
+    ui.add_space(8.0);
+
+    ui.label(theme::label("TILING"));
+    theme::inset(8).show(ui, |ui| {
+        slider_log(ui, "Repeat m", &mut m.params.tiling_m, 0.25..=64.0);
+        ui.label(theme::small(
+            "Metres per repeat. Smaller shows more grain up close and tiles more \
+             visibly at distance.",
+        ));
+    });
+    ui.add_space(8.0);
+
+    ui.label(theme::label("SURFACE"));
+    theme::inset(8).show(ui, |ui| {
+        slider(ui, "Normal strength", &mut m.params.normal_strength, 0.0..=3.0);
+        slider(ui, "Roughness", &mut m.params.roughness, 0.0..=2.0);
+        slider(ui, "Occlusion", &mut m.params.ao, 0.0..=1.0);
+    });
+    ui.add_space(8.0);
+
+    ui.label(theme::label("DEPTH"));
+    theme::inset(8).show(ui, |ui| {
+        slider(ui, "Parallax m", &mut m.params.parallax_m, 0.0..=0.25);
+        ui.label(theme::small(
+            "Offsets the texture lookup by its height channel, so stones and cracks \
+             occlude each other as the camera moves. This is what makes the surface \
+             read as relief rather than as a photograph of it. Zero is off, and off \
+             is cheaper.",
+        ));
+        ui.add_space(4.0);
+        slider(ui, "Blend band", &mut m.params.height_blend, 0.0..=0.6);
+        ui.label(theme::small(
+            "How wide a band this material contends with its neighbour in. Zero is a \
+             hard per-texel cut; wide lets it creep through.",
+        ));
+    });
+    ui.add_space(8.0);
+
+    ui.label(theme::label("TINT"));
+    theme::inset(8).show(ui, |ui| {
+        let mut rgb = m.params.tint;
+        if ui.color_edit_button_rgb(&mut rgb).changed() {
+            m.params.tint = rgb;
+        }
+        ui.label(theme::small("Multiplies the albedo. White leaves the texture alone."));
+    });
+
+    ui.add_space(10.0);
+    if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("Reset to defaults")).clicked()
+    {
+        *m.params = terra_render::material::LayerParams::default();
+    }
+    ui.add_space(4.0);
+    if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("Paint with this")).clicked() {
+        *action = EditorAction::PaintWithSelectedMaterial;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Content browser
+// ---------------------------------------------------------------------------
+
+/// One importable asset kind. The browser groups by this, and each group knows
+/// which extensions it will accept, so the file dialog can filter itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetKind {
+    /// A material set: albedo, normal, roughness in one folder.
+    Texture,
+    /// A greyscale map for the Noise sculpt brush.
+    Noise,
+    /// A mesh to scatter or place.
+    Model,
+}
+
+impl AssetKind {
+    pub const ALL: [AssetKind; 3] = [AssetKind::Texture, AssetKind::Noise, AssetKind::Model];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AssetKind::Texture => "Textures",
+            AssetKind::Noise => "Noise",
+            AssetKind::Model => "Models",
+        }
+    }
+
+    /// Extensions the import dialog offers for this kind.
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            AssetKind::Texture => &["png", "jpg", "jpeg"],
+            AssetKind::Noise => &["png", "jpg", "jpeg", "r16"],
+            AssetKind::Model => &["gltf", "glb"],
+        }
+    }
+
+    /// Subfolder of the project's `assets/` directory.
+    pub fn folder(self) -> &'static str {
+        match self {
+            AssetKind::Texture => "textures",
+            AssetKind::Noise => "noise",
+            AssetKind::Model => "models",
+        }
+    }
+}
+
+/// What the content browser has to show, read out of the project folder by the
+/// app before the UI runs.
+pub struct ContentView<'a> {
+    /// The project's `assets/` path, shown so it is obvious where uploads land.
+    pub root: &'a str,
+    /// Asset names per kind, in the same order as [`AssetKind::ALL`].
+    pub entries: [&'a [String]; 3],
+    /// Which kind's shelf is showing.
+    pub kind: AssetKind,
+}
+
+impl ContentView<'_> {
+    fn of(&self, kind: AssetKind) -> &[String] {
+        self.entries[AssetKind::ALL.iter().position(|k| *k == kind).unwrap_or(0)]
+    }
+}
+
+/// The project's own asset folder.
+///
+/// This is where uploads land, and it is deliberately a pane rather than a
+/// modal: importing a texture is something you do repeatedly while working, and
+/// a dialog that has to be dismissed between each one turns a batch into a
+/// chore.
+fn content_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAction) {
+    ui.horizontal(|ui| {
+        for k in AssetKind::ALL {
+            let n = v.content.of(k).len();
+            let label = format!("{}  {n}", k.label());
+            if ui.selectable_label(v.content.kind == k, label).clicked() {
+                *action = EditorAction::SelectAssetKind(k);
+            }
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button(format!("Import {}", v.content.kind.label())).clicked() {
+                *action = EditorAction::ImportAsset(v.content.kind);
+            }
+        });
+    });
+    ui.add_space(6.0);
+
+    let kind = v.content.kind;
+    let items = v.content.of(kind);
+    if items.is_empty() {
+        ui.add_space(10.0);
+        ui.label(theme::muted(&format!("No {} in this project yet.", kind.label().to_lowercase())));
+        ui.add_space(4.0);
+        ui.label(theme::small(&format!(
+            "Import copies the file into {}/{}/ inside the project, so the project stays \
+             movable -- nothing here stores a path outside it.",
+            v.content.root,
+            kind.folder()
+        )));
+        return;
+    }
+
+    // A wrapping shelf rather than a list: these are pictures, and the whole
+    // point of a content browser is seeing them at a glance.
+    ui.horizontal_wrapped(|ui| {
+        for (i, name) in items.iter().enumerate() {
+            let selected = kind == AssetKind::Noise && v.noise.pattern.label() == name.as_str();
+            let resp = ui.selectable_label(selected, name);
+            match kind {
+                AssetKind::Noise if resp.clicked() => {
+                    *action = EditorAction::SelectNoise(name.clone());
+                }
+                // Double-click, as in Unreal: single-click selects, double-click
+                // opens the asset for editing.
+                AssetKind::Texture if resp.double_clicked() => {
+                    *action = EditorAction::OpenMaterial(i);
+                }
+                _ => {}
+            }
+            if kind == AssetKind::Texture {
+                resp.on_hover_text("Double-click to edit this material");
+            }
+        }
+    });
+    ui.add_space(8.0);
+    ui.label(theme::small(&format!("{}/{}", v.content.root, kind.folder())));
+}
+
+// ---------------------------------------------------------------------------
+// Modifier stack
+// ---------------------------------------------------------------------------
+
+/// The cave and tunnel stack.
+///
+/// Order is shown top-to-bottom as evaluation order, because that is what
+/// decides the result: a plug added after a carve blocks the passage, and the
+/// same two entries the other way round leave it open.
+fn modifiers_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAction) {
+    use terra_voxel::Op;
+
+    // Stacked rather than side by side: this pane is narrow by default, and a
+    // right-aligned button on the same row as the heading overlaps it.
+    ui.label(theme::label("STACK"));
+    ui.add_space(4.0);
+    if ui.add_sized([ui.available_width(), 28.0], egui::Button::new("Add tunnel")).clicked() {
+        *action = EditorAction::AddTunnel;
+    }
+    ui.add_space(6.0);
+
+    if v.modifiers.is_empty() {
+        ui.label(theme::muted("No caves yet."));
+        ui.add_space(4.0);
+        ui.label(theme::small(
+            "A modifier carves the rock without destroying it. Switch one off and the \
+             passage fills back in exactly as it was, however much you have sculpted \
+             around it since.",
+        ));
+        return;
+    }
+
+    let selected = *v.selected_modifier;
+    let mut clicked = None;
+    let mut remove = None;
+    for (i, m) in v.modifiers.items.iter_mut().enumerate() {
+        theme::inset(6).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Enabled first: it is the control most often reached for, and
+                // toggling it is how you see what a cave is doing.
+                ui.checkbox(&mut m.enabled, "");
+                let label = format!("{}  \u{2022}  {}", m.name, m.op.label());
+                if ui.selectable_label(selected == Some(i), label).clicked() {
+                    clicked = Some(i);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("\u{00D7}").on_hover_text("Delete").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            });
+            if selected == Some(i) {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    for op in Op::ALL {
+                        if ui.selectable_label(m.op == op, op.label()).clicked() {
+                            m.op = op;
+                        }
+                    }
+                });
+                slider(ui, "Blend m", &mut m.blend, 0.0..=6.0);
+                ui.label(theme::small(
+                    "Rounds the join where the cave meets rock. Zero is a knife edge.",
+                ));
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    if let Some(i) = clicked {
+        *v.selected_modifier = Some(i);
+    }
+    if let Some(i) = remove {
+        *action = EditorAction::DeleteModifier(i);
+    }
 }
 
 /// Panel heights, sized to the tallest control each one holds rather than to
@@ -817,6 +1432,83 @@ fn collapse_row(ui: &mut egui::Ui, arrow: &str, title: &str) -> bool {
 /// sides left 30 for a button that wants 35 -- so the row was clipped.
 const TOOLBAR_H: f32 = 54.0;
 const STATUS_H: f32 = 32.0;
+
+/// The View menu: pane visibility, floating, and the layout reset.
+///
+/// This is the only way back once a pane is closed, which makes it load-bearing
+/// rather than a convenience. Without it the close button on a tab is a one-way
+/// trip and the pane is gone for the session -- which is exactly what the first
+/// version of the dock shipped as.
+///
+/// Mutates the layout directly instead of returning an `EditorAction`. The
+/// `DockArea` below borrows the layout again afterwards, and the two borrows are
+/// sequential, so there is nothing for an action round-trip to buy.
+fn view_menu(
+    ui: &mut egui::Ui,
+    layout: &mut crate::dock::Layout,
+    view_mode: &mut terra_render::ViewMode,
+    editing: bool,
+) {
+    use crate::dock::Tab;
+
+    ui.menu_button("View", |ui| {
+        // Bounded, or the hint at the bottom stretches the menu to the width of
+        // its longest line -- about 600 px, which reads as a dialog.
+        ui.set_min_width(200.0);
+        ui.set_max_width(240.0);
+
+        // Visualization first: it is the thing most often reached for, and the
+        // hotkeys are listed beside each entry because that is how they get
+        // learned.
+        //
+        // Absent entirely while driving rather than greyed out. These are
+        // authoring views; the moment the viewport is the game, offering to
+        // wireframe it is offering something that will not happen.
+        if editing {
+            ui.label(theme::label("VISUALIZE"));
+            for m in terra_render::ViewMode::ALL {
+                let selected = *view_mode == m;
+                let label = format!("{}\t\tAlt+{}", m.label(), m.hotkey_digit());
+                if ui.selectable_label(selected, label).clicked() {
+                    *view_mode = m;
+                }
+            }
+            ui.separator();
+        }
+
+        ui.label(theme::label("PANELS"));
+        for tab in Tab::DOCKABLE {
+            let mut open = layout.is_open(tab);
+            if ui.checkbox(&mut open, tab.title()).changed() {
+                layout.toggle(tab);
+            }
+        }
+
+        ui.separator();
+        ui.menu_button("Float a panel", |ui| {
+            for tab in Tab::DOCKABLE {
+                if ui.button(tab.title()).clicked() {
+                    layout.float(tab);
+                    ui.close();
+                }
+            }
+        });
+
+        ui.separator();
+        if ui.button("Reset layout").clicked() {
+            layout.reset();
+            ui.close();
+        }
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(theme::small(
+                "Drag a tab to re-dock it. Right-click a tab to eject it into a \
+             window. The arrow collapses a panel.",
+            ))
+            .wrap(),
+        );
+    });
+}
 
 fn hints(v: &EditorView<'_>, narrow: bool) -> &'static str {
     // Navigation first: it is the same in every tool, and it is what someone
@@ -834,11 +1526,11 @@ fn hints(v: &EditorView<'_>, narrow: bool) -> &'static str {
         }
         (false, Tool::Camera, false) => {
             "LMB orbit   \u{2022}   MMB pan   \u{2022}   Wheel zoom   \u{2022}   RMB look   \
-             \u{2022}   WASD move, Q/E down/up   \u{2022}   Shift boost"
+             \u{2022}   WASD move, Q/E down/up   \u{2022}   F frame   \u{2022}   Shift boost"
         }
         (false, Tool::Sculpt, false) => {
             "LMB sculpt   \u{2022}   MMB pan   \u{2022}   Wheel zoom   \u{2022}   RMB look   \
-             \u{2022}   WASD move, Q/E down/up   \u{2022}   [ ] brush size"
+             \u{2022}   WASD move, Q/E down/up   \u{2022}   F frame   \u{2022}   [ ] size, Shift + [ ] strength"
         }
         (false, Tool::Select, false) => {
             "LMB pick, drag to move   \u{2022}   Del remove   \u{2022}   MMB pan   \
@@ -846,16 +1538,27 @@ fn hints(v: &EditorView<'_>, narrow: bool) -> &'static str {
         }
         (false, Tool::Foliage, false) => {
             "LMB plant   \u{2022}   MMB pan   \u{2022}   Wheel zoom   \u{2022}   RMB look   \
-             \u{2022}   WASD move, Q/E down/up   \u{2022}   [ ] brush size"
+             \u{2022}   WASD move, Q/E down/up   \u{2022}   F frame   \u{2022}   [ ] size, Shift + [ ] strength"
         }
         (false, Tool::Paint, false) => {
             "LMB paint   \u{2022}   MMB pan   \u{2022}   Wheel zoom   \u{2022}   RMB look   \
-             \u{2022}   WASD move, Q/E down/up   \u{2022}   [ ] brush size"
+             \u{2022}   WASD move, Q/E down/up   \u{2022}   F frame   \u{2022}   [ ] size, Shift + [ ] strength"
         }
         (false, Tool::Road, false) => {
             "LMB drag to draw the track   \u{2022}   MMB pan   \u{2022}   Wheel zoom   \
-             \u{2022}   RMB look   \u{2022}   WASD move, Q/E down/up"
+             \u{2022}   RMB look   \u{2022}   WASD move, Q/E down/up   \u{2022}   F frame"
         }
+    }
+}
+
+/// What Ctrl does in a mode, for the tooltip. `None` where the mode has no
+/// meaningful opposite -- Flatten already pulls from both sides, and
+/// "un-smooth" is just noise, which is what the Noise mode is for.
+pub fn invert_label(m: SculptMode) -> Option<&'static str> {
+    match m {
+        SculptMode::Raise => Some("lower"),
+        SculptMode::Lower => Some("raise"),
+        _ => None,
     }
 }
 
@@ -877,6 +1580,8 @@ fn tools_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAct
         }
     }
 
+    brush_readout(ui, v);
+
     match *v.tool {
         Tool::Sculpt => {
             ui.add_space(20.0);
@@ -884,12 +1589,64 @@ fn tools_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAct
             ui.add_space(6.0);
             for m in SculptMode::ALL {
                 let w = ui.available_width();
-                if ui
-                    .add_sized([w, 32.0], egui::Button::selectable(*v.mode == m, m.label()))
-                    .clicked()
-                {
+                let resp = ui
+                    .add(egui::Button::selectable(*v.mode == m, m.label()).min_size(vec2(w, 26.0)));
+                if resp.clicked() {
                     *v.mode = m;
                 }
+                if let Some(inv) = invert_label(m) {
+                    resp.on_hover_text(format!("Hold Ctrl to {}", inv.to_lowercase()));
+                }
+            }
+
+            // Noise settings, only under the mode that reads them.
+            if v.mode.uses_noise() {
+                ui.add_space(16.0);
+                ui.label(theme::label("PATTERN"));
+                ui.add_space(6.0);
+                theme::inset(10).show(ui, |ui| {
+                    ui.label(theme::muted(v.noise.pattern.label()));
+                    if !v.noise.pattern.is_uploaded() {
+                        ui.label(theme::small(
+                            "Built in. Import a black-and-white image in the Content pane \
+                             to use your own.",
+                        ));
+                    }
+                    ui.add_space(6.0);
+                    slider_log(ui, "Feature m", &mut v.noise.scale_m, 1.0..=200.0);
+
+                    if let terra_voxel::NoisePattern::Procedural { seed, octaves, ridged } =
+                        &mut v.noise.pattern
+                    {
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(*ridged, "Ridged").clicked() {
+                                *ridged = true;
+                            }
+                            if ui.selectable_label(!*ridged, "Billow").clicked() {
+                                *ridged = false;
+                            }
+                        });
+                        let mut oct = *octaves as f32;
+                        slider(ui, "Octaves", &mut oct, 1.0..=8.0);
+                        *octaves = oct.round() as u32;
+                        if ui.button("Re-roll seed").clicked() {
+                            // Any change is enough; a counter keeps it
+                            // reproducible where a clock would not.
+                            *seed = seed.wrapping_add(0x9E37_79B9);
+                        }
+                    }
+
+                    if !v.noise_library.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(theme::small("Imported"));
+                        for name in v.noise_library {
+                            let on = v.noise.pattern.label() == name.as_str();
+                            if ui.selectable_label(on, name).clicked() {
+                                *action = EditorAction::SelectNoise(name.clone());
+                            }
+                        }
+                    }
+                });
             }
         }
         Tool::Camera => {
@@ -897,7 +1654,7 @@ fn tools_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAct
             ui.label(theme::label("NAVIGATE"));
             ui.add_space(8.0);
             ui.label(theme::muted(
-                "LMB drag   orbit\nMMB drag   pan\nWheel      zoom\nRMB drag   look\n\nWASD move, Q/E down/up\nShift      faster",
+                "LMB drag   orbit\nMMB drag   pan\nWheel      zoom\nRMB drag   look\n\nWASD move, Q/E down/up\nShift      faster\nF          frame the world",
             ));
             ui.add_space(12.0);
             ui.label(theme::small(
@@ -922,12 +1679,19 @@ fn tools_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAct
             ui.label(theme::label("MATERIALS"));
             ui.add_space(6.0);
             if v.palette.is_empty() {
+                ui.label(theme::muted("No materials imported."));
+                ui.add_space(4.0);
                 ui.label(theme::small(
-                    "No materials found. Put each texture set in its own folder under \
-                     assets/texture and restart.",
+                    "Import a texture set in the Content pane -- one folder per material, \
+                     with albedo, normal and roughness maps in it. Nothing ships prebuilt, \
+                     and imports appear here immediately; no restart.",
                 ));
             } else {
-                palette_grid(ui, v.palette, v.selected_layer);
+                let mut open_material = None;
+                palette_grid(ui, v.palette, v.selected_layer, &mut open_material);
+                if let Some(i) = open_material {
+                    *action = EditorAction::OpenMaterial(i);
+                }
             }
         }
         Tool::Foliage => {
@@ -949,7 +1713,13 @@ fn tools_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAct
             ui.label(theme::label("SPECIES"));
             ui.add_space(6.0);
             if v.foliage.is_empty() {
-                ui.label(theme::small("No species available."));
+                // Says what to do, not just that there is nothing. Nothing ships
+                // prebuilt, so an empty palette is the expected first state rather
+                // than a failure, and the message has to read that way.
+                ui.label(theme::small(
+                    "No meshes imported yet. Open the Content browser, choose Models, \
+                     and import a .glb or .gltf -- it becomes a species you can paint.",
+                ));
             } else {
                 species_grid(ui, v.foliage, v.selected_species);
                 if let Some(e) = v.foliage.get(*v.selected_species) {
@@ -1030,197 +1800,25 @@ fn tools_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAct
             }
         }
     }
-}
 
-/// Grass. Shared between the editor inspector and the in-play panel, because
-/// it is both an authoring choice and the largest performance dial there is.
-pub fn grass_controls(ui: &mut egui::Ui, grass: &mut GrassSettings) {
-    ui.checkbox(&mut grass.enabled, "Grass");
-    ui.add_enabled_ui(grass.enabled, |ui| {
-        ui.horizontal(|ui| {
-            for st in GrassStyle::ALL {
-                if ui.selectable_label(grass.style == st, st.label()).clicked() && grass.style != st
-                {
-                    grass.style = st;
-                    // A style carries its own height and density; picking one
-                    // and keeping meadow numbers gives a mown field of hay.
-                    let (h, d, dd) = st.suggested();
-                    grass.height_m = h;
-                    grass.density = d;
-                    grass.draw_distance = dd;
-                }
-            }
-        });
-        ui.label(theme::small(match grass.style {
-            GrassStyle::Lawn => {
-                "Short, even, upright, with cut tips. Needs far more blades to close \
-                 the ground, and is invisible past about twenty metres."
-            }
-            GrassStyle::Field => {
-                "Grown, not cut. Uneven lengths, leaning enough to catch light along \
-                 the blade, still short enough to read as ground."
-            }
-            GrassStyle::Meadow => {
-                "Tall, uneven, leaning, tapering to a point. Fewer blades cover more, \
-                 and it reads much further out."
-            }
-        }));
-        ui.add_space(6.0);
-        slider_log(ui, "Blades per m2", &mut grass.density, 200.0..=8000.0);
-        slider_log(ui, "Blade height m", &mut grass.height_m, 0.02..=2.0);
-        slider_log(ui, "Draw distance m", &mut grass.draw_distance, 10.0..=160.0);
-        ui.label(theme::small(
-            "Density in the near field. Beyond a few metres the field thins as the \
-             square of distance, which holds the blades per pixel steady rather than \
-             the blades per square metre -- otherwise nearly the whole budget goes to \
-             blades landing inside one pixel.",
-        ));
-        ui.add_space(4.0);
-        slider(ui, "Fade start", &mut grass.fade_start, 0.1..=0.9);
-        ui.label(theme::small(
-            "Where the dissolve begins, as a fraction of the draw distance. A short \
-             band concentrates the dither into a visible ring; a wide one hides it.",
-        ));
-        ui.add_space(4.0);
-        slider(ui, "Wind strength", &mut grass.wind_strength, 0.0..=0.8);
-        slider(ui, "Wind speed", &mut grass.wind_speed, 0.0..=4.0);
-        ui.label(theme::small(
-            "Grass grows on whatever the grass material is painted on. Paint a \
-             different material to clear a path through it.",
-        ));
-    });
-}
-
-/// Volumetric fog. Shared between the editor and the in-play panel.
-pub fn fog_controls(ui: &mut egui::Ui, fog: &mut FogSettings) {
-    ui.checkbox(&mut fog.enabled, "Volumetric fog");
-    ui.add_enabled_ui(fog.enabled, |ui| {
-        // Extinction per metre. The useful band is narrow and near zero: past
-        // about 0.002 a 450 m view is more fog than scene.
-        slider_log(ui, "Haze density", &mut fog.density, 0.00005..=0.02);
-        slider(ui, "Valley mist", &mut fog.mist_strength, 0.0..=0.01);
-        slider(ui, "Mist base height m", &mut fog.mist_base, -100.0..=1200.0);
-        slider_log(ui, "Mist falloff", &mut fog.mist_falloff, 0.002..=0.2);
-        ui.label(theme::small(
-            "Mist thickens below the base height and thins above it, so it pools in \
-             valleys and clears off ridges.",
-        ));
-        ui.add_space(4.0);
-        slider(ui, "Forward scattering", &mut fog.anisotropy, 0.0..=0.95);
-        ui.label(theme::small(
-            "How much the air throws light forward. Near 0 the fog is evenly bright; \
-             high values make looking toward the sun glow and away from it stay flat.",
-        ));
-        ui.add_space(4.0);
-        slider_log(ui, "Fog distance m", &mut fog.distance, 100.0..=2000.0);
-    });
-}
-
-/// Time of day, and the graphics dials that go with it.
-///
-/// Shared between the editor's inspector and the in-play overlay: the same
-/// settings, so a scene lit one way in the editor is lit that way when driven.
-pub fn sky_controls(ui: &mut egui::Ui, sky: &mut SkySettings, compact: bool) {
-    // `compact` is the in-play panel, where the world's sun is always what you
-    // are looking at. In the editor it is a choice.
-    if !compact {
-        ui.checkbox(&mut sky.editor_preview, "Preview time of day");
-        ui.label(theme::small(if sky.editor_preview {
-            "The viewport is showing the world's own sun. The cycle runs here too."
-        } else {
-            "The viewport uses a fixed neutral sun. These settings still apply when you \
-             press Play."
-        }));
-        ui.add_space(8.0);
-    }
-    let hour = sky.time_of_day;
-    ui.label(theme::small(&format!(
-        "Time  {:02}:{:02}",
-        hour.floor() as u32,
-        ((hour.fract()) * 60.0) as u32
-    )));
-    let w = ui.available_width();
-    ui.style_mut().spacing.slider_width = (w - VALUE_BOX_W).max(36.0);
-    ui.add(egui::Slider::new(&mut sky.time_of_day, 0.0..=24.0).show_value(false));
-
-    ui.horizontal(|ui| {
-        // The presets are what anyone actually reaches for; the slider is for
-        // the shot between them.
-        for (label, t) in [("Dawn", 6.4), ("Noon", 12.0), ("Dusk", 18.0), ("Night", 1.0)] {
-            if ui.small_button(label).clicked() {
-                sky.time_of_day = t;
-            }
-        }
-    });
-    ui.add_space(4.0);
-    ui.checkbox(&mut sky.cycle_running, "Run day/night cycle");
-    if sky.cycle_running {
-        slider_log(ui, "Hours per second", &mut sky.day_speed, 0.02..=6.0);
-    }
-    if !compact && sky.cycle_running && !sky.editor_preview {
-        // The clock only advances where the sun is being shown, so saying the
-        // cycle is "running" here without this reads as a broken setting.
-        ui.label(theme::small("The clock advances in Play, or with preview on."));
-    }
-
-    if compact {
-        return;
-    }
-    ui.add_space(10.0);
-    ui.label(theme::label("SHADOWS"));
-    ui.add_space(4.0);
-    shadow_controls(ui, sky);
-
-    ui.add_space(10.0);
-    ui.label(theme::label("ATMOSPHERE"));
-    ui.add_space(4.0);
-    atmosphere_controls(ui, sky);
-}
-
-/// God rays, haze and exposure. Shared with the in-play panel so a shot set up
-/// in the editor is the shot that gets driven.
-pub fn atmosphere_controls(ui: &mut egui::Ui, sky: &mut SkySettings) {
-    ui.checkbox(&mut sky.temporal_aa, "Temporal AA");
-    ui.label(theme::small(
-        "Accumulates a jittered sub-pixel offset across frames. It is what \
-         resolves grass blades about a pixel wide, and what turns the grass \
-         dissolve from a stipple into a fade.",
-    ));
-    ui.add_space(6.0);
-    slider(ui, "Screen-space rays", &mut sky.god_rays, 0.0..=1.5);
-    ui.label(theme::small(
-        "A screen-space bloom along the sun's direction. The volumetric fog now \
-         produces true shafts in 3D; this only adds glare around the sun itself, \
-         and only when it is in frame.",
-    ));
-    slider(ui, "Haze", &mut sky.haze, 0.0..=2.5);
-    slider(ui, "Exposure", &mut sky.exposure, 0.4..=2.0);
+    // The active tool's own settings, directly beneath it.
+    tool_settings(ui, v, action);
 }
 
 /// The one control most people will touch. Applying a preset writes through to
 /// every individual setting, which stay editable afterwards -- picking a preset
 /// is a starting point, not a mode.
-pub fn quality_presets(
-    ui: &mut egui::Ui,
-    sky: &mut SkySettings,
-    grass: &mut GrassSettings,
-    fog: &mut FogSettings,
-) {
+pub fn quality_presets(ui: &mut egui::Ui, sky: &mut SkySettings) {
     ui.horizontal_wrapped(|ui| {
         for q in Quality::ALL {
             if ui.button(q.label()).clicked() {
-                let (shadows, distance, rays, taa) = q.sky();
+                // Shadows and TAA only. God rays and fog used to be set here
+                // too, which meant picking a quality level silently overwrote
+                // the artist's environment -- the mixer owns those now.
+                let (shadows, distance, _rays, taa) = q.sky();
                 sky.shadow_quality = shadows;
                 sky.shadow_distance = distance;
-                sky.god_rays = rays;
                 sky.temporal_aa = taa;
-                let (on, density, draw) = q.grass();
-                grass.enabled = on;
-                grass.density = density;
-                grass.draw_distance = draw;
-                let (fog_on, fog_distance) = q.fog();
-                fog.enabled = fog_on;
-                fog.distance = fog_distance;
             }
         }
     });
@@ -1294,7 +1892,12 @@ fn species_grid(ui: &mut egui::Ui, entries: &[FoliageEntry], selected: &mut usiz
 /// Material swatches, the way every terrain tool presents them: the picture is
 /// the control. A list of folder names would be technically equivalent and
 /// useless -- you choose a ground texture by looking at it.
-fn palette_grid(ui: &mut egui::Ui, palette: &[PaletteEntry<'_>], selected: &mut u32) {
+fn palette_grid(
+    ui: &mut egui::Ui,
+    palette: &[PaletteEntry<'_>],
+    selected: &mut u32,
+    open_material: &mut Option<usize>,
+) {
     const CELL: f32 = 58.0;
     let avail = ui.available_width();
     let cols = ((avail + 6.0) / (CELL + 6.0)).floor().max(1.0) as usize;
@@ -1334,7 +1937,13 @@ fn palette_grid(ui: &mut egui::Ui, palette: &[PaletteEntry<'_>], selected: &mut 
                 if resp.clicked() {
                     *selected = index;
                 }
-                resp.on_hover_text(format!("{}  ({})", entry.name, entry.role));
+                if resp.double_clicked() {
+                    *open_material = Some(index as usize);
+                }
+                resp.on_hover_text(format!(
+                    "{}  ({})\nDouble-click to edit this material",
+                    entry.name, entry.role
+                ));
             }
         });
     }
@@ -1345,39 +1954,52 @@ fn palette_grid(ui: &mut egui::Ui, palette: &[PaletteEntry<'_>], selected: &mut 
     }
 }
 
-fn inspector_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAction) {
-    ui.label(theme::label("QUALITY"));
-    ui.add_space(6.0);
-    quality_presets(ui, v.sky, v.grass, v.fog);
-    ui.add_space(18.0);
-
-    ui.label(theme::label("GRASS"));
-    ui.add_space(8.0);
-    theme::inset(10).show(ui, |ui| {
-        grass_controls(ui, v.grass);
-    });
-    ui.add_space(18.0);
-
-    ui.label(theme::label("FOG"));
-    ui.add_space(8.0);
-    theme::inset(10).show(ui, |ui| {
-        fog_controls(ui, v.fog);
-    });
-    ui.add_space(18.0);
-
-    ui.label(theme::label("ENVIRONMENT"));
-    ui.add_space(8.0);
-    theme::inset(10).show(ui, |ui| {
-        sky_controls(ui, v.sky, false);
-    });
-    ui.add_space(18.0);
-
+/// Settings for whichever tool is active, and nothing else.
+///
+/// This lives in the Tools pane, directly under the tool list, rather than in a
+/// single always-on settings column. Showing every tool's controls at once
+/// meant the sculpt sliders sat next to road cross-section sliders next to
+/// foliage rules, and the reader had to work out which of them the current tool
+/// would even read. Selecting a tool now selects its settings too.
+///
+/// Brush size and strength are deliberately *not* here as sliders any more --
+/// they are on `[` and `]`. The readout below is a display, not a control.
+/// Brush size and strength, as a readout rather than sliders.
+///
+/// The keys are the interface -- `[` and `]` for size, with Shift for strength,
+/// as in Unreal. A slider here would be a second source of truth for the same
+/// number, and the request was explicitly to take these controls off the panel.
+fn brush_readout(ui: &mut egui::Ui, v: &EditorView<'_>) {
+    if !v.tool.edits() {
+        return;
+    }
+    ui.add_space(16.0);
     ui.label(theme::label("BRUSH"));
-    ui.add_space(8.0);
+    ui.add_space(6.0);
     theme::inset(10).show(ui, |ui| {
-        slider(ui, "Radius m", v.radius, 8.0..=800.0);
-        slider(ui, "Strength", v.strength, 0.05..=8.0);
+        // Read-only readouts. The keys are the interface; a slider here would
+        // be a second source of truth for the same number.
+        ui.horizontal(|ui| {
+            ui.label(theme::small("Size"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(theme::muted(&format!("{:.0} m", *v.radius)));
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label(theme::small("Strength"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(theme::muted(&format!("{:.2}", *v.strength)));
+            });
+        });
+        ui.add_space(4.0);
+        ui.label(theme::small("[ ]  size          Shift + [ ]  strength"));
     });
+}
+
+fn tool_settings(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAction) {
+    if !v.tool.edits() {
+        return;
+    }
 
     if *v.tool == Tool::Paint {
         ui.label(theme::label("PAINT"));
@@ -1422,7 +2044,24 @@ fn inspector_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut Edito
         let selected = *v.selected_species;
         theme::inset(10).show(ui, |ui| {
             if let Some(r) = v.species_rules.as_deref_mut() {
+                // Grouped and named as Unreal's Foliage Type groups them, so someone
+                // who knows that panel can find the control they are looking for.
+                ui.label(theme::small("PLACEMENT"));
                 slider_log(ui, "Per hectare", &mut r.density, 1.0..=600.0);
+                slider(ui, "Radius m", &mut r.radius_m, 0.0..=40.0);
+                ui.label(theme::small(
+                    "Minimum gap between instances. Density alone cannot say \
+                     \"sparse but never overlapping\".",
+                ));
+
+                ui.add_space(10.0);
+                ui.label(theme::small("SIZE"));
+                slider_log(ui, "Height m", &mut r.height_m, 0.05..=60.0);
+                ui.label(theme::small(
+                    "Real-world height of one instance. Every imported mesh is \
+                     normalised to a metre, so this is the size on screen whatever \
+                     the file was authored at.",
+                ));
                 slider(ui, "Scale min", &mut r.scale_min, 0.1..=3.0);
                 slider(ui, "Scale max", &mut r.scale_max, 0.1..=4.0);
                 // Keeping these ordered here rather than validating later means
@@ -1430,27 +2069,65 @@ fn inspector_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut Edito
                 if r.scale_max < r.scale_min {
                     r.scale_max = r.scale_min;
                 }
-                slider(ui, "Lean to slope", &mut r.align_to_normal, 0.0..=1.0);
+                slider(ui, "Z offset m", &mut r.z_offset_m, -3.0..=3.0);
+                ui.label(theme::small("Negative beds the instance into the ground."));
+
+                ui.add_space(10.0);
+                ui.label(theme::small("ROTATION"));
+                // The setting the whole cliff question comes down to, so it leads the
+                // group and says what it does on a cliff rather than in the abstract.
+                ui.checkbox(&mut r.align_to_normal, "Align to Normal");
+                ui.label(theme::small(if r.align_to_normal {
+                    "Instances stand perpendicular to the ground, so they tilt with a \
+                     slope and grow sideways out of a cliff. Right for rocks and \
+                     ground cover."
+                } else {
+                    "Instances point to the sky whatever the ground does, so a tree on \
+                     a cliff still stands upright. Right for anything that grows \
+                     toward the light."
+                }));
+                ui.add_enabled_ui(r.align_to_normal, |ui| {
+                    slider(ui, "Align max angle", &mut r.align_max_angle_deg, 0.0..=90.0);
+                    ui.label(theme::small(
+                        "Ceiling on that tilt, in degrees from vertical. Lets a species \
+                         lean into moderate ground without lying down on a cliff.",
+                    ));
+                });
+                ui.add_space(4.0);
+                ui.checkbox(&mut r.random_yaw, "Random yaw");
+                slider(ui, "Random pitch", &mut r.random_pitch_deg, 0.0..=30.0);
+
+                ui.add_space(10.0);
+                ui.label(theme::small("FILTERS"));
+                slider(ui, "Slope min deg", &mut r.slope_min_deg, 0.0..=90.0);
+                slider(ui, "Slope max deg", &mut r.slope_max_deg, 0.0..=90.0);
+                if r.slope_max_deg < r.slope_min_deg {
+                    r.slope_max_deg = r.slope_min_deg;
+                }
                 ui.label(theme::small(
-                    "0 stands every instance upright, 1 lays it flat against the hillside. \
-                     Trees want a little, rocks want a lot.",
+                    "Ground steepness this species accepts. Raise the minimum to put \
+                     something on cliffs and nowhere else.",
                 ));
-                ui.add_space(6.0);
-                slider(ui, "Max slope", &mut r.slope_max, 0.05..=1.0);
+                ui.add_space(4.0);
                 slider(ui, "Min height m", &mut r.altitude_min, -200.0..=2500.0);
                 slider(ui, "Max height m", &mut r.altitude_max, -200.0..=2500.0);
                 if r.altitude_max < r.altitude_min {
                     r.altitude_max = r.altitude_min;
                 }
-                slider(ui, "Bed into ground", &mut r.sink, 0.0..=0.6);
-                ui.add_space(6.0);
+
+                ui.add_space(10.0);
+                ui.label(theme::small("RENDERING"));
+                ui.checkbox(&mut r.cast_shadow, "Cast shadow");
                 slider_log(ui, "Draw distance m", &mut r.cull_distance, 100.0..=3000.0);
                 ui.label(theme::small(
                     "Beyond this, instances are not drawn at all. The main cost control: \
                      small props can be cut short, a treeline cannot.",
                 ));
             } else {
-                ui.label(theme::small("No species selected."));
+                ui.label(theme::small(
+                    "No species selected. Import a mesh in the Content browser \
+                     to add one.",
+                ));
             }
         });
 
@@ -1541,6 +2218,25 @@ fn inspector_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut Edito
         });
         ui.add_space(18.0);
     }
+}
+
+fn inspector_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAction) {
+    // Frame-time settings only. Everything that changes how the world *looks*
+    // moved to the Environment pane; what is left here costs milliseconds.
+    ui.label(theme::label("QUALITY"));
+    ui.add_space(6.0);
+    theme::inset(10).show(ui, |ui| {
+        quality_presets(ui, v.sky);
+        ui.add_space(8.0);
+        shadow_controls(ui, v.sky);
+        ui.add_space(6.0);
+        ui.checkbox(&mut v.sky.temporal_aa, "Temporal AA");
+        ui.label(theme::small(
+            "Accumulates a jittered sub-pixel offset across frames, which is what \
+             resolves foliage about a pixel wide.",
+        ));
+    });
+    ui.add_space(18.0);
 
     ui.add_space(20.0);
     ui.label(theme::label("TERRAIN"));
@@ -1580,7 +2276,7 @@ fn thousands(n: u32) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(' ');
         }
         out.push(c);
@@ -1624,11 +2320,47 @@ fn slider_inner<Num: egui::emath::Numeric>(
     range: std::ops::RangeInclusive<Num>,
     log: bool,
 ) {
-    ui.label(theme::small(caption));
+    // Caption and value share one row; the slider gets the full width below it.
+    //
+    // The previous layout put the value box *beside* the slider and reserved a
+    // fixed 74 px for it, so once a panel narrowed past about 110 px the
+    // `.max(36.0)` floor stopped the slider shrinking and the value box ran off
+    // the panel edge -- which is exactly what a docked Details panel does when
+    // the window is not wide. Splitting the rows means the width demanded is
+    // never more than the width available, at any panel size.
     let w = ui.available_width();
-    ui.style_mut().spacing.slider_width = (w - VALUE_BOX_W).max(36.0);
-    ui.add(egui::Slider::new(value, range).logarithmic(log));
+    ui.horizontal(|ui| {
+        ui.label(theme::small(caption));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // Bounded by the panel, not by a constant.
+            ui.style_mut().spacing.interact_size.x = VALUE_BOX_W.min(w * 0.45);
+            ui.add(egui::DragValue::new(value).speed(drag_speed(&range)));
+        });
+    });
+    ui.style_mut().spacing.slider_width = w.max(24.0);
+    ui.add(egui::Slider::new(value, range).logarithmic(log).show_value(false));
     ui.add_space(2.0);
+}
+
+/// A slider that reports whether the value moved.
+///
+/// Needed where a change has to trigger something -- dragging the hour has to
+/// re-derive the sun position, and only on the frames it actually moved.
+fn slider_changed<Num: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    caption: &str,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+) -> bool {
+    let before = value.to_f64();
+    slider(ui, caption, value, range);
+    value.to_f64() != before
+}
+
+/// Drag step for a range, so a 0..1 control is not as coarse as a 0..3000 one.
+fn drag_speed<Num: egui::emath::Numeric>(range: &std::ops::RangeInclusive<Num>) -> f64 {
+    let span = range.end().to_f64() - range.start().to_f64();
+    (span / 400.0).max(1e-4)
 }
 
 fn row(ui: &mut egui::Ui, key: &str, value: &str) {
@@ -1650,8 +2382,7 @@ fn row(ui: &mut egui::Ui, key: &str, value: &str) {
 pub fn play_overlay(
     root: &mut egui::Ui,
     sky: &mut SkySettings,
-    grass: &mut GrassSettings,
-    fog: &mut FogSettings,
+    env: &mut terra_render::Environment,
     open: &mut bool,
 ) {
     egui::Area::new("play-graphics".into()).anchor(Align2::LEFT_TOP, vec2(16.0, 16.0)).show(
@@ -1674,29 +2405,19 @@ pub fn play_overlay(
                     });
                 });
                 ui.add_space(6.0);
-                quality_presets(ui, sky, grass, fog);
-                ui.add_space(10.0);
-                sky_controls(ui, sky, true);
-
+                quality_presets(ui, sky);
                 ui.add_space(10.0);
                 ui.label(theme::label("SHADOWS"));
                 ui.add_space(4.0);
                 shadow_controls(ui, sky);
 
+                // The same mixer as the editor's, scrolled: a shot set up while
+                // driving is the shot the editor shows, and duplicating a
+                // reduced version of these controls is how the two drift.
                 ui.add_space(10.0);
-                ui.label(theme::label("GRASS"));
-                ui.add_space(4.0);
-                grass_controls(ui, grass);
-
-                ui.add_space(10.0);
-                ui.label(theme::label("FOG"));
-                ui.add_space(4.0);
-                fog_controls(ui, fog);
-
-                ui.add_space(10.0);
-                ui.label(theme::label("ATMOSPHERE"));
-                ui.add_space(4.0);
-                atmosphere_controls(ui, sky);
+                egui::ScrollArea::vertical().max_height(420.0).id_salt("play-env").show(ui, |ui| {
+                    environment_panel(ui, env);
+                });
             });
         },
     );

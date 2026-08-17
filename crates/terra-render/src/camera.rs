@@ -41,6 +41,16 @@ impl Default for Camera {
     }
 }
 
+/// How close the pitch may come to straight up or down.
+///
+/// Not cosmetic. `right()` is `forward().cross(Y)`, whose length is `cos(pitch)`
+/// -- at exactly +/- pi/2 that is zero, `normalize()` returns NaN, and the NaN
+/// spreads to `up()`, the view matrix and every pass that reads it. One shared
+/// constant so `rotate`, `orbit` and `look_toward` cannot disagree about it;
+/// `orbit` used its own slightly larger value, which is the kind of difference
+/// that hides a division by almost-zero.
+pub const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
+
 impl Camera {
     pub fn forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
@@ -92,9 +102,8 @@ impl Camera {
     }
 
     pub fn rotate(&mut self, dx: f32, dy: f32) {
-        const LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
         self.yaw += dx;
-        self.pitch = (self.pitch - dy).clamp(-LIMIT, LIMIT);
+        self.pitch = (self.pitch - dy).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
     /// Camera-space up. Matches the basis [`Self::look_at`] builds, so panning
@@ -133,7 +142,12 @@ impl Camera {
         }
         let d = d.normalize();
         self.yaw = d.z.atan2(d.x);
-        self.pitch = d.y.clamp(-1.0, 1.0).asin();
+        // Clamped like `rotate`. A target directly overhead gives `asin(1)` =
+        // pi/2 exactly, where `right()` degenerates to a zero-length cross
+        // product and the whole view matrix becomes NaN. `orbit` happens to
+        // clamp its elevation before calling this, but a public method must not
+        // depend on its only current caller being careful.
+        self.pitch = d.y.clamp(-1.0, 1.0).asin().clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
     /// Swing around `pivot`, keeping it framed and keeping the distance to it.
@@ -143,18 +157,43 @@ impl Camera {
     /// travel around it, which is what every DCC tool means by orbit and what
     /// turning in place can never do.
     pub fn orbit(&mut self, pivot: Vec3, dyaw: f32, dpitch: f32) {
-        const LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
         let offset = self.pos - pivot;
         let radius = offset.length();
         if radius < 1e-3 {
             return;
         }
         let azimuth = offset.z.atan2(offset.x) + dyaw;
-        let elevation = ((offset.y / radius).clamp(-1.0, 1.0).asin() + dpitch).clamp(-LIMIT, LIMIT);
+        let elevation =
+            ((offset.y / radius).clamp(-1.0, 1.0).asin() + dpitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
         let (sa, ca) = azimuth.sin_cos();
         let (se, ce) = elevation.sin_cos();
         self.pos = pivot + Vec3::new(ca * ce, se, sa * ce) * radius;
         self.look_toward(pivot);
+    }
+
+    /// Place the camera so a sphere of `radius` at `centre` fills the view.
+    ///
+    /// The escape hatch every DCC tool binds to `F`, and the reason it matters
+    /// here is that the wheel is geometric: a few seconds of scrolling out puts
+    /// the camera far enough away that nothing else recovers in reasonable time.
+    /// A key that always returns to a known-good framing is worth more than any
+    /// amount of tuning the other controls.
+    ///
+    /// Framed from above at a shallow angle rather than straight on, because a
+    /// landscape seen edge-on tells you nothing about its relief.
+    pub fn frame(&mut self, centre: Vec3, radius: f32) {
+        // Distance at which the sphere subtends the vertical field of view, with
+        // a margin so it is not flush against the edges.
+        let dist = (radius / (self.fov_y * 0.5).tan().max(1e-3)) * 1.25;
+        // 35 degrees down: high enough to read the terrain as a surface, low
+        // enough to keep the silhouette against the sky.
+        let elevation = 35f32.to_radians();
+        let (se, ce) = elevation.sin_cos();
+        // Kept on the camera's current bearing, so framing does not also spin the
+        // view to some arbitrary compass direction.
+        let (sy, cy) = self.yaw.sin_cos();
+        self.pos = centre - Vec3::new(cy * ce, -se, sy * ce) * dist;
+        self.look_toward(centre);
     }
 
     /// `dir` is (right, up, forward) in camera space, each in -1..=1.
@@ -250,6 +289,108 @@ mod tests {
     }
 
     #[test]
+    fn framing_fits_the_target_and_looks_at_it() {
+        let centre = Vec3::new(120.0, 40.0, -80.0);
+        let radius = 2000.0;
+        let mut cam = Camera { pos: Vec3::new(0.0, 5.0, 0.0), ..Default::default() };
+        cam.frame(centre, radius);
+
+        // Looking at it.
+        let to_centre = (centre - cam.pos).normalize();
+        assert!(cam.forward().dot(to_centre) > 0.999, "framing must aim at the target");
+
+        // And far enough back that it fits, with the margin.
+        let dist = cam.pos.distance(centre);
+        let half_visible = dist * (cam.fov_y * 0.5).tan();
+        assert!(half_visible > radius, "the target does not fit: {half_visible} vs {radius}");
+        assert!(half_visible < radius * 2.0, "framed far too loosely: {half_visible}");
+
+        // From above, so the relief reads.
+        assert!(cam.pos.y > centre.y, "framing should look down at the terrain");
+        assert!(cam.pitch < 0.0, "pitch should be downward");
+    }
+
+    #[test]
+    fn framing_recovers_from_being_stranded() {
+        // The case it exists for: the wheel is geometric, so a few seconds of
+        // scrolling out reaches hundreds of kilometres and nothing else brings the
+        // camera back in reasonable time.
+        let centre = Vec3::new(0.0, 256.0, 0.0);
+        let radius = 2000.0;
+        let mut cam = Camera { pos: Vec3::new(0.0, 400_000.0, 800_000.0), ..Default::default() };
+        cam.frame(centre, radius);
+        assert!(
+            cam.pos.distance(centre) < radius * 6.0,
+            "still {} m away after framing",
+            cam.pos.distance(centre)
+        );
+        assert!(cam.pos.is_finite());
+    }
+
+    #[test]
+    fn framing_keeps_the_current_bearing() {
+        // Framing should not also spin the view to some arbitrary compass
+        // direction -- the point is to recover the distance, not to reorient.
+        for yaw in [0.0, 1.0, 2.5, -2.0] {
+            let mut cam =
+                Camera { yaw, pos: Vec3::new(9999.0, 9999.0, 9999.0), ..Default::default() };
+            cam.frame(Vec3::ZERO, 500.0);
+            let delta = (cam.yaw - yaw).rem_euclid(std::f32::consts::TAU);
+            let delta = delta.min(std::f32::consts::TAU - delta);
+            assert!(delta < 1e-3, "yaw moved from {yaw} to {} ", cam.yaw);
+        }
+    }
+
+    #[test]
+    fn the_camera_basis_stays_finite_at_the_pitch_limit() {
+        // `right()` is `forward().cross(Y)`, whose length is `cos(pitch)`. At
+        // exactly +/- pi/2 that is zero and `normalize()` returns NaN, which
+        // spreads to `up()`, the view matrix, and every pass that reads it. The
+        // limit exists to keep that cross product away from zero.
+        for pitch in [PITCH_LIMIT, -PITCH_LIMIT] {
+            let cam = Camera { pitch, ..Default::default() };
+            assert!(cam.forward().is_finite(), "forward went non-finite at {pitch}");
+            assert!(cam.right().is_finite(), "right went non-finite at {pitch}");
+            assert!(cam.up().is_finite(), "up went non-finite at {pitch}");
+            assert!(
+                cam.look_at().to_cols_array().iter().all(|v| v.is_finite()),
+                "the view matrix went non-finite at {pitch}"
+            );
+        }
+    }
+
+    #[test]
+    fn looking_straight_up_does_not_produce_nan() {
+        // `look_toward` is public, and a target directly overhead gives
+        // `asin(1)` = pi/2 exactly. `orbit` happens to clamp before calling it,
+        // but the method cannot rely on that.
+        let mut cam = Camera { pos: Vec3::ZERO, ..Default::default() };
+        cam.look_toward(Vec3::new(0.0, 1000.0, 0.0));
+        assert!(cam.pitch.abs() <= PITCH_LIMIT, "pitch {} exceeded the limit", cam.pitch);
+        assert!(cam.right().is_finite() && cam.up().is_finite());
+
+        cam.look_toward(Vec3::new(0.0, -1000.0, 0.0));
+        assert!(cam.pitch.abs() <= PITCH_LIMIT);
+        assert!(cam.right().is_finite() && cam.up().is_finite());
+    }
+
+    #[test]
+    fn orbit_and_rotate_share_one_pitch_limit() {
+        // They used slightly different values, which is the kind of difference
+        // that hides a division by almost-zero in whichever is looser.
+        let mut turned = Camera { pos: Vec3::ZERO, ..Default::default() };
+        for _ in 0..200 {
+            turned.rotate(0.0, -1.0);
+        }
+        let mut orbited = Camera { pos: Vec3::new(0.0, 0.0, 50.0), ..Default::default() };
+        for _ in 0..200 {
+            orbited.orbit(Vec3::ZERO, 0.0, 1.0);
+        }
+        assert!((turned.pitch.abs() - PITCH_LIMIT).abs() < 1e-4, "rotate: {}", turned.pitch);
+        assert!((orbited.pitch.abs() - PITCH_LIMIT).abs() < 1e-3, "orbit: {}", orbited.pitch);
+    }
+
+    #[test]
     fn pitch_cannot_flip_over_the_pole() {
         let mut cam = Camera::default();
         for _ in 0..200 {
@@ -257,5 +398,63 @@ mod tests {
         }
         assert!(cam.pitch > -std::f32::consts::FRAC_PI_2);
         assert!(cam.forward().is_finite());
+    }
+}
+
+#[cfg(test)]
+mod focus_scale_tests {
+    use super::*;
+
+    /// The rule `update_editor` applies: pan and zoom scale by the distance to
+    /// what is on screen, falling back to height above ground when the view
+    /// misses the terrain.
+    fn focus_dist(hit: Option<f32>, above_ground: f32, min: f32, max: f32) -> f32 {
+        hit.unwrap_or(above_ground).clamp(min, max)
+    }
+
+    #[test]
+    fn a_distant_view_from_low_altitude_scales_by_the_distance() {
+        // The bug: five metres up, looking at a ridge two kilometres away, the
+        // pan scaled by five metres and the drag felt frozen.
+        let cam = Camera { fov_y: 60f32.to_radians(), ..Default::default() };
+        let low_and_far = focus_dist(Some(2000.0), 5.0, 4.0, 6000.0);
+        let old_behaviour = focus_dist(None, 5.0, 4.0, 6000.0);
+        assert_eq!(low_and_far, 2000.0);
+        assert_eq!(old_behaviour, 5.0);
+        assert!(
+            cam.pixel_scale(low_and_far, 900.0) > cam.pixel_scale(old_behaviour, 900.0) * 100.0,
+            "the corrected scale should be hundreds of times larger"
+        );
+    }
+
+    #[test]
+    fn aiming_at_the_sky_falls_back_to_height_above_ground() {
+        // No hit means no distance to scale by, and the height above ground is
+        // the only sensible measure of how big the world looks from here.
+        assert_eq!(focus_dist(None, 250.0, 4.0, 6000.0), 250.0);
+    }
+
+    #[test]
+    fn the_scale_is_clamped_at_both_ends() {
+        // At zero the pan would freeze and the zoom step would be nothing; at the
+        // top a stray ray to the horizon would make one pixel of drag move
+        // kilometres.
+        assert_eq!(focus_dist(Some(0.0), 0.0, 4.0, 6000.0), 4.0);
+        assert_eq!(focus_dist(Some(500_000.0), 10.0, 4.0, 6000.0), 6000.0);
+    }
+
+    #[test]
+    fn one_pixel_of_drag_covers_one_pixel_of_the_focused_surface() {
+        // What `pixel_scale` is for: a drag of the full viewport height should
+        // sweep the full world height visible at the focus distance, so the
+        // surface tracks the cursor.
+        let cam = Camera { fov_y: 60f32.to_radians(), ..Default::default() };
+        let dist = 400.0;
+        let h = 900.0;
+        let visible_height = 2.0 * dist * (cam.fov_y * 0.5).tan();
+        assert!(
+            (cam.pixel_scale(dist, h) * h - visible_height).abs() < 1e-3,
+            "a full-height drag must sweep the full visible height"
+        );
     }
 }

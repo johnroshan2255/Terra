@@ -131,6 +131,19 @@ impl ProjectPaths {
         self.edits_dir().join("props.ron")
     }
 
+    /// Environment Light Mixer settings: sun, atmosphere, sky light, fog, clouds,
+    /// tone mapping and the time of day.
+    ///
+    /// Under `edits/` rather than in `world.ron` because it is authored lighting,
+    /// not a property of the terrain: regenerating the heightfield must not reset
+    /// the time of day, and `world.ron` is validated against the heightmap on disk.
+    ///
+    /// Its own file rather than a section of another document so that a
+    /// hand-editing user, or a future field, cannot invalidate the world manifest.
+    pub fn environment(&self) -> PathBuf {
+        self.edits_dir().join("environment.ron")
+    }
+
     /// Authored road splines. Under `edits/` because they are human work and
     /// must survive a terrain regenerate.
     /// Painted material weights. Beside the other masks: it is authored data,

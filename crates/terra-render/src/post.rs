@@ -25,8 +25,14 @@ struct PostUniform {
     exposure: f32,
     density: f32,
     decay: f32,
+    tone_mapper: u32,
+    contrast: f32,
+    saturation: f32,
+    white_balance_k: f32,
     _pad: f32,
 }
+
+const _: () = assert!(std::mem::size_of::<PostUniform>() == 48);
 
 pub struct Post {
     uniform: wgpu::Buffer,
@@ -218,7 +224,7 @@ impl Post {
         sun_direction: Vec3,
         daylight: f32,
         strength: f32,
-        exposure: f32,
+        tone: &crate::environment::ToneMapping,
         fog_active: bool,
     ) -> bool {
         // The sun is directional, so project a point far along it rather than
@@ -250,9 +256,13 @@ impl Post {
             sun_uv,
             strength: strength * on_screen * daylight * gain,
             enabled: if active { 1.0 } else { 0.0 },
-            exposure,
+            exposure: 2f32.powf(tone.exposure_ev),
             density: spread,
             decay: if fog_active { 0.90 } else { 0.965 },
+            tone_mapper: tone.mapper.index(),
+            contrast: tone.contrast,
+            saturation: tone.saturation,
+            white_balance_k: tone.white_balance_k,
             _pad: 0.0,
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&u));
