@@ -51,11 +51,21 @@ struct Fixture {
     noise_library: Vec<String>,
     assets: [Vec<String>; 3],
     asset_kind: AssetKind,
+    /// Last import result, shown in the Content pane.
+    notice: Option<(String, bool)>,
+    /// Rules of the selected species, or `None` for "nothing imported".
+    rules: Option<terra_render::scatter::Rules>,
+    water: terra_render::water::WaterSettings,
+    selected_water: Option<usize>,
+    outliner: Vec<ui::OutlinerItem>,
+    outliner_selection: Option<(ui::OutlinerKind, usize)>,
     viewport_rect: Option<egui::Rect>,
     layout: Layout,
     /// `None` models "nothing imported yet", which is now the default state of a
     /// fresh project and has to render sensibly.
     material: Option<(String, terra_render::material::LayerParams)>,
+    /// Role of the open material, and what the name guess said.
+    material_role: (u32, u32),
     view_mode: terra_render::ViewMode,
     /// Driving. `Screen::Editor` is still true while playing, so this is what
     /// separates "editing" from "the viewport is the game".
@@ -84,9 +94,16 @@ impl Default for Fixture {
             noise_library: Vec::new(),
             assets: [Vec::new(), Vec::new(), Vec::new()],
             asset_kind: AssetKind::Texture,
+            notice: None,
+            rules: None,
+            water: Default::default(),
+            selected_water: None,
+            outliner: Vec::new(),
+            outliner_selection: None,
             viewport_rect: None,
             layout: Layout::new(),
             material: None,
+            material_role: (terra_render::material::ROCK, terra_render::material::ROCK),
             view_mode: terra_render::ViewMode::default(),
             playing: false,
         }
@@ -125,7 +142,7 @@ impl Fixture {
                 painted: false,
                 foliage: &[],
                 selected_species: &mut self.species,
-                species_rules: None,
+                species_rules: self.rules.as_mut(),
                 foliage_instances: 0,
                 selection: None,
                 prop_count: 0,
@@ -133,11 +150,16 @@ impl Fixture {
                 inspector_open: &mut self.inspector_open,
                 sky: &mut self.sky,
                 env: &mut self.env,
+                water: &mut self.water,
+                selected_water: &mut self.selected_water,
+                outliner: &self.outliner,
+                outliner_selection: self.outliner_selection,
                 active_road: None,
                 road_count: 0,
                 modifiers: &mut self.modifiers,
                 selected_modifier: &mut self.selected_modifier,
                 content: &content,
+                notice: self.notice.as_ref(),
                 noise: &mut self.noise,
                 noise_library: &self.noise_library,
                 viewport_rect: &mut self.viewport_rect,
@@ -147,6 +169,8 @@ impl Fixture {
                     role: "rock",
                     texture: None,
                     params,
+                    role_id: self.material_role.0,
+                    auto_role: self.material_role.1,
                 }),
             },
         );
@@ -167,6 +191,17 @@ impl Fixture {
             .children_recursive()
             .filter_map(|n| n.accesskit_node().label().filter(|l| !l.is_empty()))
             .collect()
+    }
+
+    /// How many published widgets are disabled.
+    ///
+    /// `add_enabled_ui` greys its contents rather than removing them, so "these controls
+    /// are inert" has to be asserted through the disabled flag.
+    fn disabled_count(&mut self) -> usize {
+        let mut harness =
+            Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_ui(|ui| self.frame(ui));
+        harness.run();
+        harness.root().children_recursive().filter(|n| n.accesskit_node().is_disabled()).count()
     }
 
     fn has(&mut self, needle: &str) -> bool {
@@ -203,6 +238,20 @@ impl Fixture {
 
     fn with_view_mode(mut self, mode: terra_render::ViewMode) -> Self {
         self.view_mode = mode;
+        self
+    }
+
+    /// Which content shelf is showing. The import control is per shelf, so this
+    /// is what selects between the folder picker and the file picker.
+    fn with_asset_kind(mut self, kind: AssetKind) -> Self {
+        self.asset_kind = kind;
+        self
+    }
+
+    /// Rows for the outliner, plus the pane brought to the front so they render.
+    fn with_outliner(mut self, rows: Vec<ui::OutlinerItem>) -> Self {
+        self.outliner = rows;
+        self.layout.focus(Tab::Outliner);
         self
     }
 
@@ -325,6 +374,77 @@ fn the_content_browser_offers_all_three_shelves_and_an_import() {
         assert!(labels.iter().any(|l| l.contains(k.label())), "{} shelf missing", k.label());
     }
     assert!(labels.iter().any(|l| l.starts_with("Import ")), "no import control: {labels:?}");
+}
+
+#[test]
+fn the_texture_import_asks_for_a_folder_rather_than_a_file() {
+    // A material is a folder of maps, and the button is the only place that gets
+    // said before the file dialog opens. "Import Textures" sent users looking for
+    // an image to select, and an image filter makes the folder unselectable --
+    // clicking Open just navigated into it.
+    let mut f = Fixture::default().with_asset_kind(AssetKind::Texture);
+    let labels = f.labels();
+    assert!(
+        labels.iter().any(|l| l.contains("Import material folder")),
+        "the texture import has to name a folder: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l == "Import Textures"),
+        "the old file-oriented wording is back: {labels:?}"
+    );
+}
+
+#[test]
+fn the_other_shelves_still_import_files() {
+    // Only textures are folders. Regressing noise or models to a folder picker
+    // would be the same bug pointing the other way.
+    for (kind, label) in [(AssetKind::Noise, "Import Noise"), (AssetKind::Model, "Import Models")] {
+        let mut f = Fixture::default().with_asset_kind(kind);
+        assert!(f.has(label), "{label} missing: {:?}", f.labels());
+    }
+}
+
+#[test]
+fn the_foliage_pane_exposes_the_lod_switch_distances() {
+    // The two runtime thresholds. Sliders publish their value rather than their
+    // caption through AccessKit, so the assertion is on the values being present
+    // and on the defaults being the ones the renderer clamps against.
+    let d = terra_render::scatter::Rules::default();
+    assert!(d.lod1_m > 0.0 && d.lod2_m > d.lod1_m, "defaults are not ordered");
+
+    let mut f = Fixture::default().with_tool(Tool::Foliage);
+    f.rules = Some(terra_render::scatter::Rules::default());
+    let values = f.values();
+    for want in [d.lod1_m, d.lod2_m] {
+        assert!(
+            values
+                .iter()
+                .any(|v| v.parse::<f32>().map(|n| (n - want).abs() < 0.51).unwrap_or(false)),
+            "no slider showing {want}: {values:?}"
+        );
+    }
+}
+
+#[test]
+fn dragging_lod2_below_lod1_is_corrected_rather_than_kept() {
+    // Ordered in the pane as well as clamped in the cull path, so the sliders
+    // cannot be left in a state the renderer has to silently fix. An inverted pair
+    // makes LOD 1 unreachable, which reads as "the middle level does nothing".
+    let mut f = Fixture::default().with_tool(Tool::Foliage);
+    f.rules =
+        Some(terra_render::scatter::Rules { lod1_m: 400.0, lod2_m: 100.0, ..Default::default() });
+    let _ = f.labels();
+    let got = f.rules.as_ref().unwrap();
+    assert!(got.lod2_m >= got.lod1_m, "{} < {}", got.lod2_m, got.lod1_m);
+}
+
+#[test]
+fn the_content_browser_can_rescan_after_a_manual_copy() {
+    // The palettes are built on project open and on import only, so a folder
+    // copied in from Finder is invisible until something re-reads the directory.
+    // While the import was broken that was the only way to add a material at all.
+    let mut f = Fixture::default();
+    assert!(f.has("Refresh"), "no way to re-read the asset folders: {:?}", f.labels());
 }
 
 #[test]
@@ -453,6 +573,14 @@ fn layout_snapshot() {
         vec!["pine.glb".into()],
     ];
     f.noise_library = f.assets[1].clone();
+    // A partial import, which is the interesting case to look at: the wording has
+    // to read as a success while still naming the folder that was skipped.
+    f.notice = Some((
+        "Imported Rock042. Skipped 1 -- Screenshots: no colour map found. One file's name has \
+         to contain one of: color, albedo, basecolor, base_color, _diff, diffuse"
+            .to_string(),
+        false,
+    ));
     f.modifiers.push(terra_voxel::Modifier::carve(
         "Main passage",
         terra_voxel::Shape::Tube(terra_voxel::Tube::straight(
@@ -483,7 +611,26 @@ fn layout_snapshot() {
     menu.save(dir.join("ui-view-menu.png")).expect("could not write the snapshot");
     drop(harness);
 
-    // The Environment Light Mixer, brought to the front of the right-hand column.
+    // The outliner, with one of everything in it.
+    f.outliner = vec![
+        row(ui::OutlinerKind::Water, 0, "Water 1", "260 x 180 m at 244 m", true),
+        row(ui::OutlinerKind::Species, 0, "Pine", "1240 instances", false),
+        row(ui::OutlinerKind::Species, 1, "Fern", "8600 instances", false),
+        row(ui::OutlinerKind::Prop, 0, "Boulder", "120, 340", true),
+        row(ui::OutlinerKind::Road, 0, "Road 1", "6 points", true),
+        row(ui::OutlinerKind::Modifier, 0, "Main passage", "Carve", true),
+    ];
+    f.outliner_selection = Some((ui::OutlinerKind::Species, 0));
+    f.layout.focus(Tab::Outliner);
+    let mut outl =
+        Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_ui(|ui| f.frame(ui));
+    outl.run();
+    outl.render().expect("headless wgpu render failed").save(dir.join("ui-outliner.png")).unwrap();
+    drop(outl);
+
+    // The Environment Light Mixer, brought to the front of the right-hand column, with
+    // water on so its section renders rather than sitting greyed at the bottom.
+    f.water.enabled = true;
     f.layout.focus(Tab::Environment);
     let mut envh =
         Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_ui(|ui| f.frame(ui));
@@ -678,6 +825,51 @@ fn selecting_a_material_populates_the_pane() {
 }
 
 #[test]
+fn a_material_can_be_made_paint_only() {
+    // The opt-out from automatic placement: someone who would rather brush a material
+    // on than have the slope masks decide needs a way to say so, and it is the control
+    // that answers "why did this appear everywhere the moment I imported it".
+    let mut f = Fixture::default().with_material("Rock042");
+    assert!(f.has("Paint only"), "no way to stop automatic placement: {:?}", f.labels());
+}
+
+#[test]
+fn the_automatic_role_can_be_corrected_in_the_pane() {
+    // The role is guessed from the folder name, and a set called
+    // `rocky_terrain_03/textures` was read as soil and carpeted every flat field.
+    // Renaming files on disk must not be the only way out.
+    let mut f = Fixture::default().with_material("Rock042");
+    let labels = f.labels();
+    for role in ["soil", "grass", "rock", "gravel", "snow", "track"] {
+        assert!(
+            labels.iter().any(|l| l.contains(role)),
+            "role '{role}' cannot be chosen: {labels:?}"
+        );
+    }
+}
+
+#[test]
+fn the_guessed_role_is_marked_so_there_is_a_way_back_to_it() {
+    // Overriding is only safe if the original guess stays visible.
+    let mut f = Fixture::default().with_material("Rock042");
+    f.material_role = (terra_render::material::SOIL, terra_render::material::ROCK);
+    let labels = f.labels();
+    assert!(
+        labels.iter().any(|l| l.contains("rock") && l.contains("auto")),
+        "the guessed role is not marked: {labels:?}"
+    );
+}
+
+#[test]
+fn paint_only_is_not_offered_twice_in_the_role_row() {
+    // `SELECTABLE_ROLES` ends with ROLE_NONE, which has its own button -- listing it
+    // again among the roles would give two controls for one state.
+    let mut f = Fixture::default().with_material("Rock042");
+    let n = f.labels().iter().filter(|l| l.contains("paint only")).count();
+    assert_eq!(n, 0, "'paint only' leaked into the role row");
+}
+
+#[test]
 fn paint_with_this_switches_to_the_paint_tool() {
     // The path from "I have set this material up" to "I am putting it on the
     // ground", which otherwise needs the user to find the Paint tool themselves.
@@ -693,15 +885,30 @@ fn paint_with_this_switches_to_the_paint_tool() {
 
 #[test]
 fn material_defaults_are_a_neutral_starting_point() {
-    // A freshly imported material must render as itself: no tint, no parallax
-    // cost, sampled roughness and normals used as authored.
+    // A freshly imported material must render as itself: no tint, sampled
+    // roughness and normals used as authored.
     let p = terra_render::material::LayerParams::default();
     assert_eq!(p.tint, [1.0, 1.0, 1.0], "a new material must not be tinted");
     assert_eq!(p.normal_strength, 1.0);
     assert_eq!(p.roughness, 1.0);
     assert_eq!(p.ao, 1.0);
-    assert_eq!(p.parallax_m, 0.0, "parallax costs samples; it must be opt-in");
     assert!(p.tiling_m > 0.0);
+}
+
+#[test]
+fn parallax_is_on_by_default_but_subtle() {
+    // This assertion used to be `== 0.0`, on the grounds that parallax costs a
+    // loop of samples and must be opted into. What changed is the shader, not the
+    // appetite for frame time: a flat mid-grey height channel -- what a set with
+    // no displacement map decodes to -- now leaves the march after a single
+    // fetch, and the effect fades out entirely past 140 m. So the cost is paid
+    // only by materials that actually have relief, at the distances where it is
+    // visible, which is what made opting in a chore rather than a safeguard.
+    let p = terra_render::material::LayerParams::default();
+    assert!(p.parallax_m > 0.0, "relief should be on out of the box");
+    // A ceiling, not just non-zero: a large default reads as the terrain itself
+    // having changed shape, and the slider tops out at 0.25.
+    assert!(p.parallax_m <= 0.05, "{} m is too deep for a default", p.parallax_m);
 }
 
 #[test]
@@ -713,7 +920,11 @@ fn editing_one_material_does_not_disturb_the_defaults() {
     f.material.as_mut().unwrap().1.parallax_m = 0.08;
     let _ = f.labels();
     assert_eq!(f.material.as_ref().unwrap().1.parallax_m, 0.08);
-    assert_eq!(terra_render::material::LayerParams::default().parallax_m, 0.0);
+    assert_eq!(
+        terra_render::material::LayerParams::default().parallax_m,
+        0.03,
+        "editing one layer must not move the defaults"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +958,217 @@ fn the_mixer_offers_quick_create_and_every_section() {
     ] {
         assert!(labels.iter().any(|l| l.contains(control)), "{control} missing: {labels:?}");
     }
+}
+
+#[test]
+fn the_cloud_section_offers_drift_speed_and_direction() {
+    // The wind vector already advected the layer and drove the ground shadows; there was
+    // simply no way to change it. Sliders publish their value rather than their caption,
+    // so this asserts the default speed and heading are both present as values.
+    let mut f = Fixture::default();
+    f.env.clouds.enabled = true;
+    f.env.clouds.set_wind(12.0, 45.0);
+    f.layout.focus(Tab::Environment);
+    let values = f.values();
+    for want in [12.0f32, 45.0] {
+        assert!(
+            values
+                .iter()
+                .any(|v| v.parse::<f32>().map(|n| (n - want).abs() < 0.51).unwrap_or(false)),
+            "no slider showing {want}: {values:?}"
+        );
+    }
+}
+
+/// A row for the outliner fixture.
+fn row(
+    kind: ui::OutlinerKind,
+    index: usize,
+    name: &str,
+    detail: &str,
+    removable: bool,
+) -> ui::OutlinerItem {
+    ui::OutlinerItem { kind, index, name: name.to_string(), detail: detail.to_string(), removable }
+}
+
+#[test]
+fn a_thousand_trees_are_one_outliner_row() {
+    // The rule that makes the list usable. A thousand painted instances are a thousand
+    // copies of one decision -- the species' rules -- so they are one thing to edit. A
+    // thousand identical rows would be a list nobody scrolls.
+    use ui::OutlinerKind;
+    let mut f = Fixture::default().with_outliner(vec![row(
+        OutlinerKind::Species,
+        0,
+        "Pine",
+        "1240 instances",
+        false,
+    )]);
+
+    let labels = f.labels();
+    let pine = labels.iter().filter(|l| l.contains("Pine") && !l.starts_with("Remove")).count();
+    assert_eq!(pine, 1, "one species should be one row: {labels:?}");
+    assert!(
+        labels.iter().any(|l| l.contains("1240 instances")),
+        "the count has to be shown, since the instances are not: {labels:?}"
+    );
+}
+
+#[test]
+fn hand_placed_objects_get_a_row_each() {
+    // The exception: each was placed deliberately and carries its own transform, which is
+    // exactly what a scattered instance does not.
+    use ui::OutlinerKind;
+    let mut f = Fixture::default().with_outliner(vec![
+        row(OutlinerKind::Prop, 0, "Boulder", "120, 340", true),
+        row(OutlinerKind::Prop, 1, "Boulder", "150, 300", true),
+    ]);
+    // Excluding the remove buttons, which now carry the name too so they announce
+    // themselves properly.
+    let rows = f.labels().into_iter().filter(|l| l.contains("Boulder") && !l.starts_with("Remove"));
+    assert_eq!(rows.count(), 2, "two placed objects should be two rows");
+}
+
+#[test]
+fn the_outliner_lists_every_kind_of_thing() {
+    use ui::OutlinerKind;
+    let mut f = Fixture::default().with_outliner(vec![
+        row(OutlinerKind::Water, 0, "Water 1", "120 x 80 m at 40 m", true),
+        row(OutlinerKind::Species, 0, "Pine", "900 instances", false),
+        row(OutlinerKind::Prop, 0, "Boulder", "10, 20", true),
+        row(OutlinerKind::Road, 0, "Road 1", "6 points", true),
+        row(OutlinerKind::Modifier, 0, "Main passage", "Carve", true),
+    ]);
+    let labels = f.labels();
+    for want in ["Water 1", "Pine", "Boulder", "Road 1", "Main passage"] {
+        assert!(labels.iter().any(|l| l.contains(want)), "{want} missing: {labels:?}");
+    }
+}
+
+#[test]
+fn a_species_row_offers_no_remove_button() {
+    // A species exists because a mesh is in the project's `assets/models/`. Removing it
+    // means deleting that file, so a button here would either lie or delete an asset the
+    // user did not point at.
+    use ui::OutlinerKind;
+    let mut f = Fixture::default().with_outliner(vec![row(
+        OutlinerKind::Species,
+        0,
+        "Pine",
+        "900 instances",
+        false,
+    )]);
+    assert!(
+        !f.labels().iter().any(|l| l.contains("Remove Pine")),
+        "a species must not offer a remove button: {:?}",
+        f.labels()
+    );
+}
+
+#[test]
+fn removable_rows_offer_a_remove_button() {
+    use ui::OutlinerKind;
+    let mut f = Fixture::default().with_outliner(vec![row(
+        OutlinerKind::Water,
+        0,
+        "Water 1",
+        "120 x 80 m",
+        true,
+    )]);
+    assert!(
+        f.labels().iter().any(|l| l.contains("Remove Water 1")),
+        "no way to remove a water body: {:?}",
+        f.labels()
+    );
+}
+
+#[test]
+fn every_outliner_kind_has_a_group_heading() {
+    use ui::OutlinerKind;
+    for k in [
+        OutlinerKind::Water,
+        OutlinerKind::Species,
+        OutlinerKind::Prop,
+        OutlinerKind::Road,
+        OutlinerKind::Modifier,
+    ] {
+        assert!(!k.group().is_empty(), "{k:?} has no heading");
+    }
+}
+
+#[test]
+fn the_water_tool_exists_and_lists_bodies() {
+    // The empty state is a plain label, which AccessKit does not publish -- so what is
+    // asserted is that a body, once placed, becomes a selectable row carrying its size.
+    let mut f = Fixture::default().with_tool(Tool::Water);
+    f.water.regions.push(terra_render::water::WaterRegion::from_drag(
+        [0.0, 0.0],
+        [120.0, 80.0],
+        50.0,
+    ));
+    let labels = f.labels();
+    assert!(
+        labels.iter().any(|l| l.contains("Body 1") && l.contains("120") && l.contains("80")),
+        "the body is not listed with its size: {labels:?}"
+    );
+}
+
+#[test]
+fn a_selected_body_exposes_its_own_wave_speed() {
+    // The whole point of regions: this body's waves, not the global ones. Unselected it
+    // must not show them, or two sets of wave sliders would be on screen at once with no
+    // way to tell which is which.
+    let mut f = Fixture::default().with_tool(Tool::Water);
+    let mut r = terra_render::water::WaterRegion::from_drag([0.0, 0.0], [100.0, 100.0], 40.0);
+    r.wave_speed = 2.25;
+    f.water.regions.push(r);
+
+    f.selected_water = None;
+    let unselected = f.values();
+    f.selected_water = Some(0);
+    let selected = f.values();
+    assert!(selected.len() > unselected.len(), "selecting a body exposed no settings");
+    assert!(
+        selected.iter().any(|v| v.parse::<f32>().map(|n| (n - 2.25).abs() < 0.02).unwrap_or(false)),
+        "this body's wave speed is not editable: {selected:?}"
+    );
+}
+
+#[test]
+fn the_water_tool_is_in_the_tool_list() {
+    let mut f = Fixture::default();
+    assert!(f.has("Water"), "the Water tool is not offered: {:?}", f.labels());
+}
+
+#[test]
+fn the_mixer_offers_water() {
+    // Water lives in the Environment pane because a surface that reflects the sky
+    // belongs with the sections that describe the sky.
+    let mut f = Fixture::default();
+    f.layout.focus(Tab::Environment);
+    assert!(f.has("Water"), "no water control in the mixer: {:?}", f.labels());
+}
+
+#[test]
+fn water_is_off_until_switched_on() {
+    // A default sea level would flood the valleys of every project that predates this
+    // the moment it loaded.
+    assert!(!terra_render::water::WaterSettings::default().enabled);
+}
+
+#[test]
+fn the_water_controls_are_disabled_until_water_is_on() {
+    // Sliders for a surface that is not being drawn invite tuning something invisible.
+    // `add_enabled_ui` still *renders* them, greyed -- so this asserts the disabled
+    // state rather than their absence, which is what a screen reader would report too.
+    let mut f = Fixture::default();
+    f.layout.focus(Tab::Environment);
+
+    f.water.enabled = false;
+    let off = f.disabled_count();
+    f.water.enabled = true;
+    let on = f.disabled_count();
+    assert!(off > on, "switching water on left the same controls disabled: {off} disabled -> {on}");
 }
 
 #[test]

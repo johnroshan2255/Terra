@@ -8,6 +8,7 @@ pub mod cdlod;
 pub mod clouds;
 pub mod context;
 pub mod environment;
+pub mod frustum;
 pub mod hiz;
 pub mod instancing;
 pub mod lighting;
@@ -22,6 +23,7 @@ pub mod terrain;
 pub mod texture_set;
 pub mod view_mode;
 pub mod volumetrics;
+pub mod water;
 
 pub use camera::Camera;
 pub use clouds::Clouds;

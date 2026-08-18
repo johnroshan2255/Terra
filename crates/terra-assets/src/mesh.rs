@@ -349,6 +349,52 @@ impl MeshData {
 // glTF
 // ---------------------------------------------------------------------------
 
+/// Files a `.gltf` refers to and cannot be read without, relative to its own
+/// folder.
+///
+/// A `.glb` is one self-contained file. A `.gltf` is JSON that points at its
+/// geometry: `scene.bin` for the vertex buffers, plus a PNG or JPEG per texture.
+/// Copying only the file the user picked leaves all of that behind, and
+/// `gltf::import` then fails on a path that no longer resolves -- which is
+/// exactly what an importer that copies one file at a time does.
+///
+/// Data URIs are skipped: those are embedded and need nothing alongside. So is
+/// anything that escapes the folder or is absolute, which a copy could not
+/// reproduce at the destination anyway.
+pub fn external_files(path: &Path) -> Vec<PathBuf> {
+    let Ok(doc) = gltf::Gltf::open(path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut take = |uri: &str| {
+        if uri.starts_with("data:") {
+            return;
+        }
+        // Percent-encoding is the one escape that shows up in practice, and only
+        // for spaces.
+        let decoded = uri.replace("%20", " ");
+        let p = Path::new(&decoded);
+        if p.is_absolute() || decoded.contains("..") || decoded.contains("://") {
+            return;
+        }
+        let rel = p.to_path_buf();
+        if !out.contains(&rel) {
+            out.push(rel);
+        }
+    };
+    for b in doc.buffers() {
+        if let gltf::buffer::Source::Uri(uri) = b.source() {
+            take(uri);
+        }
+    }
+    for i in doc.images() {
+        if let gltf::image::Source::Uri { uri, .. } = i.source() {
+            take(uri);
+        }
+    }
+    out
+}
+
 /// Model files under `dir`, sorted so palette order is stable between runs.
 /// Both loose files and one-folder-per-model layouts work.
 pub fn discover(dir: &Path) -> Vec<PathBuf> {
@@ -938,5 +984,83 @@ mod tests {
                 .iter()
                 .all(|p| { (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() <= r + 1e-4 })
         );
+    }
+}
+
+#[cfg(test)]
+mod sidecar_tests {
+    use super::external_files;
+    use std::path::Path;
+
+    /// A minimal but valid glTF 2.0 document referencing an external buffer and
+    /// an external image. Enough for `Gltf::open` to parse; nothing here is drawn.
+    const GLTF: &str = r#"{
+  "asset": {"version": "2.0"},
+  "buffers": [{"uri": "scene.bin", "byteLength": 4}],
+  "images": [{"uri": "textures/bark%20colour.png"}, {"uri": "data:image/png;base64,iVBORw0K"}],
+  "meshes": [], "nodes": [], "scenes": [{"nodes": []}], "scene": 0
+}"#;
+
+    fn write(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("terra-sidecar-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("tree.gltf");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn external_buffers_and_images_are_reported() {
+        // The bug this guards: importing only the picked `.gltf` leaves its `.bin`
+        // and textures behind, and `gltf::import` then fails on a path that no
+        // longer resolves -- an import that "succeeds" and cannot load.
+        let p = write("basic", GLTF);
+        let files = external_files(&p);
+        assert!(files.contains(&Path::new("scene.bin").to_path_buf()), "{files:?}");
+        // Percent-encoded spaces are the one escape that shows up in practice.
+        assert!(files.contains(&Path::new("textures/bark colour.png").to_path_buf()), "{files:?}");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn embedded_data_uris_need_nothing_copied() {
+        let p = write("basic2", GLTF);
+        let files = external_files(&p);
+        assert!(
+            !files.iter().any(|f| f.to_string_lossy().contains("base64")),
+            "a data URI is embedded and must not be treated as a file: {files:?}"
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn paths_that_escape_the_folder_are_refused() {
+        // A copy could not reproduce these at the destination, and following them
+        // would read files from outside what the user pointed at.
+        let body = GLTF.replace("scene.bin", "../../../etc/passwd");
+        let p = write("escape", &body);
+        let files = external_files(&p);
+        assert!(
+            !files.iter().any(|f| f.to_string_lossy().contains("passwd")),
+            "an escaping path must not be copied: {files:?}"
+        );
+        // The legitimate sibling is still reported -- one bad URI must not
+        // discard the rest, or a hand-edited glTF would import silently empty.
+        assert!(files.iter().any(|f| f.to_string_lossy().contains("bark")), "{files:?}");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn a_glb_reports_nothing_because_it_is_self_contained() {
+        // Not a real glb; `Gltf::open` failing is the same outcome as no external
+        // files, and either way there is nothing to copy alongside.
+        let dir = std::env::temp_dir().join("terra-sidecar-glb");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("rock.glb");
+        std::fs::write(&p, b"glTF").unwrap();
+        assert!(external_files(&p).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -21,6 +21,8 @@ rayon.workspace = true
 serde.workspace = true
 ron.workspace = true
 image.workspace = true
+exr.workspace = true
+half.workspace = true
 
 [dev-dependencies]
 pollster.workspace = true

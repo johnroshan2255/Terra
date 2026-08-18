@@ -128,6 +128,53 @@ const R_MUD: u32 = 5u;
 const R_NONE: u32 = 6u;
 const ROLES: u32 = 6u;
 
+// ---------------------------------------------------------------------------
+// Slope bands for the automatic roles
+// ---------------------------------------------------------------------------
+//
+// `slope` here is `1 - n.y`, i.e. `1 - cos(theta)`. It is *not* a tangent, so the
+// numbers do not read as angles: 0.10 is 26 degrees and 0.23 is 40.
+//
+// # Why these are not steeper
+//
+// They were, and it was a bug that made the whole system inert. The bands started at
+// 0.26 (42 degrees) for rock and 0.30 (46) for snow, and a generated 4 km world does
+// not contain a single sample that steep -- measured on one: median 11.5 degrees, p90
+// 29.3, **maximum 39.6**. So rock and snow never started and grass and soil never
+// finished, and a palette whose only material held the rock role rendered at zero
+// weight across the entire map. Nothing claimed anything, so the fallback below forced
+// slot 0 everywhere at full strength -- which reads as "my texture was applied to the
+// whole terrain" and is indistinguishable from a deliberate choice.
+//
+// Two things cap the slope this pipeline produces, and neither is going to change:
+// the heightfield samples every 4 m, so a 45 degree face is a 4 m step between
+// neighbours; and erosion *relaxes* steep ground -- thermal talus and hydraulic
+// transport exist to do exactly that. Terrain steeper than about 40 degrees has to come
+// from the voxel layer, not from here.
+//
+// So the bands are tuned to the distribution that exists. Rock takes the steepest tenth
+// or so, grass genuinely gives up before then, and every band both starts and finishes
+// inside the reachable range. `role_weight_gpu.rs` asserts that against the shipped
+// shader rather than trusting these comments.
+const SOIL_FROM: f32 = 0.02;
+const SOIL_TO: f32 = 0.12;
+const GRASS_FROM: f32 = 0.03;
+const GRASS_TO: f32 = 0.16;
+const ROCK_FROM: f32 = 0.11;
+const ROCK_TO: f32 = 0.21;
+const SNOW_FROM: f32 = 0.10;
+const SNOW_TO: f32 = 0.20;
+
+/// Snow needs altitude as well as gentle ground, and this is absolute metres.
+///
+/// Also retuned: 900-1350 m was unreachable on a world whose default amplitude is
+/// 900 m and which measured a 864 m peak, so snow never appeared either. Absolute
+/// metres is the wrong unit for a setting that should follow the world's own height
+/// range -- that wants the range in the uniform, and is worth doing when snow becomes
+/// authored rather than derived.
+const SNOW_ALTITUDE_FROM: f32 = 620.0;
+const SNOW_ALTITUDE_TO: f32 = 900.0;
+
 /// Palette slots. The array sizes below depend on this.
 const MAX_LAYERS: u32 = 8u;
 
@@ -284,6 +331,10 @@ struct Surf {
     ao: f32,
     // The layer's own relief at this point. This is what the blend arbitrates.
     height: f32,
+    // Parallax self-shadowing, 1 = unshadowed. Separate from `ao` because it
+    // occludes the *sun* rather than the sky: a stone's shadow on its neighbour
+    // moves as the sun does, where ambient occlusion is fixed to the geometry.
+    shadow: f32,
 };
 
 // Triplanar projection weights. A high exponent keeps the transition tight, so
@@ -292,6 +343,118 @@ struct Surf {
 fn tri_weights(n: vec3f) -> vec3f {
     var w = pow(abs(n), vec3f(6.0));
     return w / max(w.x + w.y + w.z, 1e-5);
+}
+
+// ---------------------------------------------------------------------------
+// Parallax occlusion mapping
+// ---------------------------------------------------------------------------
+//
+// The height channel read as a relief the view ray marches through, rather than
+// as a single offset. This is Unreal's POM node, and the difference between one
+// step and a march is what makes a gravel bed read as stones that occlude each
+// other instead of as a photograph of stones that slides as the camera turns.
+//
+// Everything here works in *uv* units, where one unit is one texture repeat:
+// `amp` is the relief depth converted out of metres by the layer's tiling, so a
+// material keeps the same apparent depth whatever its repeat is set to.
+
+/// Which triplanar projection dominates: 0 = ZY, 1 = XZ, 2 = XY.
+///
+/// The march has to happen on one plane -- three would triple the cost for a
+/// result the weights immediately blend away. Picking the dominant one also
+/// fixes a real bug in the single-step version, which always sampled the
+/// top-down `uv.xz` projection: on a cliff face that is the *degenerate*
+/// projection, so the depth it read was stretched garbage.
+fn dominant_axis(w: vec3f) -> u32 {
+    if (w.x >= w.y && w.x >= w.z) { return 0u; }
+    if (w.y >= w.z) { return 1u; }
+    return 2u;
+}
+
+/// The height channel on one projection of `uv`. Mip 0 deliberately: the march
+/// needs the relief it is intersecting, and a filtered height flattens the very
+/// stones being searched for.
+fn relief_at(layer: u32, uv: vec3f, axis: u32) -> f32 {
+    switch (axis) {
+        case 0u: { return textureSampleLevel(mat_albedo, mat_samp, uv.zy, layer, 0.0).a; }
+        case 1u: { return textureSampleLevel(mat_albedo, mat_samp, uv.xz, layer, 0.0).a; }
+        default: { return textureSampleLevel(mat_albedo, mat_samp, uv.xy, layer, 0.0).a; }
+    }
+}
+
+/// Signed offset of the relief from the reference plane, in uv units.
+///
+/// Mid-grey is the plane. Keeping the reference at 0.5 rather than at the top of
+/// the range is what preserves "a flat height map displaces nothing": with the
+/// top as reference a uniform map sits at a constant depth, and a constant depth
+/// under an oblique view is a uniform slide of the whole texture.
+fn relief_offset(layer: u32, uv: vec3f, axis: u32, amp: f32) -> f32 {
+    return (relief_at(layer, uv, axis) - 0.5) * amp;
+}
+
+/// March the view ray into the relief and return the depth it first hits.
+///
+/// Depth is measured along the surface normal, 0 at the reference plane, and is
+/// bounded by `amp * 0.5` because that is as deep as a centred height map goes.
+/// Where the relief stands *above* the plane the ray hits at zero, which is the
+/// right answer without a silhouette pass: a bump facing the camera is already
+/// at the pixel being shaded.
+fn pom_depth(layer: u32, uv0: vec3f, slope: vec3f, axis: u32, amp: f32, steps: i32) -> f32 {
+    let max_depth = amp * 0.5;
+    var prev_t = 0.0;
+    // Height of the ray above the relief at the previous sample. Positive means
+    // still in open air.
+    var prev_gap = -relief_offset(layer, uv0, axis, amp);
+    if (prev_gap <= 0.0) {
+        return 0.0;
+    }
+
+    let dt = max_depth / f32(steps);
+    for (var i = 1; i <= steps; i = i + 1) {
+        let t = f32(i) * dt;
+        // Ray sits at -t on the normal axis; the relief sits at its own offset.
+        let gap = -t - relief_offset(layer, uv0 - slope * t, axis, amp);
+        if (gap <= 0.0) {
+            // Linear interpolation across the bracket. One refinement rather
+            // than a binary search: the relief is bandlimited by the mip the
+            // sampler already picked, so the residual is well under a texel.
+            let f = prev_gap / max(prev_gap - gap, 1e-6);
+            return prev_t + dt * clamp(f, 0.0, 1.0);
+        }
+        prev_gap = gap;
+        prev_t = t;
+    }
+    return max_depth;
+}
+
+/// How much of the relief stands between this point and the sun, 1 = unshadowed.
+///
+/// The counterpart to the view march and the reason POM reads as geometry rather
+/// than as a warped texture: stones cast onto their own neighbours. Marching
+/// toward the light from the hit point, any relief that rises above the ray
+/// occludes it, and the deepest breach sets the strength.
+///
+/// Fewer steps than the view march on purpose -- this is a soft term over a few
+/// texels, and its error shows up as a slightly softer contact shadow rather
+/// than as the wrong stone in front.
+fn pom_shadow(layer: u32, uv_hit: vec3f, depth: f32, slope: vec3f, axis: u32, amp: f32) -> f32 {
+    let max_depth = amp * 0.5;
+    if (depth <= 0.0 || max_depth <= 0.0) {
+        return 1.0;
+    }
+    let steps = 4;
+    let dt = depth / f32(steps);
+    var breach = 0.0;
+    for (var i = 1; i <= steps; i = i + 1) {
+        let t = depth - f32(i) * dt;
+        let ray = -t;
+        let surface = relief_offset(layer, uv_hit + slope * (f32(i) * dt), axis, amp);
+        breach = max(breach, surface - ray);
+    }
+    // Normalized against the relief depth so the term is scale free, then eased:
+    // a linear ramp puts a hard edge at the shadow boundary.
+    let k = clamp(breach / max_depth, 0.0, 1.0);
+    return 1.0 - smoothstep(0.0, 1.0, k) * 0.85;
 }
 
 // Sample one layer, projected on all three axes and recombined.
@@ -307,25 +470,48 @@ fn sample_layer(layer: u32, world: vec3f, n: vec3f, w: vec3f) -> Surf {
     // leaves one of them blurred and the other visibly tiled.
     let scale = max(pr.tiling_m, 0.01);
     var uv = world / scale;
+    var self_shadow = 1.0;
 
-    // Parallax. Offsetting the lookup along the view direction by the height
-    // channel is what makes a gravel bed read as stones that occlude each other
-    // rather than as a photograph of stones -- the "3D" in a PBR material.
-    //
-    // One step, not a ray march: the surface is already displaced by the
-    // heightfield and the terrain is viewed at grazing angles, where a
-    // multi-step search on a triplanar projection costs three times what it
-    // does on a single one and mostly recovers detail below a pixel.
     if (pr.parallax_m > 0.0) {
         let view = normalize(cam.eye.xyz - world);
-        let h0 = textureSampleLevel(mat_albedo, mat_samp, uv.xz, layer, 0.0).a;
-        // Height is 0..1 with 0.5 as the mid-surface, so centre it before
-        // displacing or a flat material would shift bodily.
-        let depth = (h0 - 0.5) * pr.parallax_m / scale;
-        // Along the surface, not along the view ray: the component of the view
-        // direction in the tangent plane is what shifts the texture.
-        let tangential = view - n * dot(view, n);
-        uv = uv - tangential * depth;
+        let ndv = dot(view, n);
+        // Backfacing or exactly edge-on: the march has no well-defined depth
+        // axis and `slope` would blow up. Skipping is correct and free.
+        if (ndv > 0.05) {
+            let amp = pr.parallax_m / scale;
+            let axis = dominant_axis(w);
+            // uv displacement per unit of depth along the normal. Dividing by
+            // `ndv` is what makes the offset grow at grazing angles, which is
+            // the whole parallax effect; it is also why it has to be clamped.
+            let tangential = view - n * ndv;
+            let slope = tangential / max(ndv, 0.05);
+
+            // Steps scale with obliquity, because that is where the ray crosses
+            // the most texels and where too few steps show up as stair-stepping
+            // along the relief. Also with amplitude: a shallow material has
+            // little to search. Capped so a grazing view of a deep material
+            // cannot run away with the frame time.
+            let obliquity = 1.0 - ndv;
+            let want = 8.0 + 24.0 * obliquity * clamp(amp * 8.0, 0.0, 1.0);
+            // Distance fade: past the range where the relief is a pixel or two
+            // the march is spending samples on detail the mip has already
+            // removed. Falls back to no parallax rather than to fewer steps, so
+            // there is no popping as the count changes.
+            let dist = length(cam.eye.xyz - world);
+            let fade = 1.0 - smoothstep(60.0, 140.0, dist);
+            if (fade > 0.01) {
+                let steps = i32(clamp(want, 8.0, 32.0));
+                let depth = pom_depth(layer, uv, slope, axis, amp, steps) * fade;
+                uv = uv - slope * depth;
+                let sun = normalize(light.sun_direction.xyz);
+                let sdn = dot(sun, n);
+                if (sdn > 0.05) {
+                    let sun_slope = (sun - n * sdn) / max(sdn, 0.05);
+                    self_shadow = pom_shadow(layer, uv, depth, sun_slope, axis, amp);
+                    self_shadow = mix(1.0, self_shadow, fade);
+                }
+            }
+        }
     }
 
     let ax = textureSample(mat_albedo, mat_samp, uv.zy, layer);
@@ -358,6 +544,7 @@ fn sample_layer(layer: u32, world: vec3f, n: vec3f, w: vec3f) -> Surf {
     // Mixing toward 1 rather than multiplying: at ao = 0 the layer should be
     // unoccluded, not black.
     out.ao = mix(1.0, s.a, pr.ao);
+    out.shadow = self_shadow;
     return out;
 }
 
@@ -384,6 +571,7 @@ fn mix_surf(a: Surf, b: Surf, k: f32) -> Surf {
     out.rough = mix(a.rough, b.rough, k);
     out.ao = mix(a.ao, b.ao, k);
     out.height = mix(a.height, b.height, k);
+    out.shadow = mix(a.shadow, b.shadow, k);
     return out;
 }
 
@@ -446,23 +634,23 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
 
     // Soil is the base coat. It never drops to zero, so there is always
     // something underneath for the others to break through.
-    role_w[R_SOIL] = 0.45 + 0.35 * smoothstep(0.06, 0.26, slope);
+    role_w[R_SOIL] = 0.45 + 0.35 * smoothstep(SOIL_FROM, SOIL_TO, slope);
 
     // Grass holds on gentle ground, gives up on steep ground, and thickens
     // where the solver left sediment.
-    let gentle = 1.0 - smoothstep(0.08, 0.34, slope);
+    let gentle = 1.0 - smoothstep(GRASS_FROM, GRASS_TO, slope);
     role_w[R_GRASS] = gentle * (0.75 + 0.45 * clamp(dep, 0.0, 1.0));
 
     // Rock is the steep face, and anything the water scoured back to bare.
-    role_w[R_ROCK] = smoothstep(0.26, 0.58, slope) * 1.3 + clamp(-dep, 0.0, 1.0) * 0.8;
+    role_w[R_ROCK] = smoothstep(ROCK_FROM, ROCK_TO, slope) * 1.3 + clamp(-dep, 0.0, 1.0) * 0.8;
 
     // Loose material: where sediment settled, and along the channels where the
     // water actually ran.
     role_w[R_GRAVEL] = clamp(dep, 0.0, 1.0) * 0.55 + smoothstep(0.30, 0.72, wet) * 1.5;
 
     // Snow high up, and only where it can sit.
-    let cold = smoothstep(900.0, 1350.0, in.world.y);
-    role_w[R_SNOW] = cold * (1.0 - smoothstep(0.30, 0.58, slope)) * 2.0;
+    let cold = smoothstep(SNOW_ALTITUDE_FROM, SNOW_ALTITUDE_TO, in.world.y);
+    role_w[R_SNOW] = cold * (1.0 - smoothstep(SNOW_FROM, SNOW_TO, slope)) * 2.0;
 
     // The carriageway. Weighted well above the naturals so a road wins, but
     // still blended by height, which gives the scuffed edge a hard mask never
@@ -551,6 +739,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
         // exactly the shape the grid is there to reveal.
         surf.rough = 0.88;
         surf.ao = 1.0;
+        // No relief to shadow itself with. Left unset this field is undefined,
+        // and it multiplies the sun term.
+        surf.shadow = 1.0;
     } else {
         let tw = tri_weights(geo_n);
         let s0 = sample_layer(i0, in.world, geo_n, tw);
@@ -630,6 +821,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // normal map, one that looks flat under Lighting Only is genuinely flat.
     let use_bump = t.view_mode != 4u;
 
+    // Parallax self-shadowing goes with the normals, for the same reason: it is
+    // the material's relief occluding itself. Leaving it on under Lighting Only
+    // would leave stone shadows on a surface the mode promises is shaded from the
+    // geometric normal alone, which is exactly the reading the mode exists to
+    // give. Detail Lighting keeps it -- there it is part of what is inspected.
+    if (!use_bump) {
+        surf.shadow = 1.0;
+    }
+
     // Sub-pixel detail has to be traded for roughness, not just dropped.
     //
     // Once a pixel spans many texels, the material's normal map is carrying
@@ -655,7 +855,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // Cascade shadows and cloud shadows multiply: a surface in the shade of a
     // ridge under a cloud is darker than either alone, which is correct -- both
     // are occluders of the same direct light.
-    let shadow = sun_visibility(in.world, view_depth, ndl) * cloud_shadow(in.world);
+    // Cascade, cloud and parallax self-shadowing all multiply, for the same
+    // reason: each is an independent occluder of the same direct light. The
+    // parallax term is the only one below the scale of the geometry, so it is
+    // what keeps a gravel bed from going flat the moment the sun is behind it.
+    let shadow =
+        sun_visibility(in.world, view_depth, ndl) * cloud_shadow(in.world) * surf.shadow;
 
     // Occlusion belongs to the ambient term: a crevice sees less of the sky,
     // but sunlight reaching it arrives at full strength. Folding it into the

@@ -149,9 +149,16 @@ impl Default for LayerParams {
             normal_strength: 1.0,
             roughness: 1.0,
             height_blend: 0.22,
-            // Off by default. Parallax costs a loop of samples per pixel, and a
-            // material with a flat height channel gains nothing from it.
-            parallax_m: 0.0,
+            // 3 cm of relief: enough that gravel and stonework read as solid,
+            // little enough that it cannot be mistaken for the terrain's own
+            // shape. Was off by default, on the grounds that parallax costs a
+            // loop of samples and a flat height channel gains nothing from it.
+            // Both halves of that are now handled in the shader rather than by
+            // asking the user to opt in: a height map that is flat mid-grey --
+            // which is what a set with no displacement map decodes to -- exits
+            // the march after one fetch, and the whole effect fades out past
+            // 140 m where the relief is below a pixel anyway.
+            parallax_m: 0.03,
             ao: 1.0,
             _pad0: [0.0; 2],
             tint: [1.0, 1.0, 1.0],
@@ -167,7 +174,15 @@ pub struct LayerInfo {
     /// RGBA, `THUMB * THUMB * 4`.
     pub thumbnail: Vec<u8>,
     /// Role this layer fills automatically, or [`ROLE_NONE`].
+    ///
+    /// Guessed from the name at load and changeable afterwards, because the guess is
+    /// a substring match on a folder name and is wrong often enough to need a way
+    /// out. Setting it to [`ROLE_NONE`] is what makes a material paint-only: it then
+    /// appears exactly where it is painted and nowhere else.
     pub role: u32,
+    /// What the name-based guess said, kept so the pane can offer "Auto" as a choice
+    /// distinct from whichever role that turned out to be.
+    pub auto_role: u32,
     /// Mean linear albedo of the whole texture.
     ///
     /// Taken from the 1x1 mip, which *is* the average by construction. Grass
@@ -175,6 +190,32 @@ pub struct LayerInfo {
     /// is the colour they have to match.
     pub average_color: [f32; 3],
 }
+
+/// Give `layer` the automatic `role`, demoting whoever held it.
+///
+/// A free function rather than only a method on [`Materials`], because `Materials`
+/// owns GPU resources and cannot be built in a unit test -- and a test that
+/// reimplemented this rule would pass while the shipped one drifted.
+fn assign_role(layers: &mut [LayerInfo], layer: usize, role: u32) {
+    if layers.get(layer).is_none() {
+        return;
+    }
+    // Paint-only is not exclusive: several layers can be in it, and usually are.
+    if role != ROLE_NONE {
+        for (i, l) in layers.iter_mut().enumerate() {
+            if i != layer && l.role == role {
+                l.role = ROLE_NONE;
+            }
+        }
+    }
+    layers[layer].role = role;
+}
+
+/// Roles a user may choose from in the material pane, in the order shown.
+///
+/// [`ROLE_NONE`] last, because "paint only" is the opt-out rather than a peer of the
+/// others.
+pub const SELECTABLE_ROLES: [u32; 7] = [SOIL, GRASS, ROCK, GRAVEL, SNOW, MUD, ROLE_NONE];
 
 /// Human-readable role, for the palette.
 pub fn role_label(role: u32) -> &'static str {
@@ -239,6 +280,20 @@ impl Materials {
     ///
     /// The whole array every time: it is 8 x 48 bytes, and a partial write keyed
     /// by index would be more code than the transfer costs.
+    /// Change which role a layer fills automatically.
+    ///
+    /// Any *other* layer already holding that role is demoted to paint-only, keeping
+    /// the invariant `assign_roles` establishes at load: two layers competing for the
+    /// same automatic placement would fight over the same ground and neither would
+    /// win predictably. Setting [`ROLE_NONE`] demotes nothing -- several layers can be
+    /// paint-only at once, and usually are.
+    ///
+    /// The caller has to follow this with `Terrain::set_materials`, which is what
+    /// carries the roles to the GPU. Cheap: a uniform write, no texture work.
+    pub fn set_role(&mut self, layer: usize, role: u32) {
+        assign_role(&mut self.layers, layer, role);
+    }
+
     pub fn upload_params(&self, queue: &wgpu::Queue) {
         let mut padded = [LayerParams::default(); MAX_LAYERS as usize];
         for (slot, p) in padded.iter_mut().zip(&self.params) {
@@ -284,6 +339,7 @@ impl Materials {
             .zip(roles)
             .zip(baked.iter())
             .map(|((name, role), b)| LayerInfo {
+                auto_role: role,
                 name,
                 thumbnail: b.thumbnail(),
                 role,
@@ -464,7 +520,12 @@ impl Materials {
 fn load_or_bake(root: &Path, dirs: &[std::path::PathBuf]) -> Vec<(String, Baked)> {
     let key = texture_set::fingerprint(dirs, TILE);
     let cache = root.join(".cache").join(format!("materials-{key:016x}.bin"));
-    let name_of = |d: &Path| d.file_name().unwrap_or_default().to_string_lossy().to_string();
+    // `texture_set::material_name`, not the raw folder name. A download that arrives as
+    // `rocky_terrain_03/textures/*` would otherwise be called "textures", and since
+    // `role_of` reads this name, the set would be assigned the soil base coat and
+    // carpet every flat field in the world instead of appearing on cliffs. Applied
+    // here rather than only at import, so a folder already on disk is fixed too.
+    let name_of = |d: &Path| texture_set::material_name(d);
 
     if let Some(v) = read_cache(&cache, dirs.len()) {
         log::info!("materials: {} layers from cache", v.len());
@@ -508,11 +569,15 @@ fn bake_set(set: &TextureSet) -> Baked {
     let mut surf = vec![0.0f32; n * n * 4];
 
     for i in 0..n * n {
-        // Albedo arrives sRGB-encoded and is re-encoded on the way out, so it
-        // is decoded to linear here for the mip filtering in between. Box
-        // filtering gamma-encoded values darkens every downsample.
+        // Albedo is usually sRGB-encoded and is re-encoded on the way out, so it is
+        // decoded to linear here for the mip filtering in between. Box filtering
+        // gamma-encoded values darkens every downsample.
+        //
+        // An EXR albedo is already linear, and decoding it again would darken the
+        // material rather than correct it -- so that case skips the transfer.
         for k in 0..3 {
-            rgba[i * 4 + k] = srgb_to_linear(set.albedo[i * 4 + k] as f32 / 255.0);
+            let v = set.albedo[i * 4 + k] as f32 / 255.0;
+            rgba[i * 4 + k] = if set.albedo_is_linear { v } else { srgb_to_linear(v) };
         }
         rgba[i * 4 + 3] = set.height[i] as f32 / 255.0;
 
@@ -796,6 +861,100 @@ mod tests {
             VECTOR_OFFSETS.iter().all(|o| o.is_multiple_of(16)),
             "a vector member is misaligned: {VECTOR_OFFSETS:?}"
         );
+    }
+
+    /// A palette of named layers with roles assigned the way `load` assigns them.
+    fn palette(names: &[&str]) -> Vec<LayerInfo> {
+        let owned: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let roles = assign_roles(&owned);
+        owned
+            .into_iter()
+            .zip(roles)
+            .map(|(name, role)| LayerInfo {
+                name,
+                thumbnail: Vec::new(),
+                role,
+                auto_role: role,
+                average_color: [0.0; 3],
+            })
+            .collect()
+    }
+
+    /// The shipped rule. `Materials::set_role` is this plus a uniform upload, so the
+    /// tests exercise the same code the editor runs.
+    use super::assign_role as set_role;
+
+    #[test]
+    fn paint_only_stops_a_material_being_placed_automatically() {
+        // The whole point of the opt-out: a material set to paint-only appears where it
+        // is brushed and nowhere else, rather than wherever the slope masks put it.
+        let mut p = palette(&["Grass001", "Rock042"]);
+        assert_eq!(p[1].role, ROCK);
+        set_role(&mut p, 1, ROLE_NONE);
+        assert_eq!(p[1].role, ROLE_NONE);
+        // And the other layer is untouched.
+        assert_eq!(p[0].role, GRASS);
+    }
+
+    #[test]
+    fn taking_a_role_demotes_whoever_held_it() {
+        // Two layers competing for one automatic placement would fight over the same
+        // ground and neither would win predictably, which is the invariant
+        // `assign_roles` sets up at load and which an override must not break.
+        let mut p = palette(&["Grass001", "Grass005"]);
+        assert_eq!((p[0].role, p[1].role), (GRASS, ROLE_NONE));
+        set_role(&mut p, 1, GRASS);
+        assert_eq!(p[1].role, GRASS, "the new claimant takes it");
+        assert_eq!(p[0].role, ROLE_NONE, "the old holder must be demoted");
+    }
+
+    #[test]
+    fn several_layers_may_be_paint_only_at_once() {
+        // Unlike a real role, paint-only is not exclusive -- and normally most of the
+        // palette is in it.
+        let mut p = palette(&["Grass001", "Rock042", "Ground024"]);
+        for i in 0..3 {
+            set_role(&mut p, i, ROLE_NONE);
+        }
+        assert!(p.iter().all(|l| l.role == ROLE_NONE));
+    }
+
+    #[test]
+    fn an_override_does_not_lose_what_the_guess_said() {
+        // The pane shows "(auto)" against the guessed role, so it has to survive being
+        // overridden -- otherwise there is no way back to it.
+        let mut p = palette(&["Ground024"]);
+        assert_eq!(p[0].auto_role, SOIL);
+        set_role(&mut p, 0, ROCK);
+        assert_eq!(p[0].role, ROCK);
+        assert_eq!(p[0].auto_role, SOIL, "the guess must be remembered");
+    }
+
+    #[test]
+    fn a_misread_name_can_be_corrected_to_the_right_role() {
+        // The real case: `rocky_terrain_03/textures` was read as soil and covered every
+        // flat field. Renaming files on disk should not be the only way out.
+        let mut p = palette(&["textures"]);
+        assert_eq!(p[0].role, SOIL, "an unrecognised name is the base coat");
+        set_role(&mut p, 0, ROCK);
+        assert_eq!(p[0].role, ROCK);
+    }
+
+    #[test]
+    fn an_out_of_range_layer_is_ignored_rather_than_panicking() {
+        let mut p = palette(&["Grass001"]);
+        set_role(&mut p, 9, ROCK);
+        assert_eq!(p[0].role, GRASS);
+    }
+
+    #[test]
+    fn every_selectable_role_has_a_label_and_covers_the_real_ones() {
+        for r in SELECTABLE_ROLES {
+            assert!(!role_label(r).is_empty());
+        }
+        for r in [SOIL, GRASS, ROCK, GRAVEL, SNOW, MUD, ROLE_NONE] {
+            assert!(SELECTABLE_ROLES.contains(&r), "{} is not offered", role_label(r));
+        }
     }
 
     #[test]

@@ -33,9 +33,23 @@ pub enum Action {
     None,
     Go(Pane),
     Quit,
-    Create { name: String, size: WorldSize, seed: u64 },
+    Create {
+        name: String,
+        size: WorldSize,
+        seed: u64,
+    },
     Open(PathBuf),
     Forget(PathBuf),
+    /// Ask before deleting: opens the confirmation. Never deletes anything itself.
+    AskDelete(PathBuf),
+    /// Confirmed. `files` distinguishes erasing the folder from only dropping the
+    /// library entry, which are very different acts and so are separate buttons.
+    Delete {
+        path: PathBuf,
+        files: bool,
+    },
+    /// Dismiss the confirmation, changing nothing.
+    CancelDelete,
 }
 
 pub struct CreateForm {
@@ -205,7 +219,13 @@ pub fn home(root: &mut egui::Ui, world_count: usize) -> Action {
     action
 }
 
-pub fn worlds(root: &mut egui::Ui, library: &Library) -> Action {
+/// The world a delete confirmation is open for, if any.
+pub struct DeleteTarget<'a> {
+    pub name: &'a str,
+    pub path: &'a std::path::Path,
+}
+
+pub fn worlds(root: &mut egui::Ui, library: &Library, pending: Option<DeleteTarget<'_>>) -> Action {
     let mut action = Action::None;
     let entries = library.sorted();
 
@@ -245,7 +265,14 @@ pub fn worlds(root: &mut egui::Ui, library: &Library) -> Action {
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        if rail_item(ui, &e.name, &folder, false) {
+                        // The row opens; a small button on its trailing edge asks to
+                        // delete. Separate hit areas, because a delete that shares a
+                        // click target with "open this world" is a delete waiting to
+                        // happen by accident.
+                        let (clicked, delete) = rail_item_deletable(ui, &e.name, &folder);
+                        if delete {
+                            action = Action::AskDelete(e.path.clone());
+                        } else if clicked {
                             action = Action::Open(e.path.clone());
                         }
                     } else {
@@ -271,6 +298,16 @@ pub fn worlds(root: &mut egui::Ui, library: &Library) -> Action {
                                 theme::DANGER,
                             );
                         }
+                        // Named for AccessKit, as the delete button is: a painted row
+                        // is an unlabelled hit area to anything that is not a pair of
+                        // eyes, and this one is the only control the row has.
+                        resp.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                format!("{} unavailable - click to remove from list", e.name),
+                            )
+                        });
                         if resp.clicked() {
                             action = Action::Forget(e.path.clone());
                         }
@@ -279,7 +316,114 @@ pub fn worlds(root: &mut egui::Ui, library: &Library) -> Action {
             }
         }
     });
+
+    if let Some(t) = pending
+        && let Some(a) = delete_modal(root, t)
+    {
+        action = a;
+    }
     action
+}
+
+/// Confirmation for deleting a world.
+///
+/// A real modal rather than a toast with an undo: the destructive half cannot be
+/// undone. `world/source/global_height.r16` is the eroded heightmap and the one
+/// irreplaceable file in a project -- everything under `cache/` regenerates, and
+/// nothing else does.
+///
+/// The two outcomes are separate buttons rather than a checkbox, because they differ
+/// in kind and a checkbox next to "Delete" is read as a detail rather than as the
+/// difference between reversible and not.
+fn delete_modal(root: &mut egui::Ui, t: DeleteTarget<'_>) -> Option<Action> {
+    let mut result = None;
+    let mut open = true;
+    egui::Modal::new(egui::Id::new("confirm-delete-world")).show(root.ctx(), |ui| {
+        ui.set_width(430.0);
+        ui.label(theme::title("Delete world"));
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new(t.name).size(16.0).color(theme::TEXT));
+        ui.add_space(2.0);
+        ui.label(theme::small(&t.path.to_string_lossy()));
+        ui.add_space(12.0);
+        ui.label(theme::small(
+            "Deleting the files erases the eroded heightmap, every sculpt and paint \
+             stroke, and the assets imported into this project. That cannot be undone.",
+        ));
+        ui.add_space(16.0);
+
+        ui.horizontal(|ui| {
+            if ui.add_sized([120.0, 30.0], egui::Button::new("Cancel")).clicked() {
+                result = Some(Action::CancelDelete);
+                open = false;
+            }
+            if ui
+                .add_sized([140.0, 30.0], egui::Button::new("Remove from list"))
+                .on_hover_text("Leaves every file on disk; only forgets where it is")
+                .clicked()
+            {
+                result = Some(Action::Delete { path: t.path.to_path_buf(), files: false });
+                open = false;
+            }
+            if ui
+                .add_sized(
+                    [140.0, 30.0],
+                    egui::Button::new(egui::RichText::new("Delete files").color(theme::DANGER)),
+                )
+                .on_hover_text("Erases the folder. This cannot be undone")
+                .clicked()
+            {
+                result = Some(Action::Delete { path: t.path.to_path_buf(), files: true });
+                open = false;
+            }
+        });
+    });
+    // Escape or a click outside is a cancel, which is what a destructive modal has to
+    // treat an ambiguous dismissal as.
+    if open && root.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+        result = Some(Action::CancelDelete);
+    }
+    result
+}
+
+/// A rail row that can be opened or deleted, as `(clicked, delete_requested)`.
+fn rail_item_deletable(ui: &mut egui::Ui, label: &str, hint: &str) -> (bool, bool) {
+    let clicked = rail_item(ui, label, hint, false);
+    let row = ui.min_rect();
+    // Overlaid on the row's trailing edge rather than laid out beside it, so the row
+    // keeps its full width as a click target for opening.
+    let size = vec2(26.0, 26.0);
+    let at = egui::pos2(row.right() - 34.0, row.bottom() - hint_row_height(hint) / 2.0);
+    let rect = Rect::from_center_size(at, size);
+    let resp = ui.interact(rect, ui.id().with((label, "del")), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hot = resp.hovered();
+        let p = ui.painter();
+        if hot {
+            p.rect_filled(rect, CornerRadius::same(6), theme::HOVER);
+        }
+        p.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "\u{2715}",
+            FontId::proportional(13.0),
+            if hot { theme::DANGER } else { theme::MUTED.gamma_multiply(0.7) },
+        );
+    }
+    // Published to AccessKit by hand. The row and this button are painted rather than
+    // built from widgets, so neither announces itself -- which for a destructive
+    // control means a screen reader finds an unlabelled hit area. `interact` gives no
+    // name of its own, so one is supplied.
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Delete this world")
+    });
+    let resp = resp.on_hover_text("Delete this world");
+    // A click on the button must not also count as opening the row.
+    (clicked && !resp.hovered(), resp.clicked())
+}
+
+fn hint_row_height(hint: &str) -> f32 {
+    if hint.is_empty() { 46.0 } else { 56.0 }
 }
 
 pub fn create(root: &mut egui::Ui, form: &mut CreateForm) -> Action {
@@ -488,19 +632,23 @@ pub enum Tool {
     Sculpt,
     Paint,
     Foliage,
+    /// Drag a rectangle on the ground to place a body of water.
+    Water,
     /// Pick, move, scale and delete individual placed objects.
     Select,
     Road,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 5] = [Tool::Camera, Tool::Sculpt, Tool::Paint, Tool::Foliage, Tool::Road];
+    pub const ALL: [Tool; 6] =
+        [Tool::Camera, Tool::Sculpt, Tool::Paint, Tool::Foliage, Tool::Water, Tool::Road];
     pub fn label(self) -> &'static str {
         match self {
             Tool::Camera => "Camera",
             Tool::Sculpt => "Sculpt",
             Tool::Paint => "Paint",
             Tool::Foliage => "Foliage",
+            Tool::Water => "Water",
             Tool::Select => "Select",
             Tool::Road => "Road",
         }
@@ -537,6 +685,50 @@ pub struct SelectionView {
     pub scale: f32,
     pub yaw: f32,
     pub height: f32,
+}
+
+/// What kind of thing an outliner row is, which decides what selecting it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlinerKind {
+    /// A body of water. Selecting one opens the Water tool on it.
+    Water,
+    /// A scattered species. **One row per species, not per instance** -- a thousand
+    /// painted trees are one thing you can edit, and a thousand rows would be a list
+    /// nobody could use. The instance count is shown as a detail instead.
+    Species,
+    /// A hand-placed object, which really is one per row: it was placed individually and
+    /// has its own transform.
+    Prop,
+    /// A road spline.
+    Road,
+    /// A cave modifier in the stack.
+    Modifier,
+}
+
+impl OutlinerKind {
+    /// Heading the rows of this kind sit under.
+    pub fn group(self) -> &'static str {
+        match self {
+            OutlinerKind::Water => "WATER",
+            OutlinerKind::Species => "FOLIAGE",
+            OutlinerKind::Prop => "OBJECTS",
+            OutlinerKind::Road => "ROADS",
+            OutlinerKind::Modifier => "CAVES",
+        }
+    }
+}
+
+/// One row of the outliner.
+pub struct OutlinerItem {
+    pub kind: OutlinerKind,
+    /// Index within its own kind, which is what an action refers back to.
+    pub index: usize,
+    pub name: String,
+    /// The right-hand detail: an instance count, a size, whatever identifies it.
+    pub detail: String,
+    /// Whether removing this row is possible. A species comes from a file in the project
+    /// and is removed by deleting the file, not by a button here.
+    pub removable: bool,
 }
 
 /// One foliage palette entry.
@@ -594,6 +786,17 @@ pub struct EditorView<'a> {
     /// The Environment Light Mixer: sun, atmosphere, sky light, fog, clouds and
     /// tone mapping, in one place.
     pub env: &'a mut terra_render::Environment,
+    /// Water for the open world. In the Environment pane because water is part of what
+    /// the light does to the scene, and because it interacts with the sun and sky the
+    /// mixer already owns -- a lake reflects whatever the atmosphere is doing.
+    pub water: &'a mut terra_render::water::WaterSettings,
+    /// Which body the Water tool has selected, if any.
+    pub selected_water: &'a mut Option<usize>,
+    /// Everything in the world, as the outliner shows it. Built by the app, because it
+    /// spans state the UI has no other reason to see.
+    pub outliner: &'a [OutlinerItem],
+    /// The selected row, as a kind and an index.
+    pub outliner_selection: Option<(OutlinerKind, usize)>,
     /// The road being drawn, if any, plus how many roads exist.
     pub active_road: Option<&'a mut Road>,
     pub road_count: usize,
@@ -603,6 +806,8 @@ pub struct EditorView<'a> {
     pub selected_modifier: &'a mut Option<usize>,
     /// The project's own asset folder, as the content browser sees it.
     pub content: &'a ContentView<'a>,
+    /// Result of the last import or rescan, and whether it was a failure.
+    pub notice: Option<&'a (String, bool)>,
     /// Noise pattern the Noise sculpt brush samples, and the library of
     /// uploaded patterns to choose from.
     pub noise: &'a mut terra_voxel::NoiseField,
@@ -663,6 +868,9 @@ pub enum EditorAction {
     SelectAssetKind(AssetKind),
     /// Open a file dialog and copy the chosen file into the project.
     ImportAsset(AssetKind),
+    /// Re-read the project's asset folders and rebuild the palettes, for files
+    /// copied in from outside the editor.
+    RefreshAssets,
     /// Make an uploaded greyscale map the Noise brush's pattern.
     SelectNoise(String),
     /// Append a tunnel modifier through the view direction.
@@ -673,6 +881,13 @@ pub enum EditorAction {
     OpenMaterial(usize),
     /// Select the material currently open in the editor for painting.
     PaintWithSelectedMaterial,
+    /// Change which role the open material fills automatically. `ROLE_NONE` makes it
+    /// paint-only, so it appears only where it is painted.
+    SetMaterialRole(u32),
+    /// Select an outliner row, which switches to the tool that owns its settings.
+    SelectOutliner(OutlinerKind, usize),
+    /// Delete an outliner row.
+    RemoveOutliner(OutlinerKind, usize),
 }
 
 pub fn editor(
@@ -835,6 +1050,12 @@ impl egui_dock::TabViewer for EditorTabs<'_, '_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         use crate::dock::Tab;
         match tab {
+            Tab::Outliner => {
+                egui::ScrollArea::vertical()
+                    .id_salt("outliner-scroll")
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| outliner_panel(ui, self.view, self.action));
+            }
             // Draws nothing: the scene is already on screen behind this, and
             // the tab exists to reserve the space. Its rect is the one piece of
             // information it does produce. See `dock.rs`.
@@ -866,7 +1087,10 @@ impl egui_dock::TabViewer for EditorTabs<'_, '_> {
                 egui::ScrollArea::vertical()
                     .id_salt("environment-scroll")
                     .auto_shrink([false; 2])
-                    .show(ui, |ui| environment_panel(ui, self.view.env));
+                    .show(ui, |ui| {
+                        environment_panel(ui, self.view.env);
+                        water_panel(ui, self.view.water);
+                    });
             }
             Tab::Material => {
                 egui::ScrollArea::vertical()
@@ -896,6 +1120,135 @@ impl egui_dock::TabViewer for EditorTabs<'_, '_> {
 /// and a user adjusting one section at a time could not see why. Sun first, then
 /// what the air does to it, then what fills the shadows, then what sits in
 /// front, then how it all becomes pixels.
+/// Everything placed in the world, as one list.
+///
+/// Unreal's Scene Outliner, and the same job: one place that answers "what is in this
+/// level", where selecting a row shows its settings and offers to remove it.
+///
+/// The rule that makes it usable is that **a scattered species is one row, not one row
+/// per instance**. A thousand painted trees are a thousand instances of one decision --
+/// the species' rules -- so they are one thing to edit, with the count as a detail. A
+/// list with a thousand identical rows would be a list nobody scrolls. Hand-placed
+/// objects are the exception and get a row each, because each was placed on purpose and
+/// carries its own transform.
+///
+/// Selecting a row switches to the tool that owns its settings rather than duplicating
+/// them here, which is why there is one Details pane in this editor and not five.
+fn outliner_panel(ui: &mut egui::Ui, v: &EditorView<'_>, action: &mut EditorAction) {
+    ui.add_space(6.0);
+    if v.outliner.is_empty() {
+        ui.label(theme::muted("Nothing placed yet."));
+        ui.add_space(4.0);
+        ui.label(theme::small(
+            "Water bodies, foliage, objects, roads and caves appear here as they are \
+             added. Painting a thousand trees adds one entry, not a thousand.",
+        ));
+        return;
+    }
+
+    let mut group: Option<OutlinerKind> = None;
+    for item in v.outliner {
+        // Headings emitted as the kind changes, so the app decides the order once by the
+        // order it builds the list in and the pane does not sort it again.
+        if group != Some(item.kind) {
+            if group.is_some() {
+                ui.add_space(10.0);
+            }
+            ui.label(theme::label(item.kind.group()));
+            ui.add_space(4.0);
+            group = Some(item.kind);
+        }
+
+        let selected = v.outliner_selection == Some((item.kind, item.index));
+        ui.horizontal(|ui| {
+            let label = format!("{}   {}", item.name, item.detail);
+            if ui.selectable_label(selected, label).clicked() {
+                *action = EditorAction::SelectOutliner(item.kind, item.index);
+            }
+            if item.removable {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let resp = ui.small_button("\u{2715}");
+                    // Named for AccessKit. A bare glyph is an unlabelled control to
+                    // anything that is not a pair of eyes, and the tooltip below is not
+                    // published -- so a destructive button would announce itself as "✕".
+                    let name = format!("Remove {}", item.name);
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name.clone())
+                    });
+                    if resp.on_hover_text(format!("Remove {}", item.name)).clicked() {
+                        *action = EditorAction::RemoveOutliner(item.kind, item.index);
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// Water, at the end of the mixer.
+///
+/// Last because it is the last thing light meets before the tone map: the surface
+/// reflects the sky the sections above it describe, so reading downward matches the
+/// order the frame is actually built in.
+fn water_panel(ui: &mut egui::Ui, w: &mut terra_render::water::WaterSettings) {
+    ui.add_space(12.0);
+    ui.label(theme::label("WATER"));
+    ui.add_space(4.0);
+    theme::inset(8).show(ui, |ui| {
+        ui.checkbox(&mut w.enabled, "Water");
+        ui.label(theme::small(
+            "Fills every basin below the level to the same height, so it behaves like a \
+             sea rather than like separate lakes. Depth comes from the terrain itself, \
+             which is why the shoreline follows the ground exactly and needs no painting.",
+        ));
+        ui.add_enabled_ui(w.enabled, |ui| {
+            ui.add_space(8.0);
+            ui.label(theme::small("LEVEL"));
+            slider(ui, "Height m", &mut w.level_m, 0.0..=2048.0);
+            ui.label(theme::small(
+                "Surface height in world metres. Everything below it is under water.",
+            ));
+
+            ui.add_space(10.0);
+            ui.label(theme::small("COLOUR"));
+            ui.horizontal(|ui| {
+                ui.color_edit_button_rgb(&mut w.shallow);
+                ui.label(theme::small("Shallow"));
+            });
+            ui.horizontal(|ui| {
+                ui.color_edit_button_rgb(&mut w.deep);
+                ui.label(theme::small("Deep"));
+            });
+            slider_log(ui, "Absorption", &mut w.absorption, 0.01..=1.0);
+            ui.label(theme::small(
+                "How fast the water goes from the shallow colour to the deep one with \
+                 depth. This is also what makes shallows transparent and deep water \
+                 opaque, since the absorption drives the blend.",
+            ));
+
+            ui.add_space(10.0);
+            ui.label(theme::small("WAVES"));
+            slider(ui, "Height m", &mut w.wave_height_m, 0.0..=3.0);
+            slider_log(ui, "Length m", &mut w.wave_length_m, 2.0..=200.0);
+            slider(ui, "Speed", &mut w.wave_speed, 0.0..=3.0);
+            slider(ui, "Wind deg", &mut w.wind_deg, -180.0..=180.0);
+            ui.label(theme::small(
+                "Four Gerstner waves, each shorter and shallower than the last, all \
+                 travelling with the wind. Waves flatten into the shallows on their own, \
+                 so a crest cannot punch through a beach.",
+            ));
+
+            ui.add_space(10.0);
+            ui.label(theme::small("SURFACE"));
+            slider(ui, "Roughness", &mut w.roughness, 0.01..=0.5);
+            slider(ui, "Foam m", &mut w.foam_width_m, 0.0..=6.0);
+            ui.label(theme::small(
+                "Roughness spreads the sun's highlight. Foam is a band at the shoreline, \
+                 measured in metres of depth.",
+            ));
+        });
+    });
+}
+
 fn environment_panel(ui: &mut egui::Ui, env: &mut terra_render::Environment) {
     use terra_render::ToneMapper;
 
@@ -1095,6 +1448,31 @@ fn environment_panel(ui: &mut egui::Ui, env: &mut terra_render::Environment) {
             slider_log(ui, "Thickness m", &mut env.clouds.thickness_m, 100.0..=8000.0);
             slider_log(ui, "Density", &mut env.clouds.density, 0.001..=0.5);
             slider_log(ui, "Feature m", &mut env.clouds.feature_scale_m, 500.0..=40000.0);
+
+            ui.add_space(8.0);
+            ui.label(theme::small("DRIFT"));
+            // Edited as a speed and a heading, stored as a vector: that is what the
+            // shader advects by and what every saved world already holds, so this needs
+            // no format change. Round-tripping through the pair is why `set_wind` keeps
+            // the heading at zero speed -- otherwise dragging speed down and back up
+            // would silently rotate the sky.
+            let mut speed = env.clouds.wind_speed();
+            let mut heading = env.clouds.wind_deg();
+            let before = (speed, heading);
+            // Real weather, not a screensaver. A fair-weather cumulus layer drifts at
+            // roughly 5-15 m/s, which crosses a 4 km world in about six minutes -- slow
+            // enough to read as weather rather than as a conveyor belt. The range goes
+            // to 60 for a storm, and to zero for a still sky worth taking a screenshot
+            // of.
+            slider(ui, "Speed m/s", &mut speed, 0.0..=60.0);
+            slider(ui, "Direction deg", &mut heading, -180.0..=180.0);
+            if (speed, heading) != before {
+                env.clouds.set_wind(speed, heading);
+            }
+            ui.label(theme::small(
+                "How fast the layer drifts, and which way. Shadows on the ground move \
+                 with it, because they are cast from the same layer.",
+            ));
         });
     });
     ui.add_space(12.0);
@@ -1138,6 +1516,10 @@ pub struct MaterialView<'a> {
     pub role: &'a str,
     pub texture: Option<&'a egui::TextureHandle>,
     pub params: &'a mut terra_render::material::LayerParams,
+    /// Role this layer currently fills automatically, and what the name-based guess
+    /// said. Equal unless the user has overridden it.
+    pub role_id: u32,
+    pub auto_role: u32,
 }
 
 /// PBR settings for one material.
@@ -1167,6 +1549,55 @@ fn material_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut Editor
     });
     ui.add_space(8.0);
 
+    ui.label(theme::label("PLACEMENT"));
+    theme::inset(8).show(ui, |ui| {
+        use terra_render::material::{ROLE_NONE, SELECTABLE_ROLES, role_label};
+        // The opt-out first and on its own row, because it is the choice with a
+        // different *kind* of consequence: every other option moves the material
+        // somewhere, this one stops it being placed at all.
+        let paint_only = m.role_id == ROLE_NONE;
+        if ui
+            .add_sized(
+                [ui.available_width(), 26.0],
+                egui::Button::selectable(paint_only, "Paint only"),
+            )
+            .on_hover_text("Appears only where you paint it, and nowhere else")
+            .clicked()
+            && !paint_only
+        {
+            *action = EditorAction::SetMaterialRole(ROLE_NONE);
+        }
+        ui.add_space(4.0);
+        ui.label(theme::small(if paint_only {
+            "Not placed automatically. Choose the Paint tool, pick this material, and \
+             brush it on."
+        } else {
+            "Placed automatically by ground shape and by where the erosion solver ran \
+             water. Painting still overrides it anywhere you brush."
+        }));
+
+        ui.add_space(6.0);
+        ui.label(theme::small("AUTOMATIC ROLE"));
+        // The guess is a substring match on a folder name -- a set called
+        // `rocky_terrain_03/textures` was read as soil and carpeted every flat field --
+        // so the role has to be correctable without renaming files on disk.
+        ui.horizontal_wrapped(|ui| {
+            for r in SELECTABLE_ROLES {
+                if r == ROLE_NONE {
+                    continue;
+                }
+                let label = match r == m.auto_role {
+                    true => format!("{} (auto)", role_label(r)),
+                    false => role_label(r).to_string(),
+                };
+                if ui.selectable_label(m.role_id == r, label).clicked() && m.role_id != r {
+                    *action = EditorAction::SetMaterialRole(r);
+                }
+            }
+        });
+    });
+    ui.add_space(8.0);
+
     ui.label(theme::label("TILING"));
     theme::inset(8).show(ui, |ui| {
         slider_log(ui, "Repeat m", &mut m.params.tiling_m, 0.25..=64.0);
@@ -1189,10 +1620,12 @@ fn material_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut Editor
     theme::inset(8).show(ui, |ui| {
         slider(ui, "Parallax m", &mut m.params.parallax_m, 0.0..=0.25);
         ui.label(theme::small(
-            "Offsets the texture lookup by its height channel, so stones and cracks \
-             occlude each other as the camera moves. This is what makes the surface \
-             read as relief rather than as a photograph of it. Zero is off, and off \
-             is cheaper.",
+            "Depth of the relief the view ray marches through, in metres. Stones and \
+             cracks occlude each other as the camera moves and cast onto their own \
+             neighbours as the sun moves -- this is what makes the surface read as \
+             relief rather than as a photograph of it. It does not change the \
+             silhouette or what the car drives over: for that, sculpt the ground. \
+             Zero is off.",
         ));
         ui.add_space(4.0);
         slider(ui, "Blend band", &mut m.params.height_blend, 0.0..=0.6);
@@ -1302,12 +1735,34 @@ fn content_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorA
             }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button(format!("Import {}", v.content.kind.label())).clicked() {
+            // A texture is a folder of maps, so the button has to say so -- the
+            // dialog it opens is a folder picker, and "Import Textures" led
+            // straight to hunting for individual images.
+            let label = match v.content.kind {
+                AssetKind::Texture => "Import material folder".to_string(),
+                k => format!("Import {}", k.label()),
+            };
+            if ui.button(label).clicked() {
                 *action = EditorAction::ImportAsset(v.content.kind);
+            }
+            // Palettes are built on project open and on import, so a folder
+            // copied in from Finder is invisible without this.
+            if ui
+                .button("Refresh")
+                .on_hover_text("Re-read the asset folders. Use after copying files in by hand.")
+                .clicked()
+            {
+                *action = EditorAction::RefreshAssets;
             }
         });
     });
     ui.add_space(6.0);
+
+    if let Some((text, is_error)) = v.notice {
+        let colour = if *is_error { theme::WARN } else { theme::ACCENT };
+        ui.label(egui::RichText::new(text).size(11.5).color(colour));
+        ui.add_space(6.0);
+    }
 
     let kind = v.content.kind;
     let items = v.content.of(kind);
@@ -1315,12 +1770,25 @@ fn content_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorA
         ui.add_space(10.0);
         ui.label(theme::muted(&format!("No {} in this project yet.", kind.label().to_lowercase())));
         ui.add_space(4.0);
-        ui.label(theme::small(&format!(
-            "Import copies the file into {}/{}/ inside the project, so the project stays \
-             movable -- nothing here stores a path outside it.",
-            v.content.root,
-            kind.folder()
-        )));
+        ui.label(theme::small(&match kind {
+            // The one that needed saying: a material is a folder, and which file
+            // names make it loadable is not guessable.
+            AssetKind::Texture => format!(
+                "A material is a folder of maps, not a single image. Pick the folder -- one per \
+                 material -- or a pack of them, and it is copied into {}/{}/ inside the project. \
+                 One file's name has to contain color, albedo, basecolor, base_color, diff or \
+                 diffuse; normal, rough, occlusion and displacement maps are picked up if \
+                 present. PNG and JPEG only.",
+                v.content.root,
+                kind.folder()
+            ),
+            _ => format!(
+                "Import copies the file into {}/{}/ inside the project, so the project stays \
+                 movable -- nothing here stores a path outside it.",
+                v.content.root,
+                kind.folder()
+            ),
+        }));
         return;
     }
 
@@ -1516,9 +1984,13 @@ fn hints(v: &EditorView<'_>, narrow: bool) -> &'static str {
     match (v.playing, *v.tool, narrow) {
         (true, _, false) => {
             "W/S throttle   \u{2022}   A/D steer   \u{2022}   Q brake   \u{2022}   \
-             Shift handbrake   \u{2022}   Esc stop"
+             Shift handbrake   \u{2022}   Mouse look   \u{2022}   Wheel zoom   \u{2022}   \
+             R reset   \u{2022}   Esc stop"
         }
-        (true, _, true) => "W/S throttle   \u{2022}   A/D steer   \u{2022}   Esc stop",
+        (true, _, true) => {
+            "W/S throttle   \u{2022}   A/D steer   \u{2022}   Mouse look   \u{2022}   \
+             R reset   \u{2022}   Esc stop"
+        }
         (false, Tool::Camera, true) => "LMB orbit   \u{2022}   MMB pan   \u{2022}   Wheel zoom",
         (false, Tool::Select, true) => "LMB pick/move   \u{2022}   Del remove",
         (false, _, true) => {
@@ -1539,6 +2011,10 @@ fn hints(v: &EditorView<'_>, narrow: bool) -> &'static str {
         (false, Tool::Foliage, false) => {
             "LMB plant   \u{2022}   MMB pan   \u{2022}   Wheel zoom   \u{2022}   RMB look   \
              \u{2022}   WASD move, Q/E down/up   \u{2022}   F frame   \u{2022}   [ ] size, Shift + [ ] strength"
+        }
+        (false, Tool::Water, false) => {
+            "LMB drag a water body   \u{2022}   MMB pan   \u{2022}   Wheel zoom   \
+             \u{2022}   RMB look   \u{2022}   WASD move, Q/E down/up   \u{2022}   F frame"
         }
         (false, Tool::Paint, false) => {
             "LMB paint   \u{2022}   MMB pan   \u{2022}   Wheel zoom   \u{2022}   RMB look   \
@@ -1583,6 +2059,68 @@ fn tools_panel(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorAct
     brush_readout(ui, v);
 
     match *v.tool {
+        Tool::Water => {
+            ui.add_space(20.0);
+            ui.label(theme::label("BODIES"));
+            ui.add_space(6.0);
+            ui.label(theme::small(
+                "Drag a rectangle on the ground to place one. The rectangle only says \
+                 where to look -- the shoreline is wherever the ground crosses the level, \
+                 so a box over a lumpy basin still gives an irregular shore.",
+            ));
+            ui.add_space(8.0);
+
+            let count = v.water.regions.len();
+            if count == 0 {
+                ui.label(theme::muted("No water bodies yet."));
+            }
+            let mut remove = None;
+            for i in 0..count {
+                let selected = *v.selected_water == Some(i);
+                let size = v.water.regions[i].size();
+                let label = format!("Body {}  ({:.0} x {:.0} m)", i + 1, size[0], size[1]);
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(selected, label).clicked() {
+                        *v.selected_water = if selected { None } else { Some(i) };
+                    }
+                    let resp = ui.small_button("\u{2715}");
+                    let name = format!("Delete body {}", i + 1);
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name.clone())
+                    });
+                    if resp.on_hover_text("Delete this body").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                v.water.regions.remove(i);
+                // The selection is an index, so anything at or after the hole is stale.
+                *v.selected_water = None;
+            }
+
+            // Per-body settings, which is the point of regions: this body's level and
+            // this body's waves, independent of the global surface and of each other.
+            if let Some(i) = *v.selected_water
+                && let Some(r) = v.water.regions.get_mut(i)
+            {
+                ui.add_space(12.0);
+                ui.label(theme::label("THIS BODY"));
+                theme::inset(8).show(ui, |ui| {
+                    slider(ui, "Level m", &mut r.level_m, 0.0..=2048.0);
+                    ui.add_space(6.0);
+                    ui.label(theme::small("WAVES"));
+                    slider(ui, "Height m", &mut r.wave_height_m, 0.0..=3.0);
+                    slider_log(ui, "Length m", &mut r.wave_length_m, 2.0..=200.0);
+                    slider(ui, "Speed", &mut r.wave_speed, 0.0..=3.0);
+                    slider(ui, "Wind deg", &mut r.wind_deg, -180.0..=180.0);
+                    ui.label(theme::small(
+                        "This body only. A sheltered pond and an open reservoir under the \
+                         same wind do not move the same way.",
+                    ));
+                });
+            }
+        }
         Tool::Sculpt => {
             ui.add_space(20.0);
             ui.label(theme::label("MODE"));
@@ -2122,6 +2660,23 @@ fn tool_settings(ui: &mut egui::Ui, v: &mut EditorView<'_>, action: &mut EditorA
                 ui.label(theme::small(
                     "Beyond this, instances are not drawn at all. The main cost control: \
                      small props can be cut short, a treeline cannot.",
+                ));
+
+                ui.add_space(10.0);
+                ui.label(theme::small("LEVEL OF DETAIL"));
+                slider_log(ui, "LOD 1 at m", &mut r.lod1_m, 10.0..=1500.0);
+                slider_log(ui, "LOD 2 at m", &mut r.lod2_m, 10.0..=3000.0);
+                // Ordered here as well as clamped in the shader path, so the
+                // sliders cannot be dragged into a state the renderer has to
+                // silently correct.
+                if r.lod2_m < r.lod1_m {
+                    r.lod2_m = r.lod1_m;
+                }
+                ui.label(theme::small(
+                    "Distances at which an instance drops to a coarser mesh. Three levels \
+                     are built on import at roughly 6000, 1500 and 400 triangles, so the \
+                     far field costs a fraction of the near. This changes detail, not \
+                     placement: nothing appears or disappears at a switch.",
                 ));
             } else {
                 ui.label(theme::small(

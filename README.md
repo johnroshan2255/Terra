@@ -188,6 +188,66 @@ purpose: WGSL rounds uniform members up to 16-byte alignment, so a lone `f32`
 between two vectors inserts padding the Rust side does not and the whole block
 reads shifted from there on.
 
+## Water
+
+One blended surface over CDLOD patches, drawn last in the scene pass
+(`terra-render/src/water.rs`). Modelled on Unreal's Water plugin and Crest --
+Gerstner waves, depth-driven absorption, Fresnel against a sky reflection,
+shoreline foam -- with three departures that fall out of what this renderer
+already has.
+
+**Depth comes from the heightfield, not from a capture.** A shader cannot read the
+depth buffer it is writing, so engines either copy it or render a top-down *water
+info* texture first; Unreal does the latter, per Water Zone. Neither is needed
+here, because the terrain heightfield is already a storage buffer this pass can
+read. Depth is `level - terrain_height` evaluated exactly, anywhere, with no copy,
+no extra pass and no resolution loss -- which is also why there is no water-zone
+concept: the whole world is the zone. This is the one place the existing design
+makes water *easier* rather than harder.
+
+**The geometry is the terrain's own LOD.** Unreal's Water Mesh is a separate CLOD
+quadtree; `cdlod.rs` already is one, so the surface is the same patch selection
+with a different height source. It aims for 2 m spacing rather than the terrain's
+0.5 m -- waves are metres long, and a vertex every half metre resolves a curve
+that is already smooth.
+
+**No refraction.** That needs the scene colour behind the surface, which is the
+copy this avoids. Absorption drives the blend alpha instead: shallows are
+transparent and the ground shows through by ordinary blending, deep water goes
+opaque and reaches the body colour. Same physics, resolved by the blender -- it
+simply cannot bend what it shows. A later pass with a scene copy can replace the
+alpha term without touching anything else.
+
+Waves are four Gerstners at descending amplitude and rotated headings, with
+**analytic** tangent and binormal derivatives rather than a finite difference:
+the mesh under them is CDLOD, so its spacing changes with distance and a
+difference would change the lighting with it. Deep-water dispersion means long
+waves travel faster, which is what stops the sum reading as one rigid pattern
+sliding past. Amplitude fades to nothing in the shallows on its own, because a
+full-amplitude crest in 10 cm of water punches the surface through the beach.
+
+FFT would give a richer spectrum at high wave counts and `rustfft` exists for the
+CPU half, but it needs a precomputed spectrum and a per-frame IFFT; four Gerstners
+need a clock.
+
+Water is **off by default**, and that is load-bearing: a default sea level would
+flood the valleys of every project that predates the feature the moment it loaded.
+Settings live in `edits/water.ron` beside the environment, for the same reason --
+a level someone chose is authored work.
+
+This is the renderer's **first and only blended pipeline**. It writes no depth
+(the wave displacement makes a patch's own triangles overlap) and culls no faces,
+because the camera goes under the surface and a back-face-culled sheet vanishes
+from below -- which reads as the water disappearing rather than as being beneath
+it. It is also drawn *after* the vehicle, so a car in a lake appears through the
+surface rather than painted over it.
+
+**Known limits:** one global level, so it behaves like a sea rather than separate
+lakes at separate heights. Per-body regions need a region list and a per-region
+level; the shader already takes the level as a uniform, so that is an addition
+rather than a rework. There is no buoyancy yet -- `Water::submerged` and
+`Water::depth_over` are on the CPU ready for it.
+
 ## Materials
 
 **Nothing ships prebuilt.** An empty project has an empty palette and the terrain
@@ -210,7 +270,7 @@ the Material pane on it:
 | Normal strength | Multiplier on the tangent normal; 0 flattens the layer |
 | Roughness | Scales sampled roughness |
 | Occlusion | Mixes sampled AO toward unoccluded |
-| **Parallax m** | Offsets the lookup by the height channel along the view |
+| **Parallax m** | Depth of relief the view ray marches through (POM). Shading only |
 | Blend band | Width of the band this layer contends with its neighbour in |
 | Tint | Multiplies the albedo |
 
@@ -236,9 +296,67 @@ not be: gravel wants a repeat every metre or two and a cliff face wants ten, and
 one shared number leaves one blurred and the other visibly tiled.
 
 Parallax is what makes the surface read as relief rather than a photograph of
-relief — stones and cracks occlude each other as the camera moves. It is off by
-default because it costs samples and a material with a flat height channel gains
-nothing from it.
+relief — stones and cracks occlude each other as the camera moves, and cast onto
+their own neighbours as the sun moves.
+
+It is **parallax occlusion mapping**: the view ray marches the height channel
+until it meets the relief, 8–32 steps scaled by obliquity and amplitude, then one
+linear refinement across the bracketing pair. This is Unreal's POM node, and the
+distinction worth being clear about is that neither one displaces geometry —
+the silhouette stays smooth and the physics collider is untouched. For relief
+that a wheel can feel, sculpt the heightfield; the Noise brush takes the same
+greyscale maps and writes them into the terrain, where the collider reads them.
+
+The march happens on the **dominant** triplanar projection, not on all three:
+three marches would triple the cost for a result the weights immediately blend
+away. It also has to be the dominant one rather than a fixed axis — the
+single-step version this replaced always read the top-down projection, which on a
+cliff face is the degenerate one, so the depth it sampled was stretched garbage.
+
+The reference plane is **mid-grey**, not the top of the range, and that is what
+makes it safe to leave on: a set with no displacement map decodes to a flat 128,
+which exits the march after one fetch. Measured at 1920×1080 invocations on an M4
+(a compute proxy for the march alone, not a frame time):
+
+| height channel | cost |
+|---|---|
+| flat mid-grey — no displacement map | **0.13 ms** |
+| real relief, 0.03 m | 1.18 ms |
+| real relief, 0.10 m, 32 steps | 1.19 ms |
+
+A flat channel costs what switching parallax off costs. Depth and step count
+barely register against each other, so the march is bound by fetch latency rather
+than by arithmetic — which is also why the whole effect fades out past 140 m,
+where the relief is under a pixel and the mip has already removed it.
+
+Self-shadowing is off under **Lighting Only**, with the material normals: that
+mode promises a surface shaded from the geometric normal alone, and stone shadows
+left on it would contradict exactly the reading it exists to give.
+
+### The bands are tuned to the slopes this pipeline produces
+
+`slope` in the shader is `1 - cos(theta)`, not a tangent, which is how the original
+bands went wrong: rock started at 0.26 and snow at 0.30, which *read* as reasonable
+and mean **42°** and **46°**. Measured on a generated 4 km world, the steepest sample
+anywhere is **39.6°** — median 11.5, p90 29.3. So rock and snow never started, grass
+and soil never finished, and the automatic system was inert.
+
+The failure was silent and total. A palette whose only material held the rock role
+weighed zero across the whole map, so nothing claimed any texel, so the no-claimant
+fallback forced slot 0 everywhere at full strength — indistinguishable from a texture
+deliberately applied to everything, which is exactly how it was reported.
+
+Two things cap the slope and neither is going to change: the heightfield samples every
+**4 m**, so a 45° face is a 4 m step between neighbours, and erosion exists to *relax*
+steep ground — thermal talus and hydraulic transport do precisely that. Terrain steeper
+than about 40° has to come from the voxel layer.
+
+Snow was worse: its altitude band was 900–1350 m on a world whose default amplitude is
+900 m and which peaked at 864, so it was unreachable twice over.
+
+`role_weight_gpu.rs` probes the shipped shader across the reachable range and asserts
+every band both starts and finishes inside it. Reverting the old numbers fails six of
+its eight tests, which is the check that was missing.
 
 ## Camera
 
@@ -556,6 +674,22 @@ Generation on an M4, 1024² world: RMF 27 ms, thermal 0.4 s, erosion 3.1 s
 Surface Nets extraction on the same machine, per 32³ chunk: **0.073 ms** on the
 GPU against 0.94 ms for the CPU reference — so a sculpt stroke that dirties a
 handful of chunks re-extracts well inside one frame.
+
+**Foliage LOD:** three levels per species, built at import by the same
+vertex-cluster decimator at ~6000 / 1500 / 400 triangles. The existing cull pass
+bins each survivor by distance into one of three output buffers and writes three
+sets of indirect draw arguments -- still one dispatch, three counters instead of
+one. Switch distances are per species (**LOD 1 at m**, **LOD 2 at m** in the
+foliage tool). Measured on a 12 m grid at 900 m draw distance, 17,665 instances:
+**11.5 M triangles against 105 M** for a single level, an 89% cut at the
+defaults. The instance count is unchanged by the banding -- it changes detail,
+never visibility. See [docs/culling.md](docs/culling.md).
+
+This needed the instance record to shrink from **80 bytes to 32** first: a 4x4
+matrix replaced by a quaternion, an f16 scale and a position, because every
+instance drawn here is a rigid transform with uniform scale. Three 32-byte output
+buffers plus a 32-byte source is less memory than the single 80-byte source and
+output pair they replaced, so the feature costs no VRAM at all.
 
 **Stubs:** `terra-render/src/cdlod.rs`, `instancing.rs`, `terra-assets`,
 `terra-runtime`, and the tier-0 → tier-1 tile bake.

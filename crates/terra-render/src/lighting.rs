@@ -281,6 +281,10 @@ pub struct Lighting {
     shadow_map: wgpu::Texture,
     /// One view per cascade, for the depth attachments.
     pub cascade_views: Vec<wgpu::TextureView>,
+    /// The view-projections the last [`Self::upload`] fitted, kept so the shadow passes
+    /// can cull against them. Previously local to `upload` and thrown away, which is why
+    /// nothing culled for shadows.
+    fitted_cascades: [Mat4; CASCADES],
     resolution: u32,
 
     /// Sampled by the shading passes: uniform + shadow array + comparison
@@ -435,6 +439,7 @@ impl Lighting {
             cascade_ub,
             shadow_map,
             cascade_views,
+            fitted_cascades: [Mat4::IDENTITY; CASCADES],
             resolution,
             layout,
             bind_group,
@@ -508,7 +513,7 @@ impl Lighting {
     }
 
     pub fn upload(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         cam: &Camera,
         aspect: f32,
@@ -521,6 +526,7 @@ impl Lighting {
         for (i, window) in splits.windows(2).enumerate() {
             let m = self.fit_cascade(cam, aspect, window[0], window[1]);
             cascade_view_proj[i] = m.to_cols_array_2d();
+            self.fitted_cascades[i] = m;
             queue.write_buffer(
                 &self.cascade_ub,
                 SLOT * i as u64,
@@ -643,6 +649,22 @@ impl Lighting {
     }
 
     /// Dynamic offset for a cascade's uniform slot.
+    /// The cascade view-projections from the last [`Self::upload`], as frusta.
+    ///
+    /// What the shadow passes cull against: a caster only has to fall inside *some*
+    /// cascade to matter, so the union is both correct and cheaper than keeping a visible
+    /// set per cascade. Empty until the first upload, and an empty union culls nothing --
+    /// which is the safe answer for a frame that has not fitted its cascades yet.
+    pub fn cascade_frusta(&self) -> crate::frustum::FrustumUnion {
+        // Shadows off means no cascades are fitted and nothing should be culled for them.
+        if !self.settings.shadow_quality.enabled() {
+            return crate::frustum::FrustumUnion::default();
+        }
+        crate::frustum::FrustumUnion::new(
+            self.fitted_cascades.iter().map(crate::frustum::Frustum::new),
+        )
+    }
+
     pub fn cascade_offset(index: usize) -> u32 {
         (SLOT * index as u64) as u32
     }

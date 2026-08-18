@@ -17,6 +17,7 @@
 //! reading that count back would cost a GPU-to-CPU sync every frame.
 
 use crate::camera::Camera;
+use crate::frustum::Frustum;
 use crate::lighting::Lighting;
 use crate::mesh::{Instance, Mesh, MeshRenderer};
 use crate::terrain::Terrain;
@@ -40,6 +41,24 @@ const MAX_INSTANCES: usize = 300_000;
 /// 12k-triangle tree is already 240 M triangles a frame before culling.
 const MAX_TRIS_PER_SPECIES: usize = 6_000;
 
+/// Triangle budget per LOD, nearest first.
+///
+/// `LOD_TRIS[0]` is [`MAX_TRIS_PER_SPECIES`] -- the level a near instance draws
+/// at, unchanged from before LODs existed. Each step down is roughly a quarter,
+/// which is the ratio at which vertex-cluster decimation still reads as the same
+/// object: halving looks like a waste of a level, and eighths collapse a tree
+/// into a blob at a distance where its silhouette is still legible.
+///
+/// A mesh already under a budget is left alone, so a 200-triangle rock has three
+/// identical levels and costs three identical draws. That is deliberate: keeping
+/// the count fixed means the buffer, the args and the draw loop never depend on
+/// which species is being drawn.
+const LOD_TRIS: [usize; LOD_COUNT] = [MAX_TRIS_PER_SPECIES, 1_500, 400];
+
+/// Levels per species. Fixed, because it sizes the indirect-args buffer and the
+/// per-LOD output buffers.
+pub const LOD_COUNT: usize = 3;
+
 /// Palette slots. Eight is what the UI grid shows and what the density masks cost:
 /// one `DENSITY_RES` byte mask each, so the ceiling is memory, not a shader limit.
 const MAX_SPECIES: usize = 8;
@@ -51,13 +70,24 @@ const MAX_SPECIES: usize = 8;
 /// would be read as a version and the rest as nonsense floats. With it, an old file is
 /// recognised, refused, and the species keep their defaults.
 const FOLIAGE_MAGIC: [u8; 4] = *b"TFOL";
-const FOLIAGE_VERSION: u32 = 2;
+
+/// Current file version. **3** added the two LOD switch distances.
+///
+/// Version 2 is still read rather than refused: the LOD fields are the only
+/// difference, they have sensible defaults, and refusing would throw away every
+/// painted density mask in the file -- which is hours of work, to avoid writing
+/// eight bytes of migration.
+const FOLIAGE_VERSION: u32 = 3;
 
 /// Floats in one species' rules, in the order `encode_rules` writes them.
-const FLOAT_FIELDS: usize = 14;
+const FLOAT_FIELDS: usize = 16;
 
 /// Bytes one species' rules occupy: the floats, three bools, one seed.
 const RULES_BYTES: usize = FLOAT_FIELDS * 4 + 3 + 4;
+
+/// The same, for a version-2 file: two fewer floats, no LOD distances.
+const FLOAT_FIELDS_V2: usize = 14;
+const RULES_BYTES_V2: usize = FLOAT_FIELDS_V2 * 4 + 3 + 4;
 
 /// Strip the resolution suffix downloads carry, so the palette reads as names.
 fn pretty_name(file_stem: &str) -> String {
@@ -187,6 +217,17 @@ pub struct Rules {
     /// frame. Small props can be culled hard because nobody can resolve them anyway;
     /// a skyline of trees cannot.
     pub cull_distance: f32,
+
+    /// Distance at which an instance drops from LOD 0 to LOD 1, in metres.
+    ///
+    /// Runtime rather than a constant because the right value is a property of the
+    /// asset, not of the renderer: a 14 m tree still reads at 300 m where a 0.3 m
+    /// tuft is a pixel at 40. Both switch distances are clamped in
+    /// [`Self::lod_bands`] rather than validated at the slider, so a file written
+    /// by hand cannot invert them.
+    pub lod1_m: f32,
+    /// Distance at which an instance drops from LOD 1 to LOD 2.
+    pub lod2_m: f32,
     pub seed: u32,
 }
 
@@ -213,12 +254,37 @@ impl Default for Rules {
             collide_radius: 0.0,
             cast_shadow: true,
             cull_distance: 900.0,
+            // Well inside the 900 m draw distance, so LOD 0 covers the ground the
+            // camera is actually working on and the far field -- which is most of
+            // the instances, by area -- is already at the cheapest level.
+            lod1_m: 120.0,
+            lod2_m: 350.0,
             seed: 1,
         }
     }
 }
 
 impl Rules {
+    /// The two switch distances, ordered and inside the draw distance.
+    ///
+    /// Clamped here rather than trusted, because these come from a file as well as
+    /// from a slider. Three things would break the cull pass:
+    ///
+    /// * `lod2 < lod1` -- the band test is a chain of comparisons, so an inverted
+    ///   pair silently makes LOD 1 unreachable
+    /// * either past `cull_distance` -- the level is then allocated, decimated and
+    ///   never drawn
+    /// * a negative value -- squared for the comparison, so it would read as far
+    ///
+    /// Returned squared, which is what the shader compares against: the cull pass
+    /// already works in squared distance to avoid a `sqrt` per instance.
+    pub fn lod_bands(&self) -> [f32; 2] {
+        let far = self.cull_distance.max(1.0);
+        let a = self.lod1_m.clamp(0.0, far);
+        let b = self.lod2_m.clamp(a, far);
+        [a * a, b * b]
+    }
+
     /// The slope acceptance test, as a surface normal's `y` component.
     ///
     /// Kept beside the fields because the conversion is the easy thing to get
@@ -290,16 +356,29 @@ pub struct Species {
     pub color: Vec3,
     /// Palette preview, RGBA, `THUMB` square.
     pub thumbnail: Vec<u8>,
-    mesh: Mesh,
+    /// One mesh per level, nearest first. Always [`LOD_COUNT`] long, even when a
+    /// mesh is already under every budget and the levels are identical.
+    lods: Vec<Mesh>,
+    /// Triangle count per level, for the palette readout and the debug log.
+    lod_tris: [u32; LOD_COUNT],
     radius: f32,
     /// Every instance, written once at rebuild and read only by the compute
     /// pass.
     source: Option<wgpu::Buffer>,
-    /// Survivors of the cull, and the vertex buffer the indirect draw reads.
-    visible: Option<wgpu::Buffer>,
-    /// `draw_indexed_indirect` arguments, with `instance_count` written by the
-    /// compute pass.
+    /// Survivors of the cull, one buffer per LOD, each the vertex buffer that
+    /// level's indirect draw reads.
+    ///
+    /// Each is sized to the species' whole instance count rather than to a share
+    /// of it, because the split depends on where the camera is: every instance can
+    /// legitimately land in one band. At 32 bytes a record that is affordable --
+    /// the source plus three outputs is less memory than the source plus one
+    /// output was at 80.
+    visible: Vec<wgpu::Buffer>,
+    /// [`LOD_COUNT`] `draw_indexed_indirect` argument structs, contiguous, with
+    /// each `instance_count` written by the compute pass.
     args: Option<wgpu::Buffer>,
+    /// Instances the cull pass could not place. Should always read zero.
+    overflow: Option<wgpu::Buffer>,
     cull_bg: Option<wgpu::BindGroup>,
     params: Option<wgpu::Buffer>,
     count: u32,
@@ -364,6 +443,12 @@ pub struct Scatter {
     props_dirty: bool,
     pipeline: wgpu::ComputePipeline,
     cull_bgl: wgpu::BindGroupLayout,
+    /// The view-projection the last cull ran with, for the Hi-Z lookup.
+    ///
+    /// `None` on the first frame, which is what keeps occlusion culling off until there
+    /// is a depth pyramid corresponding to a matrix. Testing against a pyramid built from
+    /// nothing would cull the whole world on frame one.
+    prev_view_proj: Option<Mat4>,
 }
 
 impl Scatter {
@@ -374,51 +459,43 @@ impl Scatter {
         queue: &wgpu::Queue,
         meshes: &MeshRenderer,
         dir: &std::path::Path,
+        hiz_layout: &wgpu::BindGroupLayout,
     ) -> Self {
+        // 0 uniform, 1 source, 2..2+LOD_COUNT the per-LOD outputs, then the
+        // indirect args and the overflow counter. Built rather than spelled out:
+        // every entry past the first differs only in its read-only flag, and
+        // seven hand-written copies is where a binding index goes wrong.
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let mut cull_entries = vec![
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            storage(1, true),
+        ];
+        for i in 0..LOD_COUNT as u32 {
+            cull_entries.push(storage(2 + i, false));
+        }
+        cull_entries.push(storage(2 + LOD_COUNT as u32, false));
+        cull_entries.push(storage(3 + LOD_COUNT as u32, false));
         let cull_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scatter-cull-bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
+            entries: &cull_entries,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scatter-cull"),
@@ -428,7 +505,8 @@ impl Scatter {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scatter-cull-layout"),
-            bind_group_layouts: &[Some(&cull_bgl)],
+            // Group 1 is the depth pyramid, matching `HiZ::cull_layout`.
+            bind_group_layouts: &[Some(&cull_bgl), Some(hiz_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -448,6 +526,7 @@ impl Scatter {
             props_dirty: false,
             pipeline,
             cull_bgl,
+            prev_view_proj: None,
         };
         me.reload(device, queue, meshes, dir);
         me
@@ -655,7 +734,7 @@ impl Scatter {
         let Some(buf) = self.props_buf.as_ref() else { return };
         for &(species, first, count) in &self.prop_runs {
             if let Some(sp) = self.species.get(species) {
-                meshes.draw_instanced(pass, lighting, &sp.mesh, buf, first, count);
+                meshes.draw_instanced(pass, lighting, &sp.lods[0], buf, first, count);
             }
         }
     }
@@ -670,7 +749,15 @@ impl Scatter {
         let Some(buf) = self.props_buf.as_ref() else { return };
         for &(species, first, count) in &self.prop_runs {
             if let Some(sp) = self.species.get(species) {
-                meshes.draw_shadow_instanced(pass, lighting, cascade, &sp.mesh, buf, first, count);
+                meshes.draw_shadow_instanced(
+                    pass,
+                    lighting,
+                    cascade,
+                    &sp.lods[0],
+                    buf,
+                    first,
+                    count,
+                );
             }
         }
     }
@@ -757,13 +844,21 @@ impl Scatter {
     /// Cull every species into its visible buffer. Must run before the render
     /// pass that draws them.
     pub fn cull(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         cam: &Camera,
         aspect: f32,
+        hiz: &crate::hiz::HiZ,
     ) {
-        let frustum = Frustum::new(&(cam.projection(aspect) * cam.look_at()));
+        let view_proj = cam.projection(aspect) * cam.look_at();
+        let frustum = Frustum::new(&view_proj);
+        // First frame has no previous depth, so occlusion stays off until there is a
+        // pyramid that corresponds to something.
+        let occlusion = self.prev_view_proj.is_some();
+        let prev = self.prev_view_proj.unwrap_or(view_proj);
+        let (hw, hh) = hiz.size();
+        let levels = hiz.levels() as f32;
 
         // Uniform and argument writes first. These are queue operations, so
         // they are ordered before the encoder runs regardless of where they sit
@@ -775,29 +870,44 @@ impl Scatter {
             if s.count == 0 {
                 continue;
             }
+            let bands = s.rules.lod_bands();
             let p = CullParams {
                 planes: frustum.planes.map(|v| v.to_array()),
+                prev_view_proj: prev.to_cols_array_2d(),
                 eye: cam.pos.extend(0.0).to_array(),
                 cull_distance: s.rules.cull_distance,
                 // The instance scale range widens the bounding sphere.
                 radius: s.radius * s.rules.scale_max.max(s.rules.scale_min),
                 count: s.count,
-                _pad: 0,
+                // Every output buffer holds the whole species, which is what makes
+                // the three band counters sum to at most `count` and the clamp in
+                // the shader unreachable.
+                capacity: s.count,
+                lod_bands: [bands[0], bands[1], levels, if occlusion { 1.0 } else { 0.0 }],
+                hiz_size: [hw as f32, hh as f32, 0.0, 0.0],
             };
             queue.write_buffer(params, 0, bytemuck::bytes_of(&p));
-            // Reset the survivor count. Everything else is fixed, so rewriting
-            // the whole struct beats a clearing pass and costs 20 bytes.
-            queue.write_buffer(
-                args,
-                0,
-                bytemuck::bytes_of(&DrawArgs {
-                    index_count: s.mesh.index_count(),
+
+            // Reset all three survivor counts and restate each level's index
+            // count. This is the args fill: a queue write rather than a compute
+            // pass, because there is nothing here the GPU knows and the CPU does
+            // not -- the counters *are* the `instance_count` fields the cull pass
+            // bumps in place, so there is no separate count to gather them from.
+            let reset: Vec<DrawArgs> = s
+                .lods
+                .iter()
+                .map(|m| DrawArgs {
+                    index_count: m.index_count(),
                     instance_count: 0,
                     first_index: 0,
                     base_vertex: 0,
                     first_instance: 0,
-                }),
-            );
+                })
+                .collect();
+            queue.write_buffer(args, 0, bytemuck::cast_slice(&reset));
+            if let Some(ov) = s.overflow.as_ref() {
+                queue.write_buffer(ov, 0, &0u32.to_le_bytes());
+            }
         }
 
         // One pass for every species. Each `begin_compute_pass` costs a
@@ -807,6 +917,7 @@ impl Scatter {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(1, hiz.cull_bind_group(), &[]);
         for s in &self.species {
             let Some(bg) = s.cull_bg.as_ref() else { continue };
             if s.count == 0 {
@@ -815,6 +926,10 @@ impl Scatter {
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(s.count.div_ceil(64), 1, 1);
         }
+        drop(pass);
+        // Kept for next frame's occlusion test, which reads the pyramid this frame's
+        // depth will build.
+        self.prev_view_proj = Some(view_proj);
     }
 
     /// Draw whatever the cull left, without ever asking how much that was.
@@ -825,13 +940,16 @@ impl Scatter {
         lighting: &Lighting,
     ) {
         for s in &self.species {
-            let (Some(visible), Some(args)) = (s.visible.as_ref(), s.args.as_ref()) else {
-                continue;
-            };
+            let Some(args) = s.args.as_ref() else { continue };
             if s.count == 0 {
                 continue;
             }
-            meshes.draw_indirect(pass, lighting, &s.mesh, visible, args);
+            // One indirect draw per level. Not a regression in draw count for its
+            // own sake: the index ranges differ per LOD, so these could not be one
+            // draw even if the instances shared a buffer.
+            for (i, visible) in s.visible.iter().enumerate() {
+                meshes.draw_indirect(pass, lighting, &s.lods[i], visible, args, args_offset(i));
+            }
         }
     }
 
@@ -849,14 +967,111 @@ impl Scatter {
         cascade: usize,
     ) {
         for s in &self.species {
-            let (Some(visible), Some(args)) = (s.visible.as_ref(), s.args.as_ref()) else {
-                continue;
-            };
+            let Some(args) = s.args.as_ref() else { continue };
             if s.count == 0 || !s.rules.cast_shadow {
                 continue;
             }
-            meshes.draw_shadow_indirect(pass, lighting, cascade, &s.mesh, visible, args);
+            // Every level casts, from the same per-band buffers the colour pass
+            // reads. Casting the whole species at its coarsest level instead would
+            // be cheaper and wrong in a visible way: a near tree's shadow would
+            // carry a silhouette its lit geometry does not have.
+            for (i, visible) in s.visible.iter().enumerate() {
+                meshes.draw_shadow_indirect(
+                    pass,
+                    lighting,
+                    cascade,
+                    &s.lods[i],
+                    visible,
+                    args,
+                    args_offset(i),
+                );
+            }
         }
+    }
+
+    /// Read back each species' per-LOD survivor counts and its overflow tally.
+    ///
+    /// A debug path: it stalls on a map, so it is called from tests and from an
+    /// explicit request rather than every frame. It is the only way to check the
+    /// switch distances against a real instance distribution -- the counts are
+    /// written and consumed entirely on the GPU, so nothing else ever sees them.
+    pub fn read_lod_counts(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<LodCounts> {
+        let mut out = Vec::new();
+        for s in &self.species {
+            let (Some(args), Some(ov)) = (s.args.as_ref(), s.overflow.as_ref()) else {
+                continue;
+            };
+            let args_bytes = (LOD_COUNT * std::mem::size_of::<DrawArgs>()) as u64;
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("scatter-lod-readback"),
+                size: args_bytes + 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&Default::default());
+            enc.copy_buffer_to_buffer(args, 0, &staging, 0, args_bytes);
+            enc.copy_buffer_to_buffer(ov, 0, &staging, args_bytes, 4);
+            queue.submit([enc.finish()]);
+
+            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            let Ok(view) = staging.slice(..).get_mapped_range() else { continue };
+            let words: &[u32] = bytemuck::cast_slice(&view);
+            // `instance_count` is the second word of each 5-word struct.
+            let mut per_lod = [0u32; LOD_COUNT];
+            for (i, slot) in per_lod.iter_mut().enumerate() {
+                *slot = words[i * 5 + 1];
+            }
+            let overflow = words[LOD_COUNT * 5];
+            drop(view);
+            staging.unmap();
+            out.push(LodCounts {
+                name: s.name.clone(),
+                total: s.count,
+                per_lod,
+                tris: s.lod_tris,
+                overflow,
+            });
+        }
+        out
+    }
+}
+
+/// Byte offset of one level's `draw_indexed_indirect` arguments.
+///
+/// The structs are 20 bytes and packed, so every offset is a multiple of four --
+/// which is what `draw_indexed_indirect` requires of it.
+fn args_offset(lod: usize) -> u64 {
+    (lod * std::mem::size_of::<DrawArgs>()) as u64
+}
+
+/// What the cull pass placed where, for one species.
+#[derive(Debug, Clone)]
+pub struct LodCounts {
+    pub name: String,
+    /// Instances the species has in total, before culling.
+    pub total: u32,
+    /// Survivors per level, nearest first. These sum to the number inside the
+    /// draw distance and the frustum, never to more.
+    pub per_lod: [u32; LOD_COUNT],
+    /// Triangles in each level's mesh.
+    pub tris: [u32; LOD_COUNT],
+    /// Instances dropped for want of buffer space. Always zero in a correct build.
+    pub overflow: u32,
+}
+
+impl LodCounts {
+    /// Survivors across every level.
+    pub fn drawn(&self) -> u32 {
+        self.per_lod.iter().sum()
+    }
+
+    /// Triangles submitted this frame, against what one level for everything
+    /// would have cost. The number the whole feature exists to move.
+    pub fn triangles(&self) -> (u64, u64) {
+        let with: u64 = self.per_lod.iter().zip(self.tris).map(|(n, t)| *n as u64 * t as u64).sum();
+        let without = self.drawn() as u64 * self.tris[0] as u64;
+        (with, without)
     }
 }
 
@@ -865,12 +1080,29 @@ impl Scatter {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CullParams {
     planes: [[f32; 4]; 6],
+    /// Last frame's view-projection, for the Hi-Z lookup. The pyramid was built from last
+    /// frame's depth, so testing against this frame's matrix would compare an instance's
+    /// position against depths that never corresponded to it -- which flickers.
+    prev_view_proj: [[f32; 4]; 4],
     eye: [f32; 4],
     cull_distance: f32,
     radius: f32,
     count: u32,
-    _pad: u32,
+    /// Instances one per-LOD output buffer holds. Every buffer is sized to the
+    /// species' whole instance count, so this is also `count` -- it is passed
+    /// separately because the clamp in the shader is about the *buffer*, and
+    /// conflating the two is how a later change to either becomes a memory bug.
+    capacity: u32,
+    /// Squared switch distances in xy; z = Hi-Z level count, w = occlusion enabled.
+    lod_bands: [f32; 4],
+    /// Hi-Z level-0 size in texels. zw unused.
+    hiz_size: [f32; 4],
 }
+
+// The uniform is read by `scatter_cull.wgsl` field for field, and WGSL rounds a
+// struct up to its largest member's alignment -- 16 here, for the vec4s. 160 is
+// that already, so no tail padding is inserted on either side.
+const _: () = assert!(std::mem::size_of::<CullParams>() == 224);
 
 /// Exactly what `draw_indexed_indirect` reads.
 #[repr(C)]
@@ -898,6 +1130,27 @@ impl Species {
         // A textured mesh must not have its map tinted by the base colour
         // factor as well, or every scanned asset comes out muddy.
         let color = if data.albedo.is_some() { Vec3::ONE } else { Vec3::from(data.base_color) };
+
+        // The LOD chain. `data` already arrives decimated to `LOD_TRIS[0]` by
+        // `reload`, so level 0 is uploaded as-is and each level below is a further
+        // decimation of the *original* rather than of the level above it: chaining
+        // the clusterer compounds its error, and re-running it from full detail
+        // costs nothing here because this happens once per import.
+        let mut lods = Vec::with_capacity(LOD_COUNT);
+        let mut lod_tris = [0u32; LOD_COUNT];
+        for (i, target) in LOD_TRIS.iter().enumerate() {
+            let level = if i == 0 {
+                data.clone()
+            } else {
+                let mut d = data.clone();
+                d.decimate(*target);
+                d
+            };
+            lod_tris[i] = level.triangle_count() as u32;
+            lods.push(meshes.upload_mesh(device, queue, &level));
+        }
+        log::info!("species '{}': LOD triangles {:?} (targets {:?})", name, lod_tris, LOD_TRIS);
+
         Self {
             name,
             rules,
@@ -905,10 +1158,12 @@ impl Species {
             painted: false,
             color,
             thumbnail,
-            mesh: meshes.upload_mesh(device, queue, &data),
+            lods,
+            lod_tris,
             radius,
             source: None,
-            visible: None,
+            visible: Vec::new(),
+            overflow: None,
             args: None,
             cull_bg: None,
             params: None,
@@ -1080,8 +1335,12 @@ impl Species {
             .flat_map_iter(|gz| {
                 (0..side).filter_map(move |gx| {
                     let (pos, scale, rot) = me.place_at(terrain, gx, gz, step, extent)?;
-                    let m = Mat4::from_scale_rotation_translation(Vec3::splat(scale), rot, pos);
-                    Some(Instance::new(m, color))
+                    // Straight to the packed record: composing a matrix here only
+                    // to have `Instance::new` decompose it again was pure work.
+                    // The seed is the cell, so per-instance variation added later
+                    // is stable rather than reshuffling on every rebuild.
+                    let seed = gz << 16 | (gx & 0xffff);
+                    Some(Instance::from_parts(pos, rot, scale, color, seed))
                 })
             })
             .collect();
@@ -1106,21 +1365,36 @@ impl Species {
             contents: bytemuck::cast_slice(&flat),
             usage: wgpu::BufferUsages::STORAGE,
         });
-        // Worst case every instance survives, so the destination matches the
-        // source. Sizing it to a guess would mean silently dropping geometry
-        // the moment a camera looked at the whole map.
-        let visible = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("scatter-visible"),
-            size: (flat.len() * std::mem::size_of::<Instance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
+        // One output buffer per LOD, each sized to the *whole* source. A share of
+        // it would not do: which band an instance lands in depends on where the
+        // camera is, so a single viewpoint can legitimately put every instance in
+        // one level. Sizing to a guess would silently drop geometry the moment
+        // someone looked along the ground.
+        let visible: Vec<wgpu::Buffer> = (0..LOD_COUNT)
+            .map(|i| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("scatter-visible-lod{i}")),
+                    size: (flat.len() * std::mem::size_of::<Instance>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
         let args = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scatter-args"),
-            size: std::mem::size_of::<DrawArgs>() as u64,
+            size: (LOD_COUNT * std::mem::size_of::<DrawArgs>()) as u64,
             usage: wgpu::BufferUsages::INDIRECT
                 | wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST,
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let overflow = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scatter-overflow"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1129,20 +1403,35 @@ impl Species {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+
+        let mut entries = vec![
+            wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: source.as_entire_binding() },
+        ];
+        for (i, v) in visible.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 2 + i as u32,
+                resource: v.as_entire_binding(),
+            });
+        }
+        entries.push(wgpu::BindGroupEntry {
+            binding: 2 + LOD_COUNT as u32,
+            resource: args.as_entire_binding(),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 3 + LOD_COUNT as u32,
+            resource: overflow.as_entire_binding(),
+        });
         let cull_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scatter-cull-bg"),
             layout: cull_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: source.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: visible.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: args.as_entire_binding() },
-            ],
+            entries: &entries,
         });
 
         self.source = Some(source);
-        self.visible = Some(visible);
+        self.visible = visible;
         self.args = Some(args);
+        self.overflow = Some(overflow);
         self.params = Some(params);
         self.cull_bg = Some(cull_bg);
     }
@@ -1150,8 +1439,9 @@ impl Species {
     /// Drop the GPU side when a species has nothing to draw.
     fn release(&mut self) {
         self.source = None;
-        self.visible = None;
+        self.visible.clear();
         self.args = None;
+        self.overflow = None;
         self.params = None;
         self.cull_bg = None;
         self.count = 0;
@@ -1230,36 +1520,6 @@ fn hash3(x: u32, y: u32, seed: u32) -> u32 {
 }
 
 /// Six clip-space planes, for cell culling.
-struct Frustum {
-    planes: [glam::Vec4; 6],
-}
-
-impl Frustum {
-    fn new(view_proj: &Mat4) -> Self {
-        let m = view_proj.transpose();
-        // Reversed-Z with an infinite far plane: there is no far plane to
-        // extract, so only five are meaningful and the sixth is left degenerate.
-        let planes = [
-            m.w_axis + m.x_axis,
-            m.w_axis - m.x_axis,
-            m.w_axis + m.y_axis,
-            m.w_axis - m.y_axis,
-            m.w_axis - m.z_axis,
-            m.w_axis,
-        ];
-        Self { planes }
-    }
-
-    /// Sphere test, mirroring `scatter_cull.wgsl` exactly.
-    ///
-    /// Only the shader culls in anger; this exists so the plane extraction --
-    /// the part that is easy to get subtly wrong and invisible when it is --
-    /// is covered by a test.
-    #[cfg(test)]
-    fn contains_sphere(&self, centre: Vec3, radius: f32) -> bool {
-        self.planes.iter().all(|p| p.truncate().dot(centre) + p.w >= -radius)
-    }
-}
 impl Scatter {
     /// Serialise rules and density masks.
     ///
@@ -1298,9 +1558,21 @@ impl Scatter {
             log::warn!("foliage file predates the Unreal-style rules; keeping defaults");
             return;
         };
+        // Version 2 differs only by the two LOD distances at the end of each rule
+        // block, so it is migrated rather than refused -- the density masks are the
+        // expensive part of the file and throwing them away to avoid reading eight
+        // fewer bytes would be the wrong trade.
+        let floats = match version {
+            2 => FLOAT_FIELDS_V2,
+            v if v == FOLIAGE_VERSION => FLOAT_FIELDS,
+            v => {
+                log::warn!("foliage file is version {v}, expected {FOLIAGE_VERSION}; ignoring");
+                return;
+            }
+        };
+        let rules_bytes = if floats == FLOAT_FIELDS_V2 { RULES_BYTES_V2 } else { RULES_BYTES };
         if version != FOLIAGE_VERSION {
-            log::warn!("foliage file is version {version}, expected {FOLIAGE_VERSION}; ignoring");
-            return;
+            log::info!("foliage file is version {version}; taking default LOD distances");
         }
         let mut p = 8usize;
 
@@ -1320,10 +1592,11 @@ impl Scatter {
                 return;
             };
             p += n as usize;
-            let Some(rules) = bytes.get(p..p + RULES_BYTES).and_then(decode_rules) else {
+            let Some(rules) = bytes.get(p..p + rules_bytes).and_then(|b| decode_rules(b, floats))
+            else {
                 return;
             };
-            p += RULES_BYTES;
+            p += rules_bytes;
             let Some(mask) = bytes.get(p..p + mask_len) else { return };
             p += mask_len;
 
@@ -1427,6 +1700,10 @@ fn encode_rules(r: &Rules) -> Vec<u8> {
         r.z_offset_m,
         r.cull_distance,
         r.collide_radius,
+        // Appended, so a version-2 file is this list minus its last two entries
+        // and `decode_rules` can read both by float count alone.
+        r.lod1_m,
+        r.lod2_m,
     ] {
         out.extend_from_slice(&f.to_le_bytes());
     }
@@ -1441,12 +1718,21 @@ fn encode_rules(r: &Rules) -> Vec<u8> {
 }
 
 /// Inverse of [`encode_rules`]. `None` if the slice is short.
-fn decode_rules(b: &[u8]) -> Option<Rules> {
-    if b.len() < RULES_BYTES {
+///
+/// `floats` is how many the file version wrote, so one function reads both
+/// layouts: version 3 has the LOD distances at the end, version 2 does not and
+/// takes them from the defaults.
+fn decode_rules(b: &[u8], floats: usize) -> Option<Rules> {
+    if b.len() < floats * 4 + 3 + 4 {
         return None;
     }
     let f = |i: usize| f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
-    let bools = FLOAT_FIELDS * 4;
+    let bools = floats * 4;
+    let d = Rules::default();
+    // Present only from version 3. Defaulting rather than deriving them from the
+    // file's own `cull_distance` on purpose: a species someone had already tuned
+    // to a short draw distance would otherwise get switch distances beyond it.
+    let (lod1_m, lod2_m) = if floats > 14 { (f(14), f(15)) } else { (d.lod1_m, d.lod2_m) };
     Some(Rules {
         density: f(0),
         radius_m: f(1),
@@ -1466,6 +1752,8 @@ fn decode_rules(b: &[u8]) -> Option<Rules> {
         random_yaw: b[bools + 1] != 0,
         cast_shadow: b[bools + 2] != 0,
         seed: u32::from_le_bytes(b[bools + 3..bools + 7].try_into().unwrap()),
+        lod1_m,
+        lod2_m,
     })
 }
 
@@ -1502,11 +1790,11 @@ mod tests {
         let vp = cam.projection(16.0 / 9.0) * cam.look_at();
         let f = Frustum::new(&vp);
         // The camera looks down +X at yaw 0.
-        assert!(f.contains_sphere(Vec3::new(100.0, 0.0, 0.0), 5.0), "ahead must be visible");
-        assert!(!f.contains_sphere(Vec3::new(-100.0, 0.0, 0.0), 5.0), "behind must be rejected");
+        assert!(f.intersects_sphere(Vec3::new(100.0, 0.0, 0.0), 5.0), "ahead must be visible");
+        assert!(!f.intersects_sphere(Vec3::new(-100.0, 0.0, 0.0), 5.0), "behind must be rejected");
         // A large radius straddling the plane must survive: culling a sphere
         // whose centre is out but whose body is in pops geometry at the edges.
-        assert!(f.contains_sphere(Vec3::new(-2.0, 0.0, 0.0), 40.0), "straddling must survive");
+        assert!(f.intersects_sphere(Vec3::new(-2.0, 0.0, 0.0), 40.0), "straddling must survive");
     }
 
     /// A full-coverage fill on a normal world must not produce an instance count
@@ -1773,11 +2061,13 @@ mod tests {
             cast_shadow: false,
             collide_radius: 0.33,
             cull_distance: 1450.0,
+            lod1_m: 88.0,
+            lod2_m: 410.0,
             seed: 0xC0FF_EE01,
         };
         let bytes = encode_rules(&want);
         assert_eq!(bytes.len(), RULES_BYTES);
-        assert_eq!(decode_rules(&bytes), Some(want));
+        assert_eq!(decode_rules(&bytes, FLOAT_FIELDS), Some(want));
     }
 
     #[test]
@@ -1793,9 +2083,116 @@ mod tests {
         ] {
             let r =
                 Rules { align_to_normal: a, random_yaw: b, cast_shadow: c, ..Default::default() };
-            let got = decode_rules(&encode_rules(&r)).expect("decode");
+            let got = decode_rules(&encode_rules(&r), FLOAT_FIELDS).expect("decode");
             assert_eq!((got.align_to_normal, got.random_yaw, got.cast_shadow), (a, b, c));
         }
+    }
+
+    // --- LOD bands ---
+
+    #[test]
+    fn lod_bands_come_back_squared_and_in_order() {
+        let r = Rules { lod1_m: 100.0, lod2_m: 400.0, cull_distance: 900.0, ..Default::default() };
+        let b = r.lod_bands();
+        assert_eq!(b, [100.0 * 100.0, 400.0 * 400.0]);
+    }
+
+    #[test]
+    fn an_inverted_pair_is_ordered_rather_than_trusted() {
+        // The shader tests the far band first, so `lod2 < lod1` would make LOD 1
+        // unreachable and every mid-distance instance would jump to the coarsest
+        // mesh. These values can come from a file, not just from the slider.
+        let r = Rules { lod1_m: 500.0, lod2_m: 100.0, cull_distance: 900.0, ..Default::default() };
+        let b = r.lod_bands();
+        assert!(b[0] <= b[1], "bands came back inverted: {b:?}");
+    }
+
+    #[test]
+    fn bands_are_pulled_inside_the_draw_distance() {
+        // A level past the draw distance is decimated, uploaded and never drawn.
+        let r =
+            Rules { lod1_m: 5_000.0, lod2_m: 9_000.0, cull_distance: 300.0, ..Default::default() };
+        let b = r.lod_bands();
+        assert!(b[0] <= 300.0 * 300.0 && b[1] <= 300.0 * 300.0, "{b:?}");
+    }
+
+    #[test]
+    fn a_negative_band_does_not_read_as_far_away() {
+        // Squared for the comparison, so -50 would otherwise behave like +50 -- or
+        // worse, sort ahead of a legitimate near band.
+        let r = Rules { lod1_m: -50.0, lod2_m: 200.0, cull_distance: 900.0, ..Default::default() };
+        let b = r.lod_bands();
+        assert_eq!(b[0], 0.0);
+        assert!(b[1] >= b[0]);
+    }
+
+    #[test]
+    fn the_default_bands_leave_lod0_well_inside_the_draw_distance() {
+        let d = Rules::default();
+        assert!(d.lod1_m > 0.0 && d.lod1_m < d.cull_distance * 0.5, "{}", d.lod1_m);
+        assert!(d.lod2_m > d.lod1_m && d.lod2_m < d.cull_distance, "{}", d.lod2_m);
+    }
+
+    #[test]
+    fn a_version_two_rule_block_still_decodes() {
+        // Version 2 is the same layout minus the two LOD floats. Refusing it would
+        // discard every painted density mask in the file, which is the expensive
+        // part -- so it is migrated to the default distances instead.
+        let mut want = Rules { density: 77.0, slope_max_deg: 61.0, ..Default::default() };
+        want.lod1_m = 1.0;
+        want.lod2_m = 2.0;
+        let full = encode_rules(&want);
+        // Drop the two trailing floats, then move the bools and seed back over them.
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(&full[..FLOAT_FIELDS_V2 * 4]);
+        v2.extend_from_slice(&full[FLOAT_FIELDS * 4..]);
+        assert_eq!(v2.len(), RULES_BYTES_V2);
+
+        let got = decode_rules(&v2, FLOAT_FIELDS_V2).expect("a v2 block must still decode");
+        assert_eq!(got.density, 77.0, "the fields before the new ones must survive");
+        assert_eq!(got.slope_max_deg, 61.0);
+        assert_eq!(got.seed, want.seed, "the seed sits after the bools and must not shift");
+        // The LOD fields are absent from the file, so they take the defaults rather
+        // than whatever the tuned values happened to be.
+        assert_eq!(got.lod1_m, Rules::default().lod1_m);
+        assert_eq!(got.lod2_m, Rules::default().lod2_m);
+    }
+
+    #[test]
+    fn lod_triangle_budgets_descend_and_start_at_the_import_ceiling() {
+        assert_eq!(LOD_TRIS[0], MAX_TRIS_PER_SPECIES, "LOD 0 is the mesh as imported");
+        for w in LOD_TRIS.windows(2) {
+            assert!(w[1] < w[0], "budgets must descend: {LOD_TRIS:?}");
+        }
+        assert_eq!(LOD_TRIS.len(), LOD_COUNT);
+    }
+
+    #[test]
+    fn every_lod_args_offset_is_indirect_aligned() {
+        // `draw_indexed_indirect` requires a 4-byte aligned offset, and DrawArgs is
+        // 20 bytes -- packed, not padded to 32, so this is worth asserting.
+        for i in 0..LOD_COUNT {
+            assert_eq!(args_offset(i) % 4, 0, "offset {} is not 4-byte aligned", args_offset(i));
+        }
+        assert_eq!(args_offset(LOD_COUNT - 1) + 20, (LOD_COUNT * 20) as u64);
+    }
+
+    #[test]
+    fn lod_counts_report_the_triangles_saved() {
+        // The number the feature exists to move, so the readout has to compute it
+        // rather than leave the reader multiplying.
+        let c = LodCounts {
+            name: "pine".into(),
+            total: 1000,
+            per_lod: [100, 300, 600],
+            tris: [6000, 1500, 400],
+            overflow: 0,
+        };
+        assert_eq!(c.drawn(), 1000);
+        let (with, without) = c.triangles();
+        assert_eq!(with, 100 * 6000 + 300 * 1500 + 600 * 400);
+        assert_eq!(without, 1000 * 6000);
+        assert!(with < without / 4, "LODs should be a large cut, got {with} vs {without}");
     }
 
     #[test]
@@ -1804,7 +2201,11 @@ mod tests {
         // deliberate.
         let bytes = encode_rules(&Rules::default());
         for cut in [0, 1, RULES_BYTES / 2, RULES_BYTES - 1] {
-            assert_eq!(decode_rules(&bytes[..cut]), None, "{cut} bytes should not decode");
+            assert_eq!(
+                decode_rules(&bytes[..cut], FLOAT_FIELDS),
+                None,
+                "{cut} bytes should not decode"
+            );
         }
     }
 

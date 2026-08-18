@@ -262,11 +262,19 @@ impl Vehicle {
 
     /// Advance one fixed step. Call before [`PhysicsWorld::step`].
     pub fn update(&mut self, world: &mut PhysicsWorld, input: VehicleInput, dt: f32) {
-        // Negated, because `VehicleInput` says left is positive and Rapier's steering angle
-        // is a rotation about the up axis -- which, with the axle pointing left and +Z
-        // forward, tilts the wheel towards +X for a positive angle. That is a right turn.
-        // Unnegated, pressing A steered right, which is not a subtle thing to get wrong.
-        let steer = -input.steer.clamp(-1.0, 1.0) * self.steer_limit(self.speed);
+        // Passed through, *not* negated. Rapier steers about `-wheel_direction_ws` --
+        // the suspension points down, so that axis is world up -- and a positive
+        // rotation about up takes +Z forward towards +X. With `right = forward x up`,
+        // which is the convention `Camera::right` uses and therefore the one the
+        // driver sees, +X on a +Z heading is *left*. So positive steer is already
+        // left and the sign needs nothing done to it.
+        //
+        // This was negated, with a comment asserting the opposite handedness, and the
+        // test that covered it asserted the direction it observed rather than the one
+        // a driver would name -- so the two agreed with each other and disagreed with
+        // the keyboard. `steering_direction` below pins it to `up x forward` instead,
+        // which is checkable without a mental rotation.
+        let steer = input.steer.clamp(-1.0, 1.0) * self.steer_limit(self.speed);
         let drive = input.throttle.clamp(-1.0, 1.0) * self.tractive_force(self.speed);
         let pedal = input.brake.clamp(0.0, 1.0);
 
@@ -327,6 +335,58 @@ impl Vehicle {
 
     /// World transform of the chassis: translation and rotation quaternion
     /// `[x, y, z, w]`.
+    /// Put the vehicle back on its wheels at `ground_position`, facing `yaw`.
+    ///
+    /// The recovery for a car on its roof, wedged in a gully, or dropped through
+    /// something. A raycast vehicle has no way out of those by itself: upside down
+    /// the wheel rays point at the sky, so there is no contact, no traction and
+    /// nothing the controller can do with throttle or steering.
+    ///
+    /// Velocities are zeroed rather than kept. Carrying momentum through a reset is
+    /// how a car that rolled at 30 m/s immediately rolls again.
+    /// `heading` is in the same convention [`Self::heading`] returns, so the two
+    /// round-trip: reading a heading and resetting to it leaves the car pointing the
+    /// way it already was.
+    ///
+    /// That conversion is the whole reason this takes a heading rather than a body
+    /// yaw. A body yaw of `y` puts forward at `(sin y, 0, cos y)`, whose `atan2(z, x)`
+    /// is `pi/2 - y` -- so passing a heading straight to `from_rotation_y` mirrors the
+    /// car about the 45 degree line, which on a reset looks like it turned by itself.
+    pub fn reset(&mut self, world: &mut PhysicsWorld, ground_position: [f32; 3], heading: f32) {
+        let body = &mut world.bodies[self.controller.chassis];
+        body.set_translation(
+            Vector::new(ground_position[0], ground_position[1], ground_position[2]),
+            true,
+        );
+        // Upright, keeping only the heading. Rapier 0.35 is glam-based, so this is
+        // its rotation type directly.
+        let body_yaw = std::f32::consts::FRAC_PI_2 - heading;
+        body.set_rotation(glam::Quat::from_rotation_y(body_yaw), true);
+        body.set_linvel(Vector::ZERO, true);
+        body.set_angvel(Vector::ZERO, true);
+        // The suspension state is derived from the raycasts each step, but the roll
+        // angles are ours and would otherwise carry the old spin into the new pose.
+        self.roll = [0.0; 4];
+        self.speed = 0.0;
+    }
+
+    /// Heading in radians, in the same convention `Camera::yaw` uses: the angle of
+    /// the forward vector in the XZ plane, measured as `atan2(z, x)`.
+    pub fn heading(&self, world: &PhysicsWorld) -> f32 {
+        let body = &world.bodies[self.controller.chassis];
+        let forward = body.rotation() * glam::Vec3::Z;
+        forward.z.atan2(forward.x)
+    }
+
+    /// Whether the vehicle is far enough from upright to be unrecoverable.
+    ///
+    /// Its own up axis against world up. Past 90 degrees no wheel can reach the
+    /// ground, so throttle and steering do nothing and the only way out is a reset.
+    pub fn is_overturned(&self, world: &PhysicsWorld) -> bool {
+        let body = &world.bodies[self.controller.chassis];
+        (body.rotation() * glam::Vec3::Y).y < 0.0
+    }
+
     pub fn chassis_pose(&self, world: &PhysicsWorld) -> ([f32; 3], [f32; 4]) {
         let body = &world.bodies[self.controller.chassis];
         let t = body.translation();
@@ -345,7 +405,18 @@ impl Vehicle {
                 // The wheel hangs below its hard point by however far the spring is
                 // currently extended -- this is what makes the wheels visibly move in the
                 // arches instead of being welded to the body.
-                let centre = info.hard_point_ws + w.direction_cs * info.suspension_length;
+                //
+                // Taken from Rapier rather than recomputed. This was
+                // `info.hard_point_ws + w.direction_cs * info.suspension_length`, which
+                // mixes frames: the hard point is world space and `direction_cs` is
+                // *chassis* space. Level ground hid it, because the suspension axis is
+                // (0, -1, 0) in both frames when the body is flat -- but the moment the
+                // chassis pitched or rolled, the wheels dropped along world down instead
+                // of along the car's own suspension travel, so they slid vertically out
+                // of the arches. `center()` is `hard_point_ws + wheel_direction_ws *
+                // suspension_length`, which is the same expression with the world-space
+                // direction it should always have used.
+                let centre = w.center();
                 WheelPose {
                     position: [centre.x, centre.y, centre.z],
                     steer: w.steering,
@@ -383,17 +454,22 @@ mod tests {
 
     const GROUND: f32 = 50.0;
 
-    fn flat_world() -> PhysicsWorld {
+    pub(super) fn flat_world() -> PhysicsWorld {
         let mut w = PhysicsWorld::new();
         w.set_terrain(&vec![GROUND; 64 * 64], 64, 400.0);
         w
     }
 
-    fn spawn(world: &mut PhysicsWorld) -> Vehicle {
+    pub(super) fn spawn(world: &mut PhysicsWorld) -> Vehicle {
         Vehicle::spawn(world, [0.0, GROUND + 0.6, 0.0], &hummer())
     }
 
-    fn settle(world: &mut PhysicsWorld, car: &mut Vehicle, steps: usize, input: VehicleInput) {
+    pub(super) fn settle(
+        world: &mut PhysicsWorld,
+        car: &mut Vehicle,
+        steps: usize,
+        input: VehicleInput,
+    ) {
         for _ in 0..steps {
             car.update(world, input, FIXED_DT);
             world.step();
@@ -750,10 +826,15 @@ mod tests {
 
     #[test]
     fn positive_steer_turns_left() {
-        // `VehicleInput` documents left as positive, and the sign survives two coordinate
-        // conventions on the way to the tyre. Left in a right-handed Y-up frame with +Z
-        // forward means the heading rotates towards +X... which is to say: assert against
-        // where it actually ends up, not against a mental rotation.
+        // Driving up +Z, a left turn moves towards **+X**: with `right = forward x up`,
+        // `Z x Y = -X`, so right is -X and left is +X.
+        //
+        // This assertion used to demand the opposite, on a comment that asserted the
+        // handedness the wrong way round. It passed, because the steering sign was
+        // negated to match it -- the test and the code agreed with each other and the
+        // car steered away from the key that was pressed. See `steering_direction`,
+        // which checks the same thing against `up x forward` rather than against a
+        // hard-coded axis.
         let mut world = flat_world();
         let mut car = spawn(&mut world);
         settle(&mut world, &mut car, 300, VehicleInput::default());
@@ -766,9 +847,8 @@ mod tests {
             VehicleInput { throttle: 0.5, steer: 1.0, ..Default::default() },
         );
         let (after, _) = car.chassis_pose(&world);
-        // Driving up +Z, a left turn moves it towards -X.
         assert!(
-            after[0] < before[0] - 1.0,
+            after[0] > before[0] + 1.0,
             "under positive steer it went from x {} to {}, which is a right turn",
             before[0],
             after[0]
@@ -851,5 +931,254 @@ mod tests {
 
         let ssf = d.axle_half_width / com.y;
         assert!((0.9..1.25).contains(&ssf), "static stability factor {ssf} g is not H1-like");
+    }
+}
+
+#[cfg(test)]
+mod wheel_frames {
+    use super::tests::{flat_world, settle, spawn};
+    use super::*;
+
+    /// Wheel centres in the chassis's own frame.
+    fn wheels_in_chassis_space(car: &Vehicle, world: &PhysicsWorld) -> Vec<glam::Vec3> {
+        let (t, r) = car.chassis_pose(world);
+        let inv = glam::Quat::from_xyzw(r[0], r[1], r[2], r[3]).inverse();
+        car.wheel_poses()
+            .iter()
+            .map(|w| inv * (glam::Vec3::from_array(w.position) - glam::Vec3::from_array(t)))
+            .collect()
+    }
+
+    #[test]
+    fn a_tilted_chassis_keeps_its_wheels_in_the_arches() {
+        // The bug this guards: the wheel centre was built from a world-space hard point
+        // plus a *chassis*-space suspension direction. Flat ground hides it, because both
+        // are (0, -1, 0) there. Tilt the body and the wheels slide vertically out of the
+        // arches, which is what "the axle moves vertically sometimes" looks like.
+        //
+        // Measured in the chassis's own frame: whatever the body is doing, a wheel must
+        // stay at its axle position and only travel along the suspension axis.
+        let mut world = flat_world();
+        let mut car = spawn(&mut world);
+        settle(&mut world, &mut car, 300, VehicleInput::default());
+        let level = wheels_in_chassis_space(&car, &world);
+
+        // Roll and pitch the chassis hard, then read the wheels again.
+        let handle = car.chassis();
+        let body = &mut world.bodies[handle];
+        let tilt = glam::Quat::from_euler(glam::EulerRot::YXZ, 0.7, 0.35, 0.45);
+        // Rapier 0.35 is glam-based, so our quaternion is its rotation type.
+        body.set_rotation(tilt, true);
+        // One step so the controller refreshes its hard points from the new pose.
+        settle(&mut world, &mut car, 1, VehicleInput::default());
+        let tilted = wheels_in_chassis_space(&car, &world);
+
+        for (i, (a, b)) in level.iter().zip(&tilted).enumerate() {
+            // Lateral and longitudinal offsets are fixed by the axle geometry and must
+            // not move at all. Only Y -- the suspension axis -- is free.
+            assert!(
+                (a.x - b.x).abs() < 0.05,
+                "wheel {i} moved {:.3} m sideways in chassis space when the body tilted",
+                (a.x - b.x).abs()
+            );
+            assert!(
+                (a.z - b.z).abs() < 0.05,
+                "wheel {i} moved {:.3} m fore-aft in chassis space when the body tilted",
+                (a.z - b.z).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn wheels_sit_where_the_axles_say_on_level_ground() {
+        // The baseline the test above compares against: two wheels either side, front
+        // pair ahead of the rear pair, all at the same height.
+        let mut world = flat_world();
+        let mut car = spawn(&mut world);
+        settle(&mut world, &mut car, 300, VehicleInput::default());
+        let w = wheels_in_chassis_space(&car, &world);
+        assert_eq!(w.len(), 4);
+
+        // 0/1 front, 2/3 rear -- the order `spawn` adds them in.
+        assert!(w[0].z > 0.0 && w[1].z > 0.0, "front wheels are not ahead: {w:?}");
+        assert!(w[2].z < 0.0 && w[3].z < 0.0, "rear wheels are not behind: {w:?}");
+        // One of each pair either side of the centreline.
+        assert!(w[0].x * w[1].x < 0.0, "front pair is on one side: {w:?}");
+        assert!(w[2].x * w[3].x < 0.0, "rear pair is on one side: {w:?}");
+        // Level ground, so all four hang the same amount.
+        for pair in w.windows(2) {
+            assert!((pair[0].y - pair[1].y).abs() < 0.02, "uneven ride height: {w:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery {
+    use super::tests::{flat_world, settle, spawn};
+    use super::*;
+
+    /// Roll the chassis onto its roof.
+    fn flip(world: &mut PhysicsWorld, car: &Vehicle) {
+        let body = &mut world.bodies[car.chassis()];
+        body.set_rotation(glam::Quat::from_rotation_z(std::f32::consts::PI), true);
+        body.set_translation(Vector::new(0.0, 2.0, 0.0), true);
+    }
+
+    #[test]
+    fn an_upside_down_car_is_detected() {
+        let mut world = flat_world();
+        let mut car = spawn(&mut world);
+        settle(&mut world, &mut car, 200, VehicleInput::default());
+        assert!(!car.is_overturned(&world), "a settled car is not overturned");
+
+        flip(&mut world, &car);
+        assert!(car.is_overturned(&world), "a car on its roof must report overturned");
+    }
+
+    #[test]
+    fn a_reset_puts_it_back_on_its_wheels() {
+        // The recovery R exists for. A raycast vehicle upside down has its wheel rays
+        // pointing at the sky, so there is no contact and no input does anything --
+        // it can only be lifted out.
+        let mut world = flat_world();
+        let mut car = spawn(&mut world);
+        settle(&mut world, &mut car, 200, VehicleInput::default());
+        flip(&mut world, &car);
+        settle(&mut world, &mut car, 5, VehicleInput::default());
+        assert!(car.is_overturned(&world));
+
+        car.reset(&mut world, [12.0, 1.0, -7.0], 0.9);
+        assert!(!car.is_overturned(&world), "still overturned after a reset");
+
+        let (t, _) = car.chassis_pose(&world);
+        assert!((t[0] - 12.0).abs() < 0.01 && (t[2] + 7.0).abs() < 0.01, "moved to {t:?}");
+        // And it stays up once the simulation runs again.
+        settle(&mut world, &mut car, 200, VehicleInput::default());
+        assert!(!car.is_overturned(&world), "it fell back over after the reset");
+    }
+
+    #[test]
+    fn a_reset_keeps_the_heading_it_was_given() {
+        let mut world = flat_world();
+        let mut car = spawn(&mut world);
+        settle(&mut world, &mut car, 200, VehicleInput::default());
+        // Round-trip: `reset` takes what `heading` gives.
+        for want in [0.0f32, 1.2, -2.5, 3.0] {
+            car.reset(&mut world, [0.0, 1.0, 0.0], want);
+            let got = car.heading(&world);
+            assert!((got - want).abs() < 0.01, "heading came back {got}, wanted {want}");
+        }
+    }
+
+    #[test]
+    fn a_reset_drops_the_momentum_it_crashed_with() {
+        // Carrying velocity through a reset is how a car that rolled at speed
+        // immediately rolls again.
+        let mut world = flat_world();
+        let mut car = spawn(&mut world);
+        settle(&mut world, &mut car, 300, VehicleInput::default());
+        settle(&mut world, &mut car, 400, VehicleInput { throttle: 1.0, ..Default::default() });
+        assert!(car.speed().abs() > 5.0, "the car never got moving");
+
+        car.reset(&mut world, [0.0, 1.0, 0.0], 0.0);
+        assert_eq!(car.speed(), 0.0, "speed survived the reset");
+        let v = world.bodies[car.chassis()].linvel();
+        assert!(v.length() < 1e-4, "velocity survived the reset: {v:?}");
+    }
+
+    #[test]
+    fn heading_matches_the_camera_yaw_convention() {
+        // `Camera::yaw` is `atan2(z, x)` of the forward vector, and the chase camera
+        // sits at `heading + pi`. If these two disagree the camera starts up facing
+        // the bonnet.
+        let mut world = flat_world();
+        let mut car = spawn(&mut world);
+        settle(&mut world, &mut car, 200, VehicleInput::default());
+        // Heading 0 means forward points along +X, because the convention is
+        // `atan2(z, x)` -- the same one `Camera::yaw` uses, which is what lets the
+        // chase camera sit at `heading + pi` and be behind the car.
+        car.reset(&mut world, [0.0, 1.0, 0.0], 0.0);
+        let forward = world.bodies[car.chassis()].rotation() * glam::Vec3::Z;
+        assert!(forward.x > 0.99, "heading 0 should face +X, forward is {forward}");
+        assert!(car.heading(&world).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod steering_direction {
+    use super::tests::{flat_world, settle, spawn};
+    use super::*;
+
+    /// Screen-left for a camera behind the car looking along `forward`.
+    ///
+    /// Tied to the same convention `terra_render::camera::Camera::right()` uses --
+    /// `right = forward x up`, so `left = up x forward`. That function is what
+    /// decides which way the world appears to move, so it is the only definition of
+    /// "left" that can be checked against what a driver sees.
+    fn screen_left(forward: glam::Vec3) -> glam::Vec3 {
+        glam::Vec3::Y.cross(forward).normalize_or_zero()
+    }
+
+    #[test]
+    fn left_is_plus_x_when_driving_towards_plus_z() {
+        // The claim the steering sign rests on, isolated from the simulation.
+        let l = screen_left(glam::Vec3::Z);
+        assert!(l.x > 0.9, "left came out {l}, so the convention note is wrong");
+    }
+
+    #[test]
+    fn pressing_left_moves_the_car_to_screen_left() {
+        // `VehicleInput::steer` is documented as positive-is-left, and this is what
+        // that has to mean: the car goes the way the driver's eye calls left.
+        let mut world = flat_world();
+        let mut car = spawn(&mut world);
+        settle(&mut world, &mut car, 300, VehicleInput::default());
+        settle(&mut world, &mut car, 240, VehicleInput { throttle: 0.7, ..Default::default() });
+
+        let (before, rot) = car.chassis_pose(&world);
+        let q = glam::Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]);
+        let forward = q * glam::Vec3::Z;
+        let left = screen_left(forward);
+
+        settle(
+            &mut world,
+            &mut car,
+            240,
+            VehicleInput { throttle: 0.5, steer: 1.0, ..Default::default() },
+        );
+        let (after, _) = car.chassis_pose(&world);
+
+        let moved = glam::Vec3::from_array(after) - glam::Vec3::from_array(before);
+        let lateral = moved.dot(left);
+        assert!(
+            lateral > 1.0,
+            "positive steer moved {lateral:.2} m along screen-left, so A steers right"
+        );
+    }
+
+    #[test]
+    fn pressing_right_moves_the_car_to_screen_right() {
+        let mut world = flat_world();
+        let mut car = spawn(&mut world);
+        settle(&mut world, &mut car, 300, VehicleInput::default());
+        settle(&mut world, &mut car, 240, VehicleInput { throttle: 0.7, ..Default::default() });
+
+        let (before, rot) = car.chassis_pose(&world);
+        let q = glam::Quat::from_xyzw(rot[0], rot[1], rot[2], rot[3]);
+        let left = screen_left(q * glam::Vec3::Z);
+
+        settle(
+            &mut world,
+            &mut car,
+            240,
+            VehicleInput { throttle: 0.5, steer: -1.0, ..Default::default() },
+        );
+        let (after, _) = car.chassis_pose(&world);
+        let moved = glam::Vec3::from_array(after) - glam::Vec3::from_array(before);
+        assert!(
+            moved.dot(left) < -1.0,
+            "negative steer went {:.2} m along screen-left, so D steers left",
+            moved.dot(left)
+        );
     }
 }

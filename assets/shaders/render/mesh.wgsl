@@ -29,13 +29,57 @@ struct VsIn {
     @location(0) position: vec3f,
     @location(1) normal: vec3f,
     @location(2) uv: vec2f,
-    // Model matrix, one column per location.
-    @location(3) m0: vec4f,
-    @location(4) m1: vec4f,
-    @location(5) m2: vec4f,
-    @location(6) m3: vec4f,
-    @location(7) color: vec4f,
+    // The instance, 32 bytes. Not a model matrix: every instance drawn here is a
+    // rigid transform with uniform scale, so a quaternion, a scalar and a
+    // position say the same thing in a fifth of the space -- which is what makes
+    // one instance buffer per LOD affordable. See `mesh::Instance`.
+    @location(3) i_pos: vec3f,
+    // Snorm16x4, so this arrives already decoded to -1..1.
+    @location(4) i_rot: vec4f,
+    // Float16x2 over the f16 scale and its padding; only x is meaningful.
+    @location(5) i_scale: vec2f,
+    // Unorm8x4, already 0..1.
+    @location(6) i_color: vec4f,
+    @location(7) i_seed: u32,
 };
+
+/// Rotation matrix from a unit quaternion.
+///
+/// The instance stores i16 snorm components, which round-trip to very slightly
+/// off unit length; normalising here rather than trusting the encoding is one
+/// `inverseSqrt` and removes the question of whether the scale is exactly what
+/// was asked for.
+fn quat_to_mat3(q_in: vec4f) -> mat3x3f {
+    let q = normalize(q_in);
+    let x = q.x;
+    let y = q.y;
+    let z = q.z;
+    let w = q.w;
+    return mat3x3f(
+        vec3f(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + z * w), 2.0 * (x * z - y * w)),
+        vec3f(2.0 * (x * y - z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + x * w)),
+        vec3f(2.0 * (x * z + y * w), 2.0 * (y * z - x * w), 1.0 - 2.0 * (x * x + y * y)),
+    );
+}
+
+/// The instance's world transform, as a rotation basis and a translation.
+///
+/// Returned as a 3x3 plus a vec3 rather than a mat4x4 because the normal needs
+/// the rotation on its own, and building a 4x4 only to pull the corner back out
+/// is what the old layout did.
+struct InstanceXform {
+    rot: mat3x3f,
+    scale: f32,
+    pos: vec3f,
+};
+
+fn instance_xform(in: VsIn) -> InstanceXform {
+    var x: InstanceXform;
+    x.rot = quat_to_mat3(in.i_rot);
+    x.scale = in.i_scale.x;
+    x.pos = in.i_pos;
+    return x;
+}
 
 struct VsOut {
     @builtin(position) clip: vec4f,
@@ -47,19 +91,17 @@ struct VsOut {
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    let model = mat4x4f(in.m0, in.m1, in.m2, in.m3);
-    let world = model * vec4f(in.position, 1.0);
-
-    // Rotation only for the normal. These are rigid transforms with uniform
-    // scale, so the upper 3x3 is safe to use directly -- no inverse-transpose.
-    let rot = mat3x3f(in.m0.xyz, in.m1.xyz, in.m2.xyz);
+    let x = instance_xform(in);
+    let world = x.pos + x.rot * (in.position * x.scale);
 
     var out: VsOut;
-    out.world = world.xyz;
-    out.normal = normalize(rot * in.normal);
-    out.color = in.color.rgb;
+    out.world = world;
+    // Rotation only for the normal. The scale is uniform, so it drops out under
+    // the normalize and there is no inverse-transpose to take.
+    out.normal = normalize(x.rot * in.normal);
+    out.color = in.i_color.rgb;
     out.uv = in.uv;
-    out.clip = cam.view_proj * world;
+    out.clip = cam.view_proj * vec4f(world, 1.0);
     return out;
 }
 
@@ -113,14 +155,14 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4f 
 // quads is worse than no shadow at all.
 @vertex
 fn vs_shadow(in: VsIn) -> VsOut {
-    let model = mat4x4f(in.m0, in.m1, in.m2, in.m3);
-    let world = model * vec4f(in.position, 1.0);
+    let x = instance_xform(in);
+    let world = x.pos + x.rot * (in.position * x.scale);
     var out: VsOut;
-    out.world = world.xyz;
+    out.world = world;
     out.normal = in.normal;
-    out.color = in.color.rgb;
+    out.color = in.i_color.rgb;
     out.uv = in.uv;
-    out.clip = cam.view_proj * world;
+    out.clip = cam.view_proj * vec4f(world, 1.0);
     return out;
 }
 

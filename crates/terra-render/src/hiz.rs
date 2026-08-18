@@ -162,6 +162,11 @@ impl HiZ {
         me
     }
 
+    /// Levels in the pyramid, so a cull pass can clamp the level it samples.
+    pub fn levels(&self) -> u32 {
+        self.levels.len() as u32
+    }
+
     pub fn size(&self) -> (u32, u32) {
         self.size
     }

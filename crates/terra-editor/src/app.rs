@@ -177,6 +177,10 @@ struct OpenWorld {
     /// and reloaded without re-running the solver.
     flow: Vec<f32>,
     deposition: Vec<f32>,
+    /// The water surface. Per world rather than per session, because it binds the
+    /// terrain's own height buffer to know how deep it is -- so it has to be rebuilt
+    /// whenever the terrain is.
+    water: terra_render::water::Water,
 }
 
 /// What happened to a frame. Drives how long the loop waits before the next
@@ -214,6 +218,18 @@ struct Play {
     prev_wheels: Vec<Pose>,
     curr_wheels: Vec<Pose>,
     camera: Camera,
+    /// Where the camera sits around the car, as a world compass angle rather than
+    /// an offset from the car's heading.
+    ///
+    /// Absolute, because that is what a GTA-style chase camera does: the mouse aims
+    /// the camera at a direction and the car turns underneath it, so you can look
+    /// down a side street while still driving forward. An offset relative to the
+    /// heading would drag the view around with every steering input.
+    cam_yaw: f32,
+    /// Elevation of the camera above the car, radians. Positive looks down.
+    cam_pitch: f32,
+    /// Wheel zoom, as a multiplier on the vehicle-derived follow distance.
+    cam_zoom: f32,
 }
 
 /// Staged world load. One stage runs per frame so the loading screen actually
@@ -340,6 +356,15 @@ pub struct App {
     /// that lights the world. `Lighting::settings` and `Volumetrics::settings`
     /// are derived from it every frame and are written by nothing else.
     env: terra_render::Environment,
+    /// Authored water for the open world, and what was last written, compared the same
+    /// way the environment is so an edit marks the world unsaved.
+    water: terra_render::water::WaterSettings,
+    saved_water: terra_render::water::WaterSettings,
+    /// Body the Water tool has selected, and where a drag started on the ground.
+    selected_water: Option<usize>,
+    water_drag_start: Option<Vec2>,
+    /// The rectangle being dragged, for the viewport overlay.
+    water_drag_preview: Option<(Vec2, Vec2)>,
     /// What `env` looked like the last time it was written to disk.
     ///
     /// The mixer panel edits `env` in place, so there is no widget to hang a dirty
@@ -363,6 +388,19 @@ pub struct App {
     asset_kind: crate::ui::AssetKind,
     /// Palette slot the Material pane is editing.
     selected_material: usize,
+    /// World the delete confirmation is open for.
+    ///
+    /// Held here rather than in the UI so the modal cannot be the only thing standing
+    /// between a click and a recursive delete: the action arrives, this is set, and the
+    /// deletion happens on a *second*, explicit action.
+    pending_delete: Option<terra_project::ProjectEntry>,
+    /// Result of the last import or rescan, and whether it was a failure. Shown
+    /// in the Content pane until the next one replaces it.
+    ///
+    /// Log lines are not an answer here: an import that quietly does nothing is
+    /// the exact failure being fixed, and the user is looking at a window rather
+    /// than at stderr.
+    notice: Option<(String, bool)>,
     /// Set when the palette params were edited, so the change reaches the GPU
     /// once per frame rather than once per slider drag event.
     material_dirty: bool,
@@ -446,6 +484,11 @@ impl App {
             active_road: None,
             env: terra_render::Environment::daylight(),
             saved_env: terra_render::Environment::daylight(),
+            water: Default::default(),
+            saved_water: Default::default(),
+            selected_water: None,
+            water_drag_start: None,
+            water_drag_preview: None,
             layout: crate::dock::Layout::new(),
             modifiers: terra_voxel::ModifierStack::default(),
             selected_modifier: None,
@@ -454,6 +497,8 @@ impl App {
             assets: [Vec::new(), Vec::new(), Vec::new()],
             asset_kind: crate::ui::AssetKind::Texture,
             selected_material: 0,
+            pending_delete: None,
+            notice: None,
             material_dirty: false,
             viewport_rect: None,
             stroke: Vec::new(),
@@ -572,6 +617,22 @@ impl App {
         // Start above the flat base so a new world is in frame immediately.
         let camera =
             Camera { pos: Vec3::new(0.0, BASE_ELEVATION_M + 380.0, 900.0), ..Camera::default() };
+
+        // The water surface reads the terrain's own height buffer for depth, so it is
+        // built here from the terrain that was just loaded rather than once at startup.
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let water = terra_render::water::Water::new(
+            &gfx.ctx.device,
+            &gfx.lighting,
+            &gfx.env_gpu,
+            terrain.height_buffer(),
+            terrain.extent_m(),
+            terrain.resolution(),
+        );
+        // Whatever was authored, or none. A world from before this existed has no
+        // `water.ron` and simply has no water, which must load rather than fail.
+        self.water = terra_render::water::WaterSettings::load(&l.project.paths).unwrap_or_default();
+        self.saved_water = self.water.clone();
         self.world = Some(OpenWorld {
             project: l.project,
             terrain,
@@ -580,6 +641,7 @@ impl App {
             roads: l.roads,
             flow: l.flow,
             deposition: l.deposition,
+            water,
         });
         self.unsaved = false;
         if let Some(gfx) = self.gfx.as_mut() {
@@ -719,6 +781,7 @@ impl App {
             rotation: Quat::from_xyzw(r[0], r[1], r[2], r[3]),
         };
         let wheels = wheel_poses(&car, pose.rotation);
+        let heading = car.heading(&physics);
 
         self.obstacle_origin = eye;
         self.play = Some(Play {
@@ -730,12 +793,46 @@ impl App {
             prev_wheels: wheels.clone(),
             curr_wheels: wheels,
             camera: Camera { fov_y: 62f32.to_radians(), ..Camera::default() },
+            // Behind the car to start: the camera sits opposite the heading, which
+            // is the heading plus half a turn.
+            cam_yaw: heading + std::f32::consts::PI,
+            cam_pitch: 0.22,
+            cam_zoom: 1.0,
         });
+        self.set_cursor_captured(true);
         log::info!("play: terrain collider built, car spawned");
+    }
+
+    /// Lock and hide the pointer, or give it back.
+    ///
+    /// Held for the whole Play session: the camera is aimed by raw motion, so a
+    /// visible pointer would crawl to a screen edge and stay there while the view kept
+    /// turning. `Locked` is what a driving camera wants; `Confined` is the fallback
+    /// where a platform does not offer it, and a platform offering neither is not an
+    /// error worth interrupting play for -- the camera still works, the pointer just
+    /// wanders.
+    fn set_cursor_captured(&self, on: bool) {
+        let Some(gfx) = self.gfx.as_ref() else { return };
+        let window = gfx.ctx.window();
+        if on {
+            let locked = window.set_cursor_grab(winit::window::CursorGrabMode::Locked);
+            if locked.is_err()
+                && let Err(e) = window.set_cursor_grab(winit::window::CursorGrabMode::Confined)
+            {
+                log::debug!("cursor could not be captured: {e}");
+            }
+        } else if let Err(e) = window.set_cursor_grab(winit::window::CursorGrabMode::None) {
+            log::debug!("cursor could not be released: {e}");
+        }
+        window.set_cursor_visible(!on);
     }
 
     fn stop_play(&mut self) {
         self.play = None;
+        // Give the pointer back, and drop whatever motion arrived on the way out --
+        // the editor camera must not inherit the last flick of the driving camera.
+        self.set_cursor_captured(false);
+        self.input.clear_motion();
     }
 
     /// Rebuild the obstacle set when the car has left the one it was given.
@@ -794,31 +891,105 @@ impl App {
         self.stream_obstacles();
         let Some(play) = self.play.as_mut() else { return };
 
-        // Chase camera follows the interpolated pose, smoothed so it lags the
-        // vehicle slightly rather than being welded to it.
+        // --- mouse-aimed chase camera ---
         //
-        // Placed *behind* the vehicle, which it previously was not: the offset was
-        // `- back`, putting the camera ahead of the bonnet, and that only looked right
-        // because the vehicle used to drive backwards. Both are fixed together, since one
-        // was compensating for the other.
-        //
-        // Distances scale with the vehicle rather than being fixed at the 9 m that suited a
-        // 3.6 m hatchback -- a 5.2 m Hummer at that range fills the frame.
+        // GTA's arrangement: the mouse orbits the camera around the car freely, and
+        // when it is left alone the view drifts back behind the car. The camera angle
+        // is held in world space rather than relative to the heading, so a steering
+        // input does not drag the view with it -- you can look down a side street
+        // while still driving straight.
+        let (mdx, mdy) = self.input.look_delta;
+        self.input.look_delta = (0.0, 0.0);
+        let moved_mouse = mdx.abs() + mdy.abs() > 0.0;
+        play.cam_yaw += mdx * DRIVE_LOOK_SENSITIVITY;
+        // Screen-down should look down at the car from above, which is a *larger*
+        // elevation. Inverting this reads as an inverted mouse rather than as a
+        // camera bug, so it is worth being explicit.
+        play.cam_pitch =
+            (play.cam_pitch + mdy * DRIVE_LOOK_SENSITIVITY).clamp(DRIVE_PITCH_MIN, DRIVE_PITCH_MAX);
+
+        // Wheel zooms, consumed here so it cannot bank up for the editor camera.
+        if self.input.scroll != 0.0 {
+            play.cam_zoom = (play.cam_zoom * (1.0 - self.input.scroll * 0.08))
+                .clamp(DRIVE_ZOOM_MIN, DRIVE_ZOOM_MAX);
+            self.input.scroll = 0.0;
+        }
+
         let alpha = play.accumulator / FIXED_DT;
         let pose = interpolate(play.prev, play.curr, alpha);
         let dims = self.gfx.as_ref().map(|g| g.vehicle_dims).unwrap_or(PLACEHOLDER_VEHICLE);
-        let back = pose.rotation * Vec3::new(0.0, 0.0, -1.0);
-        let distance = dims.length() * 2.2;
-        let height = dims.chassis_centre_y + dims.chassis_half[1] * 2.2;
-        let want = pose.translation + back * distance + Vec3::Y * height;
+
+        // Recentre behind the car when the mouse is idle and the car is actually
+        // going somewhere. Gated on speed because recentring a parked car would spin
+        // the view whenever it was nudged, and gated on the mouse because fighting
+        // the player's own input is the classic chase-camera annoyance.
+        let forward = pose.rotation * Vec3::Z;
+        let heading = forward.z.atan2(forward.x);
+        let behind = heading + std::f32::consts::PI;
+        let speed = play.car.speed().abs() * 3.6;
+        if !moved_mouse && speed > 4.0 {
+            // Shortest way round, so recentring never takes the long way through a
+            // full turn.
+            let delta = wrap_angle(behind - play.cam_yaw);
+            let rate = 1.0 - (-dt * (speed / 40.0).clamp(0.4, 2.5)).exp();
+            play.cam_yaw += delta * rate;
+        }
+
+        // Aim at the roof line rather than the contact patch, or a tall vehicle sits
+        // at the bottom of the frame with the sky above it.
+        let target = pose.translation + Vec3::Y * dims.chassis_centre_y;
+        // Distances scale with the vehicle rather than being fixed at the 9 m that
+        // suited a 3.6 m hatchback -- a 5.2 m Hummer at that range fills the frame.
+        let distance = dims.length() * 2.2 * play.cam_zoom;
+        let (sy, cy) = play.cam_yaw.sin_cos();
+        let (sp, cp) = play.cam_pitch.sin_cos();
+        // Direction from the car to the camera, so a positive pitch lifts it.
+        let offset = Vec3::new(cy * cp, sp, sy * cp);
+        let want = target + offset * distance;
+
+        // Smoothed so the camera lags the vehicle slightly rather than being welded
+        // to it. Position only: the aim is exact, or the car slides around the frame.
         let follow = 1.0 - (-dt * 9.0).exp();
         play.camera.pos = play.camera.pos.lerp(want, follow);
+        play.camera.look_toward(target);
+    }
 
-        // Aim at the roof line rather than the contact patch, or a tall vehicle sits at the
-        // bottom of the frame with the sky above it.
-        let to_car = (pose.translation + Vec3::Y * dims.chassis_centre_y) - play.camera.pos;
-        play.camera.yaw = to_car.z.atan2(to_car.x);
-        play.camera.pitch = (to_car.y / to_car.length().max(0.01)).clamp(-1.0, 1.0).asin();
+    /// Put the car back on its wheels where it currently is.
+    ///
+    /// Bound to `R`. A raycast vehicle cannot recover from being upside down on its
+    /// own -- the wheel rays point at the sky, so there is no contact and neither
+    /// throttle nor steering does anything.
+    fn reset_car(&mut self) {
+        let Some(play) = self.play.as_mut() else { return };
+        let Some(world) = self.world.as_ref() else { return };
+
+        let (t, _) = play.car.chassis_pose(&play.world);
+        let heading = play.car.heading(&play.world);
+        // Lifted clear of the ground it is standing on, not of wherever it fell to:
+        // a car wedged in a gully has to come out of the gully.
+        let ground = world.terrain.height_at(t[0], t[2]);
+        let position = [t[0], ground + 1.0, t[2]];
+        play.car.reset(&mut play.world, position, heading);
+
+        // Re-seed the interpolation from the new pose. Left alone, the renderer would
+        // smear the car from where it was to where it now is over the next frame,
+        // which is a visible dash across the map.
+        let (t, r) = play.car.chassis_pose(&play.world);
+        let pose = Pose {
+            translation: Vec3::from_array(t),
+            rotation: Quat::from_xyzw(r[0], r[1], r[2], r[3]),
+        };
+        play.prev = pose;
+        play.curr = pose;
+        let wheels = wheel_poses(&play.car, pose.rotation);
+        play.prev_wheels = wheels.clone();
+        play.curr_wheels = wheels;
+        play.accumulator = 0.0;
+        // Snap the camera behind the reset heading rather than letting it swing round
+        // from wherever it was watching the crash from.
+        play.cam_yaw = heading + std::f32::consts::PI;
+        play.camera.pos = pose.translation;
+        log::info!("play: car reset at {:.0}, {:.0}", position[0], position[2]);
     }
 
     /// Tell the foliage the terrain moved.
@@ -880,44 +1051,184 @@ impl App {
         self.noise_library = self.assets[1].clone();
     }
 
-    /// Copy a file the user picks into the project's own asset folder.
+    /// Copy what the user picks into the project's own asset folder.
     ///
     /// Copied, not referenced. A project that stores a path to the user's
     /// Downloads folder stops working the moment it is moved or shared, and
     /// `README.md` already promises projects are self-contained and movable.
+    ///
+    /// A texture is a *folder* of maps rather than one image, so it needs a
+    /// folder picker. Offering the file picker for it was worse than useless: a
+    /// dialog filtered to images cannot select a directory at all, so clicking
+    /// Open on a material folder just navigated into it, and picking the images
+    /// inside copied them loose into `assets/textures/` where
+    /// `texture_set::discover` -- which only ever looks at subdirectories --
+    /// ignored them. The import silently did nothing, twice over.
     fn import_asset(&mut self, kind: crate::ui::AssetKind) {
         let Some(w) = self.world.as_ref() else { return };
         let dest_dir = w.project.paths.assets_dir().join(kind.folder());
         if let Err(e) = std::fs::create_dir_all(&dest_dir) {
             log::error!("could not create {}: {e}", dest_dir.display());
+            self.notice = Some((format!("Could not create {}: {e}", dest_dir.display()), true));
             return;
         }
+
+        if kind == crate::ui::AssetKind::Texture {
+            let picked = rfd::FileDialog::new()
+                .set_title("Import material folders  --  one folder per material")
+                .pick_folders();
+            let Some(dirs) = picked else { return };
+            self.import_texture_folders(&dirs, &dest_dir);
+            return;
+        }
+
         let picked = rfd::FileDialog::new()
             .add_filter(kind.label(), kind.extensions())
             .set_title(format!("Import {}", kind.label()))
             .pick_files();
         let Some(files) = picked else { return };
 
+        let mut imported = 0usize;
+        let mut incomplete: Vec<String> = Vec::new();
         for src in files {
             let Some(name) = src.file_name() else { continue };
-            let dest = unique_path(&dest_dir, name);
+            let is_gltf = src.extension().is_some_and(|x| x.eq_ignore_ascii_case("gltf"));
+            // A `.gltf` is JSON pointing at a `.bin` and its textures, so it
+            // cannot be copied as one file. It goes into a folder of its own with
+            // everything it names -- which `terra_assets::mesh::discover` already
+            // reads, because it accepts one-model-per-folder as well as loose
+            // files. A `.glb` is self-contained and stays loose.
+            let dest = if is_gltf {
+                let stem = src.file_stem().map(|s| s.to_string_lossy().to_string());
+                let folder = unique_folder(&dest_dir, stem.as_deref().unwrap_or("model"));
+                let dir = dest_dir.join(&folder);
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    log::error!("could not create {}: {e}", dir.display());
+                    continue;
+                }
+                dir.join(name)
+            } else {
+                unique_path(&dest_dir, name)
+            };
             match std::fs::copy(&src, &dest) {
-                Ok(_) => log::info!("imported {}", dest.display()),
-                Err(e) => log::error!("could not import {}: {e}", src.display()),
+                Ok(_) => {
+                    log::info!("imported {}", dest.display());
+                    imported += 1;
+                }
+                Err(e) => {
+                    log::error!("could not import {}: {e}", src.display());
+                    continue;
+                }
+            }
+            if !is_gltf {
+                continue;
+            }
+            // The sidecars. A missing one is reported rather than ignored: the
+            // model would import "successfully" and then fail to load, with the
+            // reason buried in a log line about a path the user never typed.
+            let Some(src_dir) = src.parent() else { continue };
+            let Some(dest_parent) = dest.parent() else { continue };
+            for rel in terra_assets::mesh::external_files(&src) {
+                let from = src_dir.join(&rel);
+                let to = dest_parent.join(&rel);
+                if let Some(p) = to.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                if let Err(e) = std::fs::copy(&from, &to) {
+                    log::error!(
+                        "{}: could not copy {}: {e}",
+                        name.to_string_lossy(),
+                        rel.display()
+                    );
+                    incomplete.push(format!(
+                        "{} (missing {})",
+                        name.to_string_lossy(),
+                        rel.display()
+                    ));
+                }
             }
         }
         self.refresh_assets();
-        match kind {
-            crate::ui::AssetKind::Texture => self.reload_materials(),
-            crate::ui::AssetKind::Model => {
-                if let Some(paths) = self.world.as_ref().map(|w| w.project.paths.clone()) {
-                    self.reload_species(&paths);
+        if kind == crate::ui::AssetKind::Model
+            && let Some(paths) = self.world.as_ref().map(|w| w.project.paths.clone())
+        {
+            self.reload_species(&paths);
+        }
+        self.notice = Some(match incomplete.is_empty() {
+            true => (format!("Imported {imported} {}.", kind.label().to_lowercase()), false),
+            false => (
+                format!(
+                    "Imported {imported}, but {} arrived incomplete: {}. A .gltf needs the \
+                     files it references beside it.",
+                    incomplete.len(),
+                    incomplete.join("; ")
+                ),
+                true,
+            ),
+        });
+    }
+
+    /// Install picked folders as materials and rebuild the palette.
+    ///
+    /// Accepts either a single material folder or a pack containing several, and
+    /// reports every folder it had to skip -- a folder with no colour map used to
+    /// be listed by the content browser (which only checks that it is a
+    /// directory) and then never appear in the palette, with nothing said.
+    fn import_texture_folders(&mut self, dirs: &[std::path::PathBuf], dest_dir: &std::path::Path) {
+        let mut installed: Vec<String> = Vec::new();
+        let mut rejected: Vec<(String, String)> = Vec::new();
+        let mut incomplete: Vec<(String, Vec<&'static str>)> = Vec::new();
+        let mut unreadable: Vec<(String, Vec<String>)> = Vec::new();
+
+        for src in dirs {
+            match terra_render::texture_set::install(src, dest_dir) {
+                Ok(out) => {
+                    installed.extend(out.materials);
+                    rejected.extend(out.rejected);
+                    incomplete.extend(out.incomplete);
+                    unreadable.extend(out.unreadable);
+                }
+                Err(e) => {
+                    log::error!("could not import {}: {e}", src.display());
+                    rejected.push((
+                        src.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                        e.to_string(),
+                    ));
                 }
             }
-            // Noise maps are chosen explicitly from the browser, so there is
-            // nothing to rebuild until one is picked.
-            crate::ui::AssetKind::Noise => {}
         }
+
+        // Only rebuild when something landed. `Materials::load` re-decodes every
+        // set in the folder, which is seconds of work on a big palette.
+        if !installed.is_empty() {
+            self.refresh_assets();
+            self.reload_materials();
+        }
+        self.notice = Some(import_summary(&installed, &rejected, &incomplete, &unreadable));
+    }
+
+    /// Re-read the project's asset folders and rebuild both palettes.
+    ///
+    /// Needed because the palettes are otherwise built only on project open and
+    /// on import, so a folder copied in by hand -- which was the *only* way to
+    /// add a material while the import was broken -- stayed invisible until the
+    /// project was closed and reopened.
+    fn rescan_assets(&mut self) {
+        let Some(paths) = self.world.as_ref().map(|w| w.project.paths.clone()) else { return };
+        self.refresh_assets();
+        self.reload_materials();
+        self.reload_species(&paths);
+        let n = self.gfx.as_ref().map_or(0, |g| g.materials.count());
+        self.notice = Some((
+            match n {
+                0 => "Rescanned. No materials found -- each one needs its own folder with a \
+                      colour map in it."
+                    .to_string(),
+                1 => "Rescanned: 1 material.".to_string(),
+                n => format!("Rescanned: {n} materials."),
+            },
+            n == 0,
+        ));
     }
 
     /// Rebuild the foliage palette from the open project's model folder.
@@ -973,17 +1284,309 @@ impl App {
         }
     }
 
+    /// Remove a world from the library, and its files too when asked.
+    ///
+    /// The library entry is dropped either way, but only *after* a requested file
+    /// delete succeeds -- forgetting first would leave a folder nobody can find again
+    /// if the delete then failed on a permission error.
+    fn delete_world(&mut self, path: &std::path::Path, files: bool) {
+        self.pending_delete = None;
+
+        if files {
+            match terra_project::ProjectPaths::delete_project(path) {
+                Ok(()) => log::info!("deleted {}", path.display()),
+                Err(e) => {
+                    // Left in the library on purpose: the folder is still there, and
+                    // hiding it would leave a project the user cannot reach.
+                    log::error!("could not delete {}: {e}", path.display());
+                    self.notice = Some((format!("Could not delete: {e}"), true));
+                    return;
+                }
+            }
+        }
+        self.library.forget(path);
+        if let Err(e) = self.library.save() {
+            log::error!("could not save the library: {e}");
+        }
+    }
+
+    /// Everything in the world, as the outliner shows it.
+    ///
+    /// Built fresh each frame rather than cached, because it is a few dozen short strings
+    /// and every source it reads is already in memory -- a cache would need invalidating
+    /// from six places and would be wrong in one of them.
+    ///
+    /// The order here *is* the order on screen: the pane emits a heading when the kind
+    /// changes and never sorts.
+    fn outliner_items(&self) -> Vec<ui::OutlinerItem> {
+        use ui::{OutlinerItem, OutlinerKind};
+        let mut out = Vec::new();
+
+        for (i, r) in self.water.regions.iter().enumerate() {
+            let s = r.size();
+            out.push(OutlinerItem {
+                kind: OutlinerKind::Water,
+                index: i,
+                name: format!("Water {}", i + 1),
+                detail: format!("{:.0} x {:.0} m at {:.0} m", s[0], s[1], r.level_m),
+                removable: true,
+            });
+        }
+
+        if let Some(gfx) = self.gfx.as_ref() {
+            // One row per species, whatever the instance count. This is the rule that
+            // keeps the list usable: a thousand painted trees are one decision -- the
+            // species' rules -- and a thousand rows would be unreadable.
+            for (i, sp) in gfx.scatter.species.iter().enumerate() {
+                let n = sp.instance_count();
+                if n == 0 && !sp.is_painted() {
+                    continue;
+                }
+                out.push(OutlinerItem {
+                    kind: OutlinerKind::Species,
+                    index: i,
+                    name: sp.name.clone(),
+                    detail: match n {
+                        1 => "1 instance".to_string(),
+                        n => format!("{n} instances"),
+                    },
+                    // Not removable here. A species exists because a mesh is in the
+                    // project's `assets/models/`, so removing it means deleting that file
+                    // -- clearing its painting is what the Foliage tool's Clear does.
+                    removable: false,
+                });
+            }
+
+            // Hand-placed objects, one row each: each was placed deliberately and has its
+            // own transform, which is exactly what a scattered instance does not.
+            for (i, p) in gfx.scatter.props.iter().enumerate() {
+                let name = gfx
+                    .scatter
+                    .species
+                    .get(p.species)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "Object".to_string());
+                out.push(OutlinerItem {
+                    kind: OutlinerKind::Prop,
+                    index: i,
+                    name,
+                    detail: format!("{:.0}, {:.0}", p.pos.x, p.pos.z),
+                    removable: true,
+                });
+            }
+        }
+
+        if let Some(w) = self.world.as_ref() {
+            for (i, r) in w.roads.roads.iter().enumerate() {
+                out.push(OutlinerItem {
+                    kind: OutlinerKind::Road,
+                    index: i,
+                    name: format!("Road {}", i + 1),
+                    detail: match r.points.len() {
+                        1 => "1 point".to_string(),
+                        n => format!("{n} points"),
+                    },
+                    removable: true,
+                });
+            }
+        }
+
+        for (i, m) in self.modifiers.items.iter().enumerate() {
+            out.push(OutlinerItem {
+                kind: OutlinerKind::Modifier,
+                index: i,
+                name: m.name.clone(),
+                detail: m.op.label().to_string(),
+                removable: true,
+            });
+        }
+        out
+    }
+
+    /// Which row the outliner should show as selected.
+    ///
+    /// Derived from the tool selections rather than stored separately, so the outliner and
+    /// the tool panes cannot disagree about what is selected.
+    fn outliner_selection(&self) -> Option<(ui::OutlinerKind, usize)> {
+        use ui::{OutlinerKind, Tool};
+        match self.tool {
+            Tool::Water => self.selected_water.map(|i| (OutlinerKind::Water, i)),
+            Tool::Foliage => Some((OutlinerKind::Species, self.species)),
+            Tool::Select => self.selected_prop.map(|i| (OutlinerKind::Prop, i)),
+            Tool::Road => self.active_road.map(|i| (OutlinerKind::Road, i)),
+            _ => self.selected_modifier.map(|i| (OutlinerKind::Modifier, i)),
+        }
+    }
+
+    /// Select an outliner row: switch to the tool that owns its settings, and point that
+    /// tool at it.
+    ///
+    /// Routing to the existing panes rather than duplicating their controls is what keeps
+    /// one Details pane in this editor instead of five.
+    fn select_outliner(&mut self, kind: ui::OutlinerKind, index: usize) {
+        use ui::{OutlinerKind, Tool};
+        match kind {
+            OutlinerKind::Water => {
+                self.tool = Tool::Water;
+                self.selected_water = Some(index);
+            }
+            OutlinerKind::Species => {
+                self.tool = Tool::Foliage;
+                self.species = index;
+            }
+            OutlinerKind::Prop => {
+                self.tool = Tool::Select;
+                self.selected_prop = Some(index);
+            }
+            OutlinerKind::Road => {
+                self.tool = Tool::Road;
+                self.active_road = Some(index);
+            }
+            OutlinerKind::Modifier => {
+                self.selected_modifier = Some(index);
+                self.layout.focus(crate::dock::Tab::Modifiers);
+            }
+        }
+    }
+
+    /// Remove an outliner row.
+    ///
+    /// Every arm has to leave the *selection* valid as well as the list: these are
+    /// indices, so anything at or after the hole now refers to something else. Clearing
+    /// the selection is the honest answer rather than guessing which neighbour was meant.
+    fn remove_outliner(&mut self, kind: ui::OutlinerKind, index: usize) {
+        use ui::OutlinerKind;
+        match kind {
+            OutlinerKind::Water => {
+                if index < self.water.regions.len() {
+                    self.water.regions.remove(index);
+                    self.selected_water = None;
+                    self.unsaved = true;
+                }
+            }
+            OutlinerKind::Prop => {
+                if let Some(gfx) = self.gfx.as_mut() {
+                    gfx.scatter.remove_prop(index);
+                    self.selected_prop = None;
+                    self.unsaved = true;
+                }
+            }
+            OutlinerKind::Road => {
+                if let Some(w) = self.world.as_mut()
+                    && index < w.roads.roads.len()
+                {
+                    w.roads.roads.remove(index);
+                    self.active_road = None;
+                    self.rebuild_roads();
+                    self.unsaved = true;
+                }
+            }
+            OutlinerKind::Modifier => {
+                if index < self.modifiers.len() {
+                    self.modifiers.remove(index);
+                    self.selected_modifier = None;
+                    self.unsaved = true;
+                }
+            }
+            // A species is a file in the project. Nothing to remove from here.
+            OutlinerKind::Species => {}
+        }
+    }
+
+    /// Whether a physical-pixel cursor position falls inside a logical-point rect.
+    ///
+    /// The conversion is the whole reason this is its own function: `winit` reports the
+    /// cursor in **physical pixels** and egui lays out in **logical points**, so on a 2x
+    /// display a cursor at the middle of the window is at *twice* the point coordinate of
+    /// the rect that contains it. Skipping the divide makes the gate correct only near the
+    /// top-left corner, which is exactly the kind of bug that reads as "sometimes it
+    /// works".
+    fn point_in_rect(cursor_px: (f32, f32), rect: egui::Rect, pixels_per_point: f32) -> bool {
+        if pixels_per_point <= 0.0 {
+            return true;
+        }
+        rect.contains(egui::pos2(cursor_px.0 / pixels_per_point, cursor_px.1 / pixels_per_point))
+    }
+
+    /// Whether the pointer is over the 3D view rather than over a panel.
+    ///
+    /// The scene is rendered across the whole window and the docked panels are drawn on
+    /// top of it, which is cheap and looks right -- but it means every pointer event
+    /// reaches the camera regardless of what it is over. Scrolling a settings list zoomed
+    /// the terrain, which is the bug this exists to stop.
+    ///
+    /// Unreal's viewport is a bounded region that owns its own input, and this is that
+    /// boundary: `Tab::Viewport` reports where it ended up and everything camera-facing
+    /// asks here first.
+    ///
+    /// Two coordinate spaces meet here. `winit` reports the cursor in **physical pixels**
+    /// and egui lays out in **logical points**, so the cursor has to be divided by the
+    /// scale factor before it can be compared -- on a 2x display, skipping that puts the
+    /// pointer at twice its real position and the gate is wrong everywhere but the top
+    /// left.
+    ///
+    /// An unknown rect returns `true`: before the editor has laid out once there is no
+    /// viewport to be inside, and a dead viewport is worse than a leaky one.
+    fn cursor_in_viewport(&self) -> bool {
+        let Some(rect) = self.viewport_rect else { return true };
+        Self::point_in_rect(self.input.cursor, rect, self.egui_ctx.pixels_per_point())
+    }
+
+    /// Change which role the open material fills automatically.
+    ///
+    /// `ROLE_NONE` makes it paint-only, which is what someone wants when they would
+    /// rather place a material by hand than have the slope and erosion masks decide.
+    /// The roles then have to reach the GPU, which is `set_materials` -- a uniform
+    /// write, so this is cheap enough to do on a click.
+    fn set_material_role(&mut self, role: u32) {
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        gfx.materials.set_role(self.selected_material, role);
+        let materials = &gfx.materials;
+        let queue = &gfx.ctx.queue;
+        if let Some(w) = self.world.as_mut() {
+            w.terrain.set_materials(queue, materials);
+        }
+        // The menu backdrop shares the palette, so it has to agree or the two show
+        // the same material in different places.
+        if let Some(b) = self.backdrop.as_mut() {
+            b.set_materials(queue, materials);
+        }
+        self.unsaved = true;
+    }
+
     /// Load an imported greyscale map and make it the Noise brush's pattern.
     fn select_noise(&mut self, name: &str) {
         let Some(w) = self.world.as_ref() else { return };
         let path = w.project.paths.assets_dir().join("noise").join(name);
-        let img = match image::open(&path) {
-            Ok(i) => i.to_luma8(),
-            Err(e) => {
-                log::error!("could not read noise map {}: {e}", path.display());
-                return;
+
+        // `.r16` is offered by the import dialog and is not an image format:
+        // headerless little-endian u16, the same layout the heightfield uses on
+        // disk. `image::open` cannot read it -- there is nothing to sniff -- so
+        // picking one used to log "could not read noise map" and do nothing,
+        // which made the advertised option a dead end.
+        let is_r16 = path.extension().is_some_and(|x| x.eq_ignore_ascii_case("r16"));
+        let (wpx, hpx, gray) = if is_r16 {
+            match read_r16_square(&path) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("{}: {e}", path.display());
+                    self.notice = Some((format!("{name}: {e}"), true));
+                    return;
+                }
             }
+        } else {
+            let img = match image::open(&path) {
+                Ok(i) => i.to_luma8(),
+                Err(e) => {
+                    log::error!("could not read noise map {}: {e}", path.display());
+                    self.notice = Some((format!("{name} could not be read: {e}"), true));
+                    return;
+                }
+            };
+            (img.width(), img.height(), img.into_raw())
         };
+        let img = image::GrayImage::from_raw(wpx, hpx, gray)
+            .expect("dimensions were derived from the buffer length");
         let (wpx, hpx) = (img.width(), img.height());
         match terra_voxel::NoiseImage::from_gray8(name, wpx, hpx, img.as_raw()) {
             Ok(n) => {
@@ -1114,6 +1717,12 @@ impl App {
             log::error!("could not save environment: {e}");
             return;
         }
+        // Water, for the same reason and beside it. Written even when disabled: the
+        // file's presence is what separates "decided against water" from "never asked".
+        if let Err(e) = self.water.save(&w.project.paths) {
+            log::error!("could not save water: {e}");
+            return;
+        }
         if let Err(e) = data.save(&w.project.paths, w.project.size()) {
             log::error!("could not save world data: {e}");
             return;
@@ -1124,6 +1733,7 @@ impl App {
         }
         log::info!("saved {}", w.project.manifest.name);
         self.saved_env = self.env;
+        self.saved_water = self.water.clone();
         self.unsaved = false;
     }
 
@@ -1154,6 +1764,12 @@ impl App {
         if self.world.is_some() && self.env.differs_for_saving(&self.saved_env) {
             self.unsaved = true;
         }
+        // Same treatment for water: a level someone set is authored work, and losing it
+        // on close would make the panel a toy. `WaterSettings` is `PartialEq`, so this
+        // needs no bespoke comparison.
+        if self.world.is_some() && self.water != self.saved_water {
+            self.unsaved = true;
+        }
         if let Some(g) = self.gfx.as_mut() {
             self.env.apply_to(&mut g.lighting.settings, &mut g.fog.settings);
             // And the light values themselves, so the terrain is lit by the same
@@ -1176,10 +1792,11 @@ impl App {
             // wind, so clouds advect with the same clock everything else uses.
             g.env_gpu.upload(&g.ctx.queue, &self.env, self.time);
         }
-        // Mouse motion and wheel notches are only consumed while editing, so any
-        // that arrive in the menu, during a load, or while driving have to be
-        // dropped rather than banked.
-        if !self.is_editing() {
+        // Mouse motion and wheel notches are consumed while editing *and* while
+        // driving -- the chase camera is mouse-aimed. Anything arriving in the menu
+        // or during a load still has to be dropped rather than banked, or it applies
+        // in one jump on the first frame that reads it.
+        if !self.is_editing() && self.play.is_none() {
             self.input.clear_motion();
         }
 
@@ -1286,29 +1903,33 @@ impl App {
             (Screen::Editor, None, Some(w)) => w.camera.clone(),
             _ => self.backdrop_cam.clone(),
         };
-        if let Some(gfx) = self.gfx.as_ref() {
+        if let Some(gfx) = self.gfx.as_mut() {
             gfx.sky.upload_camera(&gfx.ctx.queue, &cam, aspect);
             gfx.meshes.upload_camera(&gfx.ctx.queue, &cam, aspect);
-            // Cascades are fitted to the camera actually being rendered from.
-            let f = &gfx.fog.settings;
+            // Cascades are fitted to the camera actually being rendered from, and kept so
+            // the shadow passes can cull against them.
+            let f = gfx.fog.settings;
+            let near = gfx.fog.near();
+            let (width, height) = (gfx.ctx.config.width as f32, gfx.ctx.config.height as f32);
             gfx.lighting.upload(
                 &gfx.ctx.queue,
                 &cam,
                 aspect,
                 [
-                    gfx.fog.near(),
+                    near,
                     f.distance,
                     if f.enabled { 1.0 } else { 0.0 },
                     terra_render::volumetrics::FROXELS[2] as f32,
                 ],
-                [gfx.ctx.config.width as f32, gfx.ctx.config.height as f32],
+                [width, height],
             );
         }
         // While driving, the terrain must be drawn from the chase camera too.
         if let (Some(p), Some(w), Some(gfx)) =
             (self.play.as_ref(), self.world.as_mut(), self.gfx.as_ref())
         {
-            w.terrain.upload_camera(&gfx.ctx.queue, &p.camera, aspect);
+            let lights = gfx.lighting.cascade_frusta();
+            w.terrain.upload_camera_culled(&gfx.ctx.queue, &p.camera, aspect, &lights);
             // No brush ring while driving.
             w.terrain.set_brush(&gfx.ctx.queue, None, 0.0);
         }
@@ -1425,6 +2046,15 @@ impl App {
         let wants_ptr = self.egui_ctx.egui_wants_pointer_input();
         let aspect = self.gfx.as_ref().map(|g| g.ctx.aspect()).unwrap_or(1.0);
 
+        // `wants_ptr` only covers hovering an interactive widget, so over a panel's blank
+        // area the ray still fired and the brush ring tracked the cursor across the
+        // settings. The viewport bound is what stops that.
+        //
+        // Held strokes are exempt: a sculpt drag that runs past the viewport edge must
+        // keep hitting the ground, or the stroke breaks wherever the panel starts.
+        //
+        // Taken before the world is borrowed mutably, since it reads across `self`.
+        let over_view = self.cursor_in_viewport() || self.input.sculpting;
         let (Some(world), Some(gfx)) = (self.world.as_mut(), self.gfx.as_ref()) else {
             // Still clear the motion. Returning with it accumulated is the same
             // bug as never consuming it: the next frame that does get a world
@@ -1518,7 +2148,12 @@ impl App {
 
         self.brush_hit = None;
         let mut finish_stroke = false;
-        if !wants_ptr && !self.input.looking && !self.input.panning && self.tool.edits() {
+        if over_view
+            && !wants_ptr
+            && !self.input.looking
+            && !self.input.panning
+            && self.tool.edits()
+        {
             let (o, d) = {
                 let (w, h) = (gfx.ctx.config.width as f32, gfx.ctx.config.height as f32);
                 let ndc_x = (self.input.cursor.0 / w) * 2.0 - 1.0;
@@ -1565,6 +2200,16 @@ impl App {
                         self.stroke.push([c.x, c.y]);
                     }
                 }
+                // Water bodies: press starts a rectangle, release commits it. Recorded
+                // on the ground rather than on screen, so the box is in world metres and
+                // does not change shape when the camera moves mid-drag.
+                if self.tool == Tool::Water {
+                    if self.input.sculpting && self.water_drag_start.is_none() {
+                        self.water_drag_start = Some(c);
+                    }
+                    self.water_drag_preview = self.water_drag_start.map(|a| (a, c));
+                }
+
                 if self.input.sculpting && self.tool == Tool::Foliage {
                     let flow = (self.paint_flow * dt).clamp(0.0, 1.0);
                     self.pending_foliage = Some((c, flow));
@@ -1613,9 +2258,50 @@ impl App {
                 }
             }
         }
+        // Released: commit the rectangle. Done here rather than in the branch above,
+        // because that branch only runs while the cursor is over the ground and a drag
+        // can legitimately end with the pointer off it.
+        if self.tool == Tool::Water
+            && !self.input.sculpting
+            && let Some(start) = self.water_drag_start.take()
+        {
+            self.water_drag_preview = None;
+            if let Some(end) = self.brush_hit.or(self.last_brush_hit) {
+                // The level a new body starts at: the ground under the middle of the
+                // drag, so water appears immediately rather than needing the slider found
+                // before anything is visible. Plus a little, or a basin whose centre is
+                // its lowest point comes out with a surface exactly at the mud.
+                let mid = (start + end) * 0.5;
+                // `world` is already borrowed in this scope, so the terrain is read
+                // through it rather than through `self`.
+                let level = world.terrain.height_at(mid.x, mid.y) + 2.0;
+                let r = terra_render::water::WaterRegion::from_drag(
+                    [start.x, start.y],
+                    [end.x, end.y],
+                    level,
+                );
+                if r.is_usable() {
+                    if self.water.regions.len() < terra_render::water::MAX_REGIONS {
+                        self.water.regions.push(r);
+                        self.selected_water = Some(self.water.regions.len() - 1);
+                        self.unsaved = true;
+                    } else {
+                        self.notice = Some((
+                            format!(
+                                "At the limit of {} water bodies. Delete one first.",
+                                terra_render::water::MAX_REGIONS
+                            ),
+                            true,
+                        ));
+                    }
+                }
+            }
+        }
+
         self.last_brush_hit = if self.input.sculpting { self.brush_hit } else { None };
         world.terrain.set_brush(&gfx.ctx.queue, self.brush_hit, self.brush_radius);
-        world.terrain.upload_camera(&gfx.ctx.queue, &world.camera, aspect);
+        let lights = gfx.lighting.cascade_frusta();
+        world.terrain.upload_camera_culled(&gfx.ctx.queue, &world.camera, aspect, &lights);
 
         // Consume the click regardless of whether anything used it, or one
         // press would keep firing every frame.
@@ -1720,6 +2406,12 @@ impl App {
                     })
                 });
 
+                // Built here because it reads across the whole of `self`, and the
+                // borrows below take `gfx` mutably. Same reasoning as the note on
+                // `species_rules`, one step earlier.
+                let outliner = self.outliner_items();
+                let outliner_selection = self.outliner_selection();
+
                 // Copied out and written back: the pane needs `&mut` on one
                 // layer's params while the palette above it holds `gfx` shared.
                 let mut material_params = self
@@ -1728,15 +2420,24 @@ impl App {
                     .and_then(|g| g.materials.params.get(self.selected_material).copied());
                 let material_meta = self.gfx.as_ref().and_then(|g| {
                     let l = g.materials.layers.get(self.selected_material)?;
-                    Some((l.name.clone(), terra_render::material::role_label(l.role)))
+                    Some((
+                        l.name.clone(),
+                        terra_render::material::role_label(l.role),
+                        l.role,
+                        l.auto_role,
+                    ))
                 });
                 let material = match (material_meta.as_ref(), material_params.as_mut()) {
-                    (Some((name, role)), Some(params)) => Some(ui::MaterialView {
-                        name,
-                        role,
-                        texture: self.swatches.get(self.selected_material),
-                        params,
-                    }),
+                    (Some((name, role, role_id, auto_role)), Some(params)) => {
+                        Some(ui::MaterialView {
+                            name,
+                            role,
+                            texture: self.swatches.get(self.selected_material),
+                            params,
+                            role_id: *role_id,
+                            auto_role: *auto_role,
+                        })
+                    }
                     _ => None,
                 };
 
@@ -1805,11 +2506,16 @@ impl App {
                         inspector_open: &mut self.inspector_open,
                         sky: &mut sky_settings,
                         env: &mut self.env,
+                        water: &mut self.water,
+                        selected_water: &mut self.selected_water,
+                        outliner: &outliner,
+                        outliner_selection,
                         active_road,
                         road_count,
                         modifiers: &mut self.modifiers,
                         selected_modifier: &mut self.selected_modifier,
                         content: &content,
+                        notice: self.notice.as_ref(),
                         noise: &mut self.noise,
                         noise_library: &self.noise_library,
                         viewport_rect: &mut self.viewport_rect,
@@ -1867,11 +2573,15 @@ impl App {
                         self.selected_material = i;
                         self.layout.focus(crate::dock::Tab::Material);
                     }
+                    EditorAction::SetMaterialRole(role) => self.set_material_role(role),
+                    EditorAction::SelectOutliner(kind, i) => self.select_outliner(kind, i),
+                    EditorAction::RemoveOutliner(kind, i) => self.remove_outliner(kind, i),
                     EditorAction::PaintWithSelectedMaterial => {
                         self.paint_layer = self.selected_material as u32;
                         self.tool = Tool::Paint;
                     }
                     EditorAction::ImportAsset(k) => self.import_asset(k),
+                    EditorAction::RefreshAssets => self.rescan_assets(),
                     EditorAction::SelectNoise(name) => self.select_noise(&name),
                     EditorAction::AddTunnel => self.add_tunnel(),
                     EditorAction::DeleteModifier(i) => {
@@ -2000,7 +2710,13 @@ impl App {
             Screen::Menu(pane) => {
                 let action = match pane {
                     Pane::Home => ui::home(ui, self.library.projects.len()),
-                    Pane::Worlds => ui::worlds(ui, &self.library),
+                    Pane::Worlds => ui::worlds(
+                        ui,
+                        &self.library,
+                        self.pending_delete
+                            .as_ref()
+                            .map(|e| ui::DeleteTarget { name: &e.name, path: &e.path }),
+                    ),
                     Pane::Create => ui::create(ui, &mut self.form),
                     Pane::Settings => ui::settings(
                         ui,
@@ -2041,6 +2757,13 @@ impl App {
                         self.library.forget(&path);
                         let _ = self.library.save();
                     }
+                    Action::AskDelete(path) => {
+                        // Only opens the confirmation. Nothing is touched here.
+                        self.pending_delete =
+                            self.library.projects.iter().find(|e| e.path == path).cloned();
+                    }
+                    Action::CancelDelete => self.pending_delete = None,
+                    Action::Delete { path, files } => self.delete_world(&path, files),
                 }
             }
         }
@@ -2181,6 +2904,21 @@ impl App {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
+        // Water patch selection and uniforms, before the pass that draws them. Uses the
+        // camera the scene is actually rendered from, so the LOD is centred on the view
+        // rather than on the editor camera while driving.
+        {
+            let cam = match (self.screen, self.play.as_ref(), self.world.as_ref()) {
+                (Screen::Editor, Some(p), _) => Some(p.camera.clone()),
+                (Screen::Editor, None, Some(w)) => Some(w.camera.clone()),
+                _ => None,
+            };
+            let (water, aspect, time) = (self.water.clone(), gfx.ctx.aspect(), self.time);
+            if let (Some(cam), Some(w)) = (cam, self.world.as_mut()) {
+                w.water.prepare(&gfx.ctx.queue, &water, &cam, aspect, time);
+            }
+        }
+
         // The depth buffer still holds the previous frame at this point, which
         // is exactly what the pyramid is built from -- reading this frame's
         // instead would mean a read-back and a stall. One frame of staleness is
@@ -2195,7 +2933,7 @@ impl App {
                 Some(p) => &p.camera,
                 None => &w.camera,
             };
-            gfx.scatter.cull(&mut encoder, &gfx.ctx.queue, cam, gfx.ctx.aspect());
+            gfx.scatter.cull(&mut encoder, &gfx.ctx.queue, cam, gfx.ctx.aspect(), &gfx.hiz);
         }
 
         // Fog needs the shadow cascades, so it is built after them and before
@@ -2355,6 +3093,16 @@ impl App {
                         );
                     }
                 }
+            }
+
+            // Water is the last draw in the pass, and has to be: it is the only blended
+            // pipeline here, so everything that can be seen through it must already be
+            // in the colour buffer. Drawn before the vehicle, a submerged car would be
+            // painted over the surface instead of appearing beneath it.
+            if let (Screen::Editor, Some(w)) = (self.screen, self.world.as_ref())
+                && !view_mode.is_wireframe()
+            {
+                w.water.draw(&mut pass, &gfx.lighting, &gfx.env_gpu);
             }
         }
 
@@ -2576,11 +3324,15 @@ impl ApplicationHandler for App {
         let t_mat = Instant::now();
         let materials = Materials::load(&ctx.device, &ctx.queue, &shared_texture_dir());
         log::info!("materials baked in {:.0} ms", t_mat.elapsed().as_secs_f32() * 1000.0);
+        // Before the scatter, which needs its bind group layout: the cull pass tests
+        // instances against the pyramid.
+        let hiz = HiZ::new(&ctx);
         let t_models = Instant::now();
         // Empty at startup: the palette belongs to a project, and none is open yet.
         // `reload_species` fills it from the project's own `assets/models` when a world
         // opens, which is the only place a user's meshes can come from.
-        let scatter = Scatter::load(&ctx.device, &ctx.queue, &meshes, &empty_dir());
+        let scatter =
+            Scatter::load(&ctx.device, &ctx.queue, &meshes, &empty_dir(), hiz.cull_layout());
         log::info!("models loaded in {:.0} ms", t_models.elapsed().as_secs_f32() * 1000.0);
         let mut post = Post::new(&ctx);
         let taa = Taa::new(&ctx);
@@ -2593,7 +3345,6 @@ impl ApplicationHandler for App {
             terra_gen::heightfield::generate(backdrop.resolution(), backdrop.extent_m(), &params);
         backdrop.set_heights(&ctx.queue, heights);
 
-        let hiz = HiZ::new(&ctx);
         let gfx = Gfx {
             ctx,
             sky,
@@ -2670,7 +3421,11 @@ impl ApplicationHandler for App {
                 self.input.cursor = (position.x as f32, position.y as f32);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if !consumed {
+                // `consumed` alone is not enough: egui reports a wheel over a scroll area
+                // as consumed only in some cases, so a notch over a settings list reached
+                // the camera and zoomed the terrain. The viewport owns the wheel, and
+                // only inside its own bounds.
+                if !consumed && self.cursor_in_viewport() {
                     // A wheel notch and a trackpad's pixel scroll are wildly
                     // different magnitudes; normalise to notches so zooming
                     // feels the same on both.
@@ -2682,11 +3437,16 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
+                // Gated on the *press* only. A release always releases, and a drag begun
+                // inside the viewport has to survive the pointer wandering onto a panel --
+                // which is exactly what happens when you orbit past the edge.
+                let start = !consumed && self.cursor_in_viewport();
                 match button {
-                    MouseButton::Right => self.input.looking = down,
-                    MouseButton::Middle if !consumed => self.input.panning = down,
+                    MouseButton::Right if start || !down => self.input.looking = down,
+                    MouseButton::Right => {}
+                    MouseButton::Middle if start => self.input.panning = down,
                     MouseButton::Middle => self.input.panning = false,
-                    MouseButton::Left if !consumed => {
+                    MouseButton::Left if start => {
                         // In the Camera tool the left button drives the view,
                         // never the brush.
                         if self.tool.edits() {
@@ -2719,6 +3479,10 @@ impl ApplicationHandler for App {
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.input.boost = down,
                         KeyCode::ControlLeft | KeyCode::ControlRight => self.input.invert = down,
                         KeyCode::AltLeft | KeyCode::AltRight => self.input.alt = down,
+                        // Recover the car. Only while driving, and only on the press
+                        // -- a held R must not reset every frame, which would pin the
+                        // car in the air.
+                        KeyCode::KeyR if down && self.play.is_some() => self.reset_car(),
                         // Frame the world, as F does in every DCC tool. The hard
                         // recovery: the wheel is geometric, so a few seconds of
                         // scrolling out puts the camera far enough away that
@@ -2880,8 +3644,15 @@ impl ApplicationHandler for App {
     }
 
     fn device_event(&mut self, _e: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        // Raw relative motion, so it is independent of where the pointer is and keeps
+        // working once the cursor is locked. While driving it is accepted with no
+        // button held at all: the chase camera is mouse-aimed, as in GTA, and needing
+        // to hold a button to look around while steering is not playable.
         if let DeviceEvent::MouseMotion { delta } = event
-            && (self.input.looking || self.input.panning || self.input.orbiting)
+            && (self.input.looking
+                || self.input.panning
+                || self.input.orbiting
+                || self.play.is_some())
         {
             self.input.look_delta.0 += delta.0 as f32;
             self.input.look_delta.1 += delta.1 as f32;
@@ -2956,6 +3727,21 @@ fn interpolate(a: Pose, b: Pose, t: f32) -> Pose {
 ///
 /// The wheel mesh lies along X, so roll is about X and steering about Y, both
 /// applied inside the chassis frame.
+/// `a` folded into `-pi..=pi`.
+///
+/// Used to recentre the chase camera the short way round. Without it, a camera
+/// 179 degrees from centre takes the long route through a full turn.
+fn wrap_angle(a: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let mut x = a % TAU;
+    if x > PI {
+        x -= TAU;
+    } else if x < -PI {
+        x += TAU;
+    }
+    x
+}
+
 fn wheel_poses(car: &Vehicle, chassis_rotation: Quat) -> Vec<Pose> {
     car.wheel_poses()
         .into_iter()
@@ -2997,6 +3783,38 @@ const PLACEHOLDER_VEHICLE: terra_core::VehicleDims = terra_core::VehicleDims {
     rear_axle_z: -1.65,
     mass_kg: VEHICLE_MASS_KG,
 };
+
+/// Radians of camera rotation per pixel of mouse movement while driving.
+///
+/// The editor camera's own sensitivity is applied inside `Camera::rotate`; this
+/// path sets the angles directly, so it needs its own figure. Matched to the
+/// editor's by eye so switching between driving and editing does not feel like
+/// two different mice.
+const DRIVE_LOOK_SENSITIVITY: f32 = 0.0035;
+
+/// Elevation limits for the chase camera, radians. Positive looks down at the car.
+///
+/// Not symmetric: there is more to see from above than from underneath, and the
+/// upper bound stops short of straight down, where the view basis degenerates --
+/// `Camera::right` is a cross product with world up, which is zero-length when the
+/// forward vector is parallel to it.
+const DRIVE_PITCH_MIN: f32 = -0.25;
+const DRIVE_PITCH_MAX: f32 = 1.25;
+
+/// How far the wheel may pull the chase camera in and out, as a multiplier.
+const DRIVE_ZOOM_MIN: f32 = 0.45;
+const DRIVE_ZOOM_MAX: f32 = 3.0;
+
+// Checked here rather than in a test, because both sides are constants and a bad
+// pair should not compile. At exactly vertical the view basis degenerates:
+// `Camera::right` is a cross product with world up, zero-length when forward is
+// parallel to it, and the NaN spreads through the whole view matrix.
+const _: () = assert!(DRIVE_PITCH_MAX < terra_render::camera::PITCH_LIMIT);
+const _: () = assert!(DRIVE_PITCH_MIN > -terra_render::camera::PITCH_LIMIT);
+// Neither zoom end may collapse the follow distance to nothing or push the car to a
+// dot: the distance is this multiplied by roughly two vehicle lengths.
+const _: () = assert!(DRIVE_ZOOM_MIN > 0.0 && DRIVE_ZOOM_MIN < 1.0);
+const _: () = assert!(DRIVE_ZOOM_MAX > 1.0 && DRIVE_ZOOM_MAX <= 4.0);
 
 /// Kerb mass of the player's vehicle, in kilograms.
 ///
@@ -3073,6 +3891,93 @@ fn unique_path(dir: &std::path::Path, name: &std::ffi::OsStr) -> std::path::Path
     first
 }
 
+/// Read a headerless little-endian `u16` map, down to 8-bit grey.
+///
+/// `.r16` carries no dimensions, so the side length is derived from the file
+/// length and has to come out square -- which every `.r16` Terra writes is, and
+/// which World Machine and Gaea also export. Anything else is rejected with the
+/// size it would have needed, because "not square" is not something the user can
+/// act on without knowing what was expected.
+fn read_r16_square(path: &std::path::Path) -> Result<(u32, u32, Vec<u8>), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() % 2 != 0 || bytes.is_empty() {
+        return Err(format!("{} bytes is not a whole number of 16-bit samples", bytes.len()));
+    }
+    let samples = bytes.len() / 2;
+    let n = (samples as f64).sqrt().round() as usize;
+    if n * n != samples {
+        return Err(format!(
+            "{samples} samples is not square -- an r16 map has to be N by N (nearest is {n}x{n})"
+        ));
+    }
+    // Down to 8 bits because the Noise brush samples an 8-bit pattern. The extra
+    // 8 bits describe height steps far below what a displacement brush resolves.
+    let gray =
+        bytes.chunks_exact(2).map(|c| (u16::from_le_bytes([c[0], c[1]]) >> 8) as u8).collect();
+    Ok((n as u32, n as u32, gray))
+}
+
+/// One line describing what an import did, and whether to show it as a failure.
+///
+/// A pure function of the outcome so the wording is testable without a file
+/// dialog. Rejections are named individually rather than counted: "1 folder
+/// skipped" tells the user nothing they can act on, and the reason is the whole
+/// value of the message.
+fn import_summary(
+    installed: &[String],
+    rejected: &[(String, String)],
+    incomplete: &[(String, Vec<&'static str>)],
+    unreadable: &[(String, Vec<String>)],
+) -> (String, bool) {
+    let mut ok = match installed.len() {
+        0 => String::new(),
+        1 => format!("Imported {}.", installed[0]),
+        n => format!("Imported {n} materials: {}.", installed.join(", ")),
+    };
+    // Named individually and with the maps they lack, because "incomplete" on its own
+    // is not actionable and the consequence is severe: a set with no normal map has no
+    // relief for the light to catch and renders as a photograph laid over the ground,
+    // which is easy to mistake for the renderer being broken.
+    if !incomplete.is_empty() {
+        let each: Vec<String> =
+            incomplete.iter().map(|(n, m)| format!("{n} has no {}", m.join(" or "))).collect();
+        ok.push_str(&format!(
+            " {} -- flat defaults are used, so download the missing maps for real relief.",
+            each.join("; ")
+        ));
+    }
+    // Named with the file, because the fix is to convert something they already have
+    // rather than to go and download it again.
+    if !unreadable.is_empty() {
+        let each: Vec<String> = unreadable
+            .iter()
+            .map(|(n, files)| format!("{n} could not read {}", files.join(", ")))
+            .collect();
+        ok.push_str(&format!(
+            " {} -- convert those to PNG. Readable formats are {}.",
+            each.join("; "),
+            terra_render::texture_set::MAP_EXTENSIONS.join(", ")
+        ));
+    }
+    if rejected.is_empty() {
+        return match installed.is_empty() {
+            // Reachable when a picked folder holds only empty subfolders.
+            true => ("Nothing imported -- no material folders found.".to_string(), true),
+            false => (ok, false),
+        };
+    }
+    let why: Vec<String> =
+        rejected.iter().map(|(name, reason)| format!("{name}: {reason}")).collect();
+    let skipped = format!("Skipped {} -- {}", rejected.len(), why.join("; "));
+    match installed.is_empty() {
+        true => (skipped, true),
+        // A partial success is still a success: the palette changed, so it must
+        // not read as an error, but the skipped folder has to be named or the
+        // user is left counting swatches to notice it is missing.
+        false => (format!("{ok} {skipped}"), false),
+    }
+}
+
 fn unique_folder(parent: &std::path::Path, name: &str) -> String {
     let base = sanitize(name);
     if !parent.join(&base).exists() {
@@ -3085,11 +3990,128 @@ fn unique_folder(parent: &std::path::Path, name: &str) -> String {
 mod tests {
     use super::*;
 
+    // --- chase camera ---
+
+    /// Where the chase camera sits, given the orbit angles and a distance. Mirrors
+    /// the expression in `update_play`.
+    fn chase_offset(yaw: f32, pitch: f32) -> Vec3 {
+        let (sy, cy) = yaw.sin_cos();
+        let (sp, cp) = pitch.sin_cos();
+        Vec3::new(cy * cp, sp, sy * cp)
+    }
+
+    #[test]
+    fn the_camera_starts_behind_the_car() {
+        // `heading + pi` has to put the camera on the far side of the car from the way
+        // it is pointing. Getting this backwards is what previously had the camera
+        // looking at the bonnet, and it is also what makes steering *look* inverted:
+        // seen head-on, a left turn goes right.
+        for heading in [0.0f32, 0.9, -2.2, 3.0] {
+            let forward = Vec3::new(heading.cos(), 0.0, heading.sin());
+            let offset = chase_offset(heading + std::f32::consts::PI, 0.0);
+            assert!(
+                offset.dot(forward) < -0.99,
+                "at heading {heading} the camera sat {:.2} along forward, not behind it",
+                offset.dot(forward)
+            );
+        }
+    }
+
+    #[test]
+    fn a_positive_camera_pitch_lifts_it_above_the_car() {
+        assert!(chase_offset(0.0, 0.5).y > 0.0);
+        assert!(chase_offset(0.0, -0.2).y < 0.0);
+    }
+
+    #[test]
+    fn wrap_angle_takes_the_short_way_round() {
+        use std::f32::consts::PI;
+        // The case it exists for: nearly a full turn one way is a hair the other.
+        assert!((wrap_angle(2.0 * PI - 0.1) + 0.1).abs() < 1e-4);
+        assert!((wrap_angle(-2.0 * PI + 0.1) - 0.1).abs() < 1e-4);
+        for a in [0.0f32, 1.0, -1.0, PI - 0.01, -PI + 0.01] {
+            assert!((wrap_angle(a) - a).abs() < 1e-4, "{a} should be unchanged");
+        }
+        // Everything lands inside the half-open turn.
+        for k in -8..8 {
+            let a = k as f32 * 1.7;
+            assert!(wrap_angle(a).abs() <= PI + 1e-4, "{a} wrapped to {}", wrap_angle(a));
+        }
+    }
+
+    #[test]
+    fn recentring_converges_on_the_heading_from_either_side() {
+        // The recentre is a lerp along the wrapped delta, so it must approach from
+        // whichever side is closer and not orbit the long way.
+        let behind = 1.0f32;
+        for start in [behind + 3.0, behind - 3.0, behind + 0.2] {
+            let mut yaw = start;
+            for _ in 0..200 {
+                yaw += wrap_angle(behind - yaw) * 0.1;
+            }
+            assert!(
+                wrap_angle(behind - yaw).abs() < 1e-2,
+                "from {start} it settled at {yaw}, wanted {behind}"
+            );
+        }
+    }
+
     #[test]
     fn sanitize_produces_usable_folder_names() {
         assert_eq!(sanitize("Desert Rally"), "Desert_Rally");
         assert_eq!(sanitize("../../etc"), "etc");
         assert_eq!(sanitize("!!!"), "world");
+    }
+
+    // --- import feedback ------------------------------------------------------
+    //
+    // The import used to say nothing at all, in the one case where saying
+    // nothing was indistinguishable from working: files landed on disk and no
+    // material appeared. These assert the message exists and is actionable.
+
+    #[test]
+    fn a_successful_import_names_what_arrived() {
+        let (msg, err) = import_summary(&["Ground024".into()], &[], &[], &[]);
+        assert_eq!(msg, "Imported Ground024.");
+        assert!(!err);
+    }
+
+    #[test]
+    fn importing_several_materials_counts_and_lists_them() {
+        let (msg, err) = import_summary(&["Grass001".into(), "Rock042".into()], &[], &[], &[]);
+        assert!(msg.contains("2 materials"), "{msg}");
+        assert!(msg.contains("Grass001") && msg.contains("Rock042"), "{msg}");
+        assert!(!err);
+    }
+
+    #[test]
+    fn a_rejected_import_is_an_error_and_gives_the_reason() {
+        let rejected = vec![("Screenshots".to_string(), "no colour map found".to_string())];
+        let (msg, err) = import_summary(&[], &rejected, &[], &[]);
+        assert!(err, "a wholly failed import must not read as success");
+        assert!(msg.contains("Screenshots"), "the folder has to be named: {msg}");
+        assert!(msg.contains("no colour map found"), "the reason is the point: {msg}");
+    }
+
+    #[test]
+    fn a_partial_import_reports_both_halves_and_is_not_an_error() {
+        // The palette did change, so flagging it red would be wrong -- but the
+        // skipped folder still has to be named, or the only clue is a missing
+        // swatch the user has to notice by counting.
+        let rejected = vec![("Notes".to_string(), "no colour map found".to_string())];
+        let (msg, err) = import_summary(&["Grass001".into()], &rejected, &[], &[]);
+        assert!(!err, "a partial success is a success: {msg}");
+        assert!(msg.contains("Grass001"), "{msg}");
+        assert!(msg.contains("Notes"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_import_still_says_something() {
+        // Reachable when a picked folder holds only empty subfolders. Silence
+        // here is the original bug.
+        let (msg, err) = import_summary(&[], &[], &[], &[]);
+        assert!(err);
+        assert!(!msg.is_empty());
     }
 
     #[test]
@@ -3354,5 +4376,111 @@ mod camera_scale_tests {
             assert!(m >= prev - 1e-6, "speed fell as distance grew");
             prev = m;
         }
+    }
+}
+
+#[cfg(test)]
+mod r16_tests {
+    use super::read_r16_square;
+
+    fn write(bytes: &[u8], tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("terra-r16-{tag}.r16"));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_square_r16_map_is_read_and_reduced_to_eight_bits() {
+        // 4x4 of u16, ascending. The dialog offers `.r16` and `image::open`
+        // cannot sniff a headerless format, so this path is the only thing that
+        // makes the advertised option work.
+        let mut bytes = Vec::new();
+        for i in 0u16..16 {
+            bytes.extend_from_slice(&(i * 4096).to_le_bytes());
+        }
+        let p = write(&bytes, "ok");
+        let (w, h, gray) = read_r16_square(&p).expect("square map");
+        assert_eq!((w, h), (4, 4));
+        assert_eq!(gray.len(), 16);
+        // 4096 >> 8 = 16, so the ramp survives as a byte ramp.
+        assert_eq!(gray[0], 0);
+        assert_eq!(gray[1], 16);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn a_non_square_r16_map_says_what_size_was_expected() {
+        // 6 samples. "Not square" is useless on its own -- the message has to
+        // name the size it wanted or there is nothing to act on.
+        let bytes = vec![0u8; 12];
+        let p = write(&bytes, "oblong");
+        let err = read_r16_square(&p).expect_err("6 samples is not square");
+        assert!(err.contains("not square"), "{err}");
+        assert!(err.contains("2x2"), "the nearest square has to be named: {err}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn an_odd_byte_count_is_rejected_rather_than_truncated() {
+        let p = write(&[0u8; 7], "odd");
+        let err = read_r16_square(&p).expect_err("7 bytes is not whole samples");
+        assert!(err.contains("16-bit"), "{err}");
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[cfg(test)]
+mod viewport_gate_tests {
+    use super::App;
+    use egui::{Rect, pos2};
+
+    /// A viewport occupying the middle of a 1600x1000 point layout: tools on the left,
+    /// details on the right, content along the bottom. Roughly the default dock.
+    fn viewport() -> Rect {
+        Rect::from_min_max(pos2(256.0, 60.0), pos2(1200.0, 740.0))
+    }
+
+    #[test]
+    fn a_cursor_over_the_viewport_is_inside() {
+        assert!(App::point_in_rect((700.0, 400.0), viewport(), 1.0));
+    }
+
+    #[test]
+    fn a_cursor_over_a_side_panel_is_outside() {
+        // The bug: a wheel notch here zoomed the terrain while scrolling the settings.
+        assert!(!App::point_in_rect((80.0, 400.0), viewport(), 1.0), "left panel");
+        assert!(!App::point_in_rect((1400.0, 400.0), viewport(), 1.0), "right panel");
+        assert!(!App::point_in_rect((700.0, 900.0), viewport(), 1.0), "content browser");
+        assert!(!App::point_in_rect((700.0, 20.0), viewport(), 1.0), "toolbar");
+    }
+
+    #[test]
+    fn the_scale_factor_is_applied() {
+        // On a 2x display a cursor at physical (1400, 800) is at logical (700, 400) --
+        // inside the viewport. Ignoring the scale factor would place it at (1400, 800),
+        // outside, and the viewport would be dead over most of its own area.
+        let r = viewport();
+        assert!(App::point_in_rect((1400.0, 800.0), r, 2.0), "a 2x cursor was rejected");
+        assert!(!App::point_in_rect((1400.0, 800.0), r, 1.0), "at 1x the same pixel is outside");
+    }
+
+    #[test]
+    fn a_nonsense_scale_factor_does_not_kill_the_viewport() {
+        // A dead viewport is worse than a leaky one, so an impossible scale factor errs
+        // towards letting input through.
+        assert!(App::point_in_rect((80.0, 400.0), viewport(), 0.0));
+        assert!(App::point_in_rect((80.0, 400.0), viewport(), -1.0));
+    }
+
+    #[test]
+    fn the_boundary_belongs_to_the_viewport() {
+        // `Rect::contains` is inclusive, so the edge pixel is inside. Either answer is
+        // defensible; what matters is that it is not undefined between the two tests that
+        // read it.
+        let r = viewport();
+        assert!(App::point_in_rect((256.0, 60.0), r, 1.0), "the min corner");
+        assert!(App::point_in_rect((1200.0, 740.0), r, 1.0), "the max corner");
+        assert!(!App::point_in_rect((255.0, 400.0), r, 1.0), "one point left of it");
+        assert!(!App::point_in_rect((1201.0, 400.0), r, 1.0), "one point right of it");
     }
 }

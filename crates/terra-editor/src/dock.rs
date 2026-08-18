@@ -38,6 +38,8 @@ pub enum Tab {
     Material,
     /// The Environment Light Mixer: sun, sky, fog, clouds, tone mapping.
     Environment,
+    /// Everything placed in the world, as one list. Unreal's Scene Outliner.
+    Outliner,
 }
 
 impl Tab {
@@ -45,8 +47,15 @@ impl Tab {
     ///
     /// Excludes [`Tab::Viewport`], which is not optional: closing it would
     /// leave the editor with nowhere to show the world.
-    pub const DOCKABLE: [Tab; 6] =
-        [Tab::Tools, Tab::Inspector, Tab::Environment, Tab::Content, Tab::Modifiers, Tab::Material];
+    pub const DOCKABLE: [Tab; 7] = [
+        Tab::Tools,
+        Tab::Inspector,
+        Tab::Environment,
+        Tab::Outliner,
+        Tab::Content,
+        Tab::Modifiers,
+        Tab::Material,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -57,6 +66,7 @@ impl Tab {
             Tab::Modifiers => "Modifiers",
             Tab::Material => "Material",
             Tab::Environment => "Environment",
+            Tab::Outliner => "Outliner",
         }
     }
 
@@ -104,7 +114,11 @@ impl Layout {
         // Old node comes first here, so 0.75 is the viewport's share.
         // Environment is tabbed with Details on the right, which is where the
         // request put it: "shown in right panel then from there we can adjust it".
-        let [_, details] = surface.split_right(main, 0.75, vec![Tab::Inspector, Tab::Environment]);
+        // Outliner tabbed alongside Details and Environment: it is the third "what is in
+        // this world" pane and only one of the three is wanted at a time. Unreal keeps its
+        // outliner and details stacked on the right for the same reason.
+        let [_, details] =
+            surface.split_right(main, 0.75, vec![Tab::Inspector, Tab::Environment, Tab::Outliner]);
         // Modifiers and Material share a leaf: both are "the thing you selected",
         // only one is relevant at a time, and two more permanent panes would
         // leave the viewport a letterbox.
@@ -197,7 +211,7 @@ mod tests {
     /// The viewport plus every dockable pane. One list, so adding a pane to the
     /// enum and forgetting the default layout fails here rather than silently
     /// shipping a pane nobody can reach.
-    const ALL_PANES: [Tab; 7] = [
+    const ALL_PANES: [Tab; 8] = [
         Tab::Viewport,
         Tab::Tools,
         Tab::Inspector,
@@ -205,6 +219,7 @@ mod tests {
         Tab::Content,
         Tab::Modifiers,
         Tab::Material,
+        Tab::Outliner,
     ];
 
     #[test]
@@ -220,7 +235,9 @@ mod tests {
     fn default_layout_has_every_pane_exactly_once() {
         let l = Layout::new();
         let open = l.open_tabs();
-        assert_eq!(open.len(), 7, "expected 7 panes, got {open:?}");
+        // Derived from `ALL_PANES` rather than written out, so adding a pane does not
+        // fail a test that has nothing to say about it.
+        assert_eq!(open.len(), ALL_PANES.len(), "expected {} panes, got {open:?}", ALL_PANES.len());
         for t in ALL_PANES {
             assert_eq!(
                 open.iter().filter(|o| **o == t).count(),
@@ -290,7 +307,7 @@ mod tests {
         l.close(Tab::Content);
         l.float(Tab::Inspector);
         l.reset();
-        assert_eq!(l.open_tabs().len(), 7);
+        assert_eq!(l.open_tabs().len(), ALL_PANES.len());
         for t in Tab::DOCKABLE {
             assert!(l.is_open(t), "{t:?} missing after reset");
         }

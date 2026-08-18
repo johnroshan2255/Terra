@@ -26,6 +26,7 @@
 //! the patch's nearest point, not its centre. Using the centre makes a large patch
 //! straddling the boundary pick a level that is wrong for half of itself.
 
+use crate::frustum::{Frustum, FrustumUnion};
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
 
@@ -212,8 +213,17 @@ pub struct Cdlod {
     levels: u32,
     /// Camera distance the finest level reaches to, in metres.
     near_range: f32,
-    /// Selected patches, rebuilt each frame.
+    /// Selected patches for the colour pass, rebuilt each frame.
     patches: Vec<Patch>,
+    /// Selected patches for the shadow passes.
+    ///
+    /// A separate set, because the two are culled against different volumes: the colour
+    /// pass wants what the camera can see, the shadow passes want what the *light* can
+    /// see -- a ridge behind the camera still casts into the view. Both are descended
+    /// with the same camera position, so the morph is identical and the overlapping
+    /// patches are bit-for-bit the same. That matters: a caster morphed from a different
+    /// eye than the surface it shades puts a band of acne along every level boundary.
+    shadow_patches: Vec<Patch>,
     /// Highest patch count seen, so the buffer is grown rather than reallocated
     /// every frame.
     capacity: usize,
@@ -240,6 +250,7 @@ impl Cdlod {
             levels,
             near_range: finest_patch * RANGE_IN_PATCHES,
             patches: Vec::new(),
+            shadow_patches: Vec::new(),
             capacity: 0,
         }
     }
@@ -294,32 +305,91 @@ impl Cdlod {
     ///
     /// `height_range` is the terrain's own min/max, which only matters when the
     /// camera is above or below all of it -- see [`vertical_gap`].
+    /// Select patches with no visibility culling. Kept for callers -- and tests -- that
+    /// want the whole quadtree.
     pub fn select(&mut self, eye: Vec3, height_range: (f32, f32), world_extent_m: f32) -> &[Patch] {
+        self.select_culled(eye, height_range, world_extent_m, None, &FrustumUnion::default());
+        &self.patches
+    }
+
+    /// Select both patch sets: the colour pass's, culled against `camera`, and the shadow
+    /// passes', culled against `lights`.
+    ///
+    /// Passing `None` for the camera frustum culls nothing, which is the safe reading of
+    /// "the caller has not said where it is looking".
+    ///
+    /// Both sets are descended from the same eye, so a patch appearing in both is
+    /// identical in both -- the morph is a function of the eye alone. Culling only ever
+    /// *removes* patches, and CDLOD's crack-freeness comes from the morph rather than from
+    /// a patch's neighbours being present, so a culled set has no seams.
+    pub fn select_culled(
+        &mut self,
+        eye: Vec3,
+        height_range: (f32, f32),
+        world_extent_m: f32,
+        camera: Option<&Frustum>,
+        lights: &FrustumUnion,
+    ) {
         self.patches.clear();
+        self.shadow_patches.clear();
         let half = world_extent_m * 0.5;
         let root =
             Node { origin: Vec2::splat(-half), size: world_extent_m, level: self.levels - 1 };
         let gap = vertical_gap(eye.y, height_range);
-        self.descend(root, Vec2::new(eye.x, eye.z), gap);
-        self.capacity = self.capacity.max(self.patches.len());
+        self.descend(root, Vec2::new(eye.x, eye.z), gap, height_range, camera, lights);
+        self.capacity = self.capacity.max(self.patches.len().max(self.shadow_patches.len()));
         debug_assert!(
-            self.patches.len() <= self.max_patches(),
-            "selected {} patches, past the {} the instance buffer is sized for",
+            self.patches.len() <= self.max_patches()
+                && self.shadow_patches.len() <= self.max_patches(),
+            "selected {}/{} patches, past the {} the instance buffer is sized for",
             self.patches.len(),
+            self.shadow_patches.len(),
             self.max_patches()
         );
         // Release builds clamp rather than overrun the buffer: losing the tail of a
         // selection is a missing patch, overrunning it is a validation failure that
         // kills the frame.
         self.patches.truncate(self.max_patches());
-        &self.patches
+        self.shadow_patches.truncate(self.max_patches());
     }
 
-    fn descend(&mut self, node: Node, cam: Vec2, gap: f32) {
+    /// The world-space box a node occupies.
+    ///
+    /// Y comes from the whole heightfield's range rather than from the node's own, which
+    /// is conservative: a node is kept whenever *any* ground in the world reaches into
+    /// view above it. Tightening this needs a per-node min/max height pyramid, which is
+    /// also what horizon culling would want -- so it is one change, not two.
+    fn node_aabb(node: &Node, height_range: (f32, f32)) -> (Vec3, Vec3) {
+        (
+            Vec3::new(node.origin.x, height_range.0, node.origin.y),
+            Vec3::new(node.origin.x + node.size, height_range.1, node.origin.y + node.size),
+        )
+    }
+
+    fn descend(
+        &mut self,
+        node: Node,
+        cam: Vec2,
+        gap: f32,
+        height_range: (f32, f32),
+        camera: Option<&Frustum>,
+        lights: &FrustumUnion,
+    ) {
+        // Quadtree bounding-volume culling: test the node's box once and, if neither the
+        // camera nor any light can see it, drop the node *and its whole subtree*. A
+        // child's box is contained in its parent's, so this is sound -- and it is what
+        // makes the test cost proportional to what is visible rather than to the tree.
+        let (min, max) = Self::node_aabb(&node, height_range);
+        let in_camera = camera.is_none_or(|f| f.intersects_aabb(min, max));
+        let in_light = lights.intersects_aabb(min, max);
+        if !in_camera && !in_light {
+            return;
+        }
+
         // Finest level, or far enough away that the child level's band does not
         // reach this patch: render it as-is.
         if node.level == 0 || node.distance_to(cam, gap) > self.range(node.level - 1) {
-            self.emit(node);
+            self.emit(node, in_camera, in_light);
             return;
         }
         let half = node.size * 0.5;
@@ -328,25 +398,41 @@ impl Cdlod {
                 Node { origin: node.origin + Vec2::new(ox, oz), size: half, level: node.level - 1 },
                 cam,
                 gap,
+                height_range,
+                camera,
+                lights,
             );
         }
     }
 
-    fn emit(&mut self, node: Node) {
+    fn emit(&mut self, node: Node, in_camera: bool, in_light: bool) {
         let outer = self.range(node.level);
         let inner = if node.level == 0 { 0.0 } else { self.range(node.level - 1) };
         // The morph has to finish by the outer edge of the band, where the next
         // level takes over: at that point this patch's vertices must coincide with
         // the parent's or the seam is a crack.
         let start = inner + (outer - inner) * MORPH_START;
-        self.patches.push(Patch {
+        // One patch, pushed into whichever sets can see it. Built once rather than twice
+        // so the two sets cannot disagree about a patch they share.
+        let patch = Patch {
             origin: node.origin.to_array(),
             size: node.size,
             level: node.level,
             morph_start: start,
             morph_end: outer,
             _pad: [0.0; 2],
-        });
+        };
+        if in_camera {
+            self.patches.push(patch);
+        }
+        if in_light {
+            self.shadow_patches.push(patch);
+        }
+    }
+
+    /// Patches the shadow passes should draw.
+    pub fn shadow_patches(&self) -> &[Patch] {
+        &self.shadow_patches
     }
 
     /// Upper bound on how many patches any camera position can select.
@@ -966,5 +1052,185 @@ mod tests {
         // At 720p over a ~60 degree vertical field, one radian is about 690 px.
         let px = a * 690.0;
         assert!(px < 20.0, "a quad can reach {px} px, which reads as faceting");
+    }
+}
+
+#[cfg(test)]
+mod culling_tests {
+    use super::*;
+    use crate::camera::Camera;
+
+    const EXTENT: f32 = 4096.0;
+    const RANGE: (f32, f32) = (0.0, 900.0);
+
+    fn camera_at(pos: Vec3, yaw: f32) -> Camera {
+        Camera { pos, yaw, pitch: 0.0, ..Camera::default() }
+    }
+
+    fn frustum_of(cam: &Camera) -> Frustum {
+        Frustum::new(&(cam.projection(1.6) * cam.look_at()))
+    }
+
+    /// Patches selected with and without culling, from the same viewpoint.
+    fn counts(cam: &Camera) -> (usize, usize) {
+        let mut c = Cdlod::new(EXTENT, 0.5);
+        let uncut = c.select(cam.pos, RANGE, EXTENT).len();
+        let f = frustum_of(cam);
+        c.select_culled(cam.pos, RANGE, EXTENT, Some(&f), &FrustumUnion::default());
+        (uncut, c.patches().len())
+    }
+
+    #[test]
+    fn culling_removes_a_large_share_of_the_quadtree() {
+        // On a world centred on the camera, roughly half the tree is behind it. Anything
+        // less than a quarter removed would mean the test is not reaching the tree.
+        let cam = camera_at(Vec3::new(0.0, 400.0, 0.0), 0.0);
+        let (uncut, cut) = counts(&cam);
+        assert!(uncut > 0, "nothing was selected at all");
+        assert!(cut < uncut * 3 / 4, "culling kept {cut} of {uncut} patches, which is not culling");
+        assert!(cut > 0, "culling removed everything, so the camera sees no ground");
+    }
+
+    #[test]
+    fn culling_never_drops_a_patch_the_frustum_can_see() {
+        // The property that matters. A cull that is too eager pops geometry out of view,
+        // which a user sees immediately; too lax only costs frame time. So every patch the
+        // unculled selection produced must survive unless its own box is outside.
+        let cam = camera_at(Vec3::new(300.0, 250.0, -700.0), 1.1);
+        let f = frustum_of(&cam);
+
+        let mut c = Cdlod::new(EXTENT, 0.5);
+        let all: Vec<Patch> = c.select(cam.pos, RANGE, EXTENT).to_vec();
+        c.select_culled(cam.pos, RANGE, EXTENT, Some(&f), &FrustumUnion::default());
+        let kept: Vec<Patch> = c.patches().to_vec();
+
+        for p in &all {
+            let min = Vec3::new(p.origin[0], RANGE.0, p.origin[1]);
+            let max = Vec3::new(p.origin[0] + p.size, RANGE.1, p.origin[1] + p.size);
+            if f.intersects_aabb(min, max) {
+                assert!(
+                    kept.iter().any(|k| k.origin == p.origin && k.size == p.size),
+                    "a visible patch at {:?} size {} was culled",
+                    p.origin,
+                    p.size
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_kept_patch_is_identical_to_its_unculled_self() {
+        // Culling must only *remove*. If it changed a patch's level or morph band, the
+        // shading would differ from frame to frame as the camera turned.
+        let cam = camera_at(Vec3::new(-500.0, 300.0, 200.0), 2.4);
+        let mut c = Cdlod::new(EXTENT, 0.5);
+        let all: Vec<Patch> = c.select(cam.pos, RANGE, EXTENT).to_vec();
+        c.select_culled(cam.pos, RANGE, EXTENT, Some(&frustum_of(&cam)), &FrustumUnion::default());
+        for k in c.patches() {
+            let same = all
+                .iter()
+                .find(|p| p.origin == k.origin && p.size == k.size)
+                .expect("a culled selection invented a patch");
+            assert_eq!(same.level, k.level, "level changed under culling");
+            assert_eq!(same.morph_start, k.morph_start, "morph band changed under culling");
+            assert_eq!(same.morph_end, k.morph_end);
+        }
+    }
+
+    #[test]
+    fn no_frustum_means_no_culling() {
+        // The safe reading of "the caller has not said where it is looking".
+        let cam = camera_at(Vec3::new(0.0, 400.0, 0.0), 0.0);
+        let mut c = Cdlod::new(EXTENT, 0.5);
+        let uncut = c.select(cam.pos, RANGE, EXTENT).len();
+        c.select_culled(cam.pos, RANGE, EXTENT, None, &FrustumUnion::default());
+        assert_eq!(c.patches().len(), uncut);
+    }
+
+    #[test]
+    fn the_shadow_set_keeps_casters_the_camera_cannot_see() {
+        // The Phase C fix. A ridge behind the camera casts into the view, so it has to
+        // survive the *camera's* cull -- which is why the shadow set is culled against the
+        // light instead.
+        let cam = camera_at(Vec3::new(0.0, 400.0, 0.0), 0.0);
+        // A "light" looking the opposite way, standing in for a sun behind the camera.
+        let light = camera_at(Vec3::new(0.0, 400.0, 0.0), std::f32::consts::PI);
+        let lights = FrustumUnion::new([frustum_of(&light)]);
+
+        let mut c = Cdlod::new(EXTENT, 0.5);
+        c.select_culled(cam.pos, RANGE, EXTENT, Some(&frustum_of(&cam)), &lights);
+
+        assert!(!c.patches().is_empty(), "the camera set is empty");
+        assert!(!c.shadow_patches().is_empty(), "the shadow set is empty");
+        // The shadow set has to contain something the camera set does not, or the light
+        // frustum is being ignored.
+        let extra = c
+            .shadow_patches()
+            .iter()
+            .any(|s| !c.patches().iter().any(|p| p.origin == s.origin && p.size == s.size));
+        assert!(extra, "the shadow set is a subset of the camera set, so nothing off-screen casts");
+    }
+
+    #[test]
+    fn an_empty_light_union_leaves_the_shadow_set_uncut() {
+        // Shadows off, or cascades not yet fitted: draw every caster rather than none.
+        let cam = camera_at(Vec3::new(0.0, 400.0, 0.0), 0.0);
+        let mut c = Cdlod::new(EXTENT, 0.5);
+        let uncut = c.select(cam.pos, RANGE, EXTENT).len();
+        c.select_culled(cam.pos, RANGE, EXTENT, Some(&frustum_of(&cam)), &FrustumUnion::default());
+        assert_eq!(c.shadow_patches().len(), uncut, "an empty light union culled casters");
+    }
+
+    #[test]
+    fn culling_holds_up_from_every_direction() {
+        // Sweeping the yaw, because a plane-extraction sign error usually shows up at one
+        // orientation and not at the one that was tried by hand.
+        for i in 0..12 {
+            let yaw = i as f32 * std::f32::consts::TAU / 12.0;
+            let cam = camera_at(Vec3::new(120.0, 350.0, -80.0), yaw);
+            let (uncut, cut) = counts(&cam);
+            assert!(cut > 0, "at yaw {yaw} everything was culled");
+            assert!(cut <= uncut, "at yaw {yaw} culling invented patches");
+        }
+    }
+}
+
+#[cfg(test)]
+mod culling_report {
+    use super::*;
+    use crate::camera::Camera;
+
+    /// What culling removes, printed rather than asserted.
+    ///
+    /// `cargo test -p terra-render --lib culling_report -- --ignored --nocapture`
+    ///
+    /// A share rather than a frame time: the saving is in patches submitted, and what that
+    /// is worth depends on the fill cost of the terrain shader on the day.
+    #[test]
+    #[ignore]
+    fn how_much_the_terrain_cull_removes() {
+        println!("world   pitch   patches   culled   kept    saved");
+        for extent in [2048.0f32, 4096.0, 8192.0, 16384.0] {
+            for (label, pitch) in [("level", 0.0f32), ("down", -0.6), ("up", 0.3)] {
+                let cam = Camera {
+                    pos: Vec3::new(0.0, 400.0, 0.0),
+                    yaw: 0.7,
+                    pitch,
+                    ..Camera::default()
+                };
+                let range = (0.0, 900.0);
+                let mut c = Cdlod::new(extent, 0.5);
+                let all = c.select(cam.pos, range, extent).len();
+                let f = Frustum::new(&(cam.projection(1.6) * cam.look_at()));
+                c.select_culled(cam.pos, range, extent, Some(&f), &FrustumUnion::default());
+                let kept = c.patches().len();
+                println!(
+                    "{:>5.0}m  {label:<6} {all:>7}  {:>6}  {kept:>5}   {:>4.0}%",
+                    extent,
+                    all - kept,
+                    100.0 - (kept as f64 / all as f64) * 100.0
+                );
+            }
+        }
     }
 }

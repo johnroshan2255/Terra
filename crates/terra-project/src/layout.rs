@@ -144,6 +144,13 @@ impl ProjectPaths {
         self.edits_dir().join("environment.ron")
     }
 
+    /// Authored water bodies. Under `edits/` for the same reason the environment is:
+    /// a water level and the regions it fills are decisions someone made, and a
+    /// terrain regenerate must not take them away.
+    pub fn water(&self) -> PathBuf {
+        self.edits_dir().join("water.ron")
+    }
+
     /// Authored road splines. Under `edits/` because they are human work and
     /// must survive a terrain regenerate.
     /// Painted material weights. Beside the other masks: it is authored data,
@@ -195,6 +202,32 @@ impl ProjectPaths {
         root.join("project.ron").is_file()
     }
 
+    /// Delete a whole project from disk, irreversibly.
+    ///
+    /// Refuses anything that is not a project. That check is the entire safety
+    /// mechanism here: this is a recursive delete driven by a path from a config
+    /// file, and `world/source/` holds the one irreplaceable file in a project --
+    /// `global_height.r16`, the eroded heightmap, which `README.md` marks
+    /// AUTHORITATIVE. A stale or hand-edited `library.ron` pointing at a home
+    /// directory must not be able to erase it.
+    ///
+    /// Requiring `project.ron` also means a path already gone is an error rather
+    /// than a silent success, which is what the caller needs to know before it
+    /// removes the library entry.
+    pub fn delete_project(root: &Path) -> Result<()> {
+        if !Self::looks_like_project(root) {
+            return Err(ProjectError::NotAProject { path: root.to_path_buf() });
+        }
+        // Belt and braces against a `project.ron` somewhere absurd. A real project
+        // path is a named folder several levels down; anything this shallow is a
+        // mount point or a home directory and is refused whatever it contains.
+        if root.components().count() < 3 {
+            return Err(ProjectError::NotAProject { path: root.to_path_buf() });
+        }
+        std::fs::remove_dir_all(root)
+            .map_err(|e| ProjectError::Io { path: root.to_path_buf(), source: e })
+    }
+
     /// Drop every regenerable byte. Called when terrain parameters change, and
     /// exposed in the editor as "Clear cache".
     pub fn clear_cache(&self) -> Result<()> {
@@ -238,5 +271,71 @@ mod tests {
         assert!(p.tiles_dir().is_dir());
         assert!(p.masks_dir().is_dir());
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("terra-del-{tag}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A folder that passes `looks_like_project`, with something irreplaceable in it.
+    fn project(parent: &Path, name: &str) -> PathBuf {
+        let root = parent.join(name);
+        std::fs::create_dir_all(root.join("world/source")).unwrap();
+        std::fs::write(root.join("project.ron"), b"Project()").unwrap();
+        std::fs::write(root.join("world/source/global_height.r16"), [0u8; 8]).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_project_is_deleted_whole() {
+        let tmp = scratch("ok");
+        let root = project(&tmp, "MyGame");
+        assert!(ProjectPaths::delete_project(&root).is_ok());
+        assert!(!root.exists(), "the folder survived");
+        // The parent is untouched -- only the project goes.
+        assert!(tmp.exists());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_project_is_refused() {
+        // The entire safety mechanism: this is a recursive delete driven by a path out
+        // of a config file, and `world/source/global_height.r16` is the one
+        // irreplaceable file in a project. A stale `library.ron` pointing somewhere
+        // else must not be able to erase it.
+        let tmp = scratch("notaproject");
+        let dir = tmp.join("Documents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("important.txt"), b"keep me").unwrap();
+
+        assert!(ProjectPaths::delete_project(&dir).is_err());
+        assert!(dir.join("important.txt").exists(), "a non-project was deleted");
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn a_path_already_gone_is_an_error_not_a_silent_success() {
+        // The caller needs to tell "deleted" from "was never there" before it drops
+        // the library entry.
+        let tmp = scratch("missing");
+        let gone = tmp.join("NoSuchWorld");
+        assert!(ProjectPaths::delete_project(&gone).is_err());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn a_suspiciously_shallow_path_is_refused_even_with_a_manifest() {
+        // Belt and braces: a real project sits several levels down. Anything this
+        // shallow is a mount point or a home directory whatever it contains.
+        assert!(ProjectPaths::delete_project(Path::new("/")).is_err());
+        assert!(ProjectPaths::delete_project(Path::new("/tmp")).is_err());
     }
 }

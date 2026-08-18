@@ -46,14 +46,35 @@ quadtree it introduces.
 
 ## Phase A — with CDLOD
 
-| Technique | Why here |
+| Technique | State |
 |---|---|
-| **Quadtree bounding-volume culling** | Falls out of CDLOD for free. Each node already carries a min/max height, so its AABB is known without extra work. |
-| **Frustum culling** | Test node AABBs during quadtree descent. Reject a node and its whole subtree goes with it. |
-| **Horizon culling** | Underrated, and specific to heightfields. A ray from the camera along the ground either clears the ridgeline in front or it doesn't; anything below that horizon angle is hidden. Cheap, and in mountain terrain it removes a large fraction of the map. |
-| **Distance culling** | Trivial once nodes are being walked. Mostly subsumed by LOD selection — a node past max range simply never gets a mesh. |
+| **Quadtree bounding-volume culling** | *Done.* `Cdlod::descend` tests each node's AABB and drops the node **and its whole subtree** — sound because a child's box is contained in its parent's. |
+| **Frustum culling** | *Done.* The same test. Y comes from the whole heightfield's range rather than per-node, which is conservative; tightening it wants a min/max height pyramid. |
+| **Horizon culling** | **Not done.** Wants the same per-node height pyramid, so it is one change with the point above rather than two. |
+| **Distance culling** | *Subsumed.* A node past the finest band simply gets a coarser level; there is no maximum range, because the terrain is the world. |
 
-Expected: this is what makes 8–16 km worlds viable at all.
+Measured share of terrain patches culled, camera at 400 m:
+
+| World | level | looking down | looking up |
+|---|---|---|---|
+| 2 km | **68%** | 27% | 34% |
+| 4 km | **69%** | 33% | 39% |
+| 8 km | **69%** | 38% | 43% |
+| 16 km | **69%** | 43% | 46% |
+
+Level is the common case and roughly two thirds of the quadtree goes. That is not a
+clever result — on a world centred on the camera, half of it is simply behind you.
+
+The water surface reuses the same selection, so it is culled by the same test.
+
+**The shadow passes get their own patch set.** Culling the terrain against the camera
+alone would drop a ridge behind the camera that casts *into* the view, so
+`Cdlod::select_culled` produces two sets: one culled against the camera, one against
+the union of the shadow cascades. Both are descended from the same eye, so a patch in
+both is identical in both — which matters, because a caster morphed from a different
+eye than the surface it shades puts a band of acne along every level boundary. This is
+Phase C's light frustum culling, arriving early because it was the correctness
+condition for doing Phase A at all.
 
 ## Phase B — with scatter (grass, rocks, trees)
 
@@ -65,19 +86,71 @@ from 1 to 10⁵–10⁶.
   buffer, and writes a draw count. One `draw_indexed_indirect` per prop type.
   The CPU never sees an instance. Per-species draw distance is exposed in the
   foliage tool, because it is the dial that decides how much there is to cull.
-- **Hi-Z occlusion culling.** *Done, for grass.* A depth mip pyramid built from
+- **Mesh LOD for scatter.** *Done.* Three levels per species, built at import by
+  the same vertex-cluster decimator, at roughly 6000 / 1500 / 400 triangles. The
+  cull pass bins each survivor by horizontal distance into one of three output
+  buffers and writes three sets of indirect draw arguments, so LOD selection
+  costs no extra pass over the instances -- it is the same single dispatch, with
+  three counters instead of one. Switch distances are per species and runtime.
+
+  Measured on a 12 m grid inside a 900 m draw distance, 17,665 instances drawn:
+
+  | switch distances | LOD 0 / 1 / 2 | triangles | vs one level |
+  |---|---|---|---|
+  | 60 / 200 m | 81 / 796 / 16788 | 8.4 M | **-92%** |
+  | 120 / 350 m (default) | 317 / 2376 / 14972 | 11.5 M | **-89%** |
+  | 300 / 600 m | 1961 / 5884 / 9820 | 24.5 M | -77% |
+
+  The instance *count* is identical in all three rows: banding changes detail,
+  never visibility. Most of the saving is geometric rather than clever -- instance
+  count grows with the square of the radius, so the far field is most of the
+  scatter and it is the cheapest level that draws it.
+
+  This was affordable only after the instance record shrank from 80 bytes to 32
+  (`mesh::Instance`): a 4x4 matrix replaced by a quaternion, an f16 scale and a
+  position, since every instance here is a rigid transform with uniform scale.
+  Three 32-byte output buffers plus a 32-byte source is *less* memory than the
+  one 80-byte source and one 80-byte output they replaced.
+
+  A dithered cross-fade between levels is not implemented. It would need an
+  instance inside a transition band emitted into **both** adjacent buffers, so
+  peak occupancy would exceed the instance count and the buffers would have to
+  grow by the width of the widest band; they are not sized for that.
+- **Hi-Z occlusion culling.** *Done, for scatter.* A depth mip pyramid built from
   last frame's depth, each level the minimum reversed-Z of the block below it --
-  the farthest surface drawn there. Each blade's bounding sphere tests against
+  the farthest surface drawn there. Each instance's bounding sphere tests against
   the level whose texels cover its screen footprint. In mountain terrain a ridge
-  hides an enormous amount, and this is the technique that finds it. Scatter's
-  props do not use it yet; the same pyramid is already there for them.
+  hides an enormous amount, and this is the technique that finds it.
+
+  It carries one lesson worth recording. Applied literally -- cull anything behind
+  the farthest surface in its footprint -- it culled about seventy per cent of near
+  grass and visibly thinned the field, because *a field of grass is not an
+  occluder*. The depth buffer records only the frontmost blade, and at the coarse
+  pyramid levels the test reads, the gaps between blades are gone: grass culls
+  grass. The test therefore compares in **metres** with two metres of slack, which
+  lets a landform occlude what is behind it while foliage no longer occludes
+  itself. A depth epsilon would have been meaningless across a reversed-Z range
+  spanning kilometres.
+
+  Read with `textureLoad` rather than a sampler: `R32Float` is not filterable, and
+  the test wants the exact texel covering a footprint rather than an interpolation.
+  Tested against the *previous* frame's view-projection, because that is the matrix
+  the depths correspond to -- using this frame's makes it flicker. Occlusion stays
+  off on the first frame, when there is no pyramid to correspond to anything.
+
+  This pyramid was being built every frame and read by nothing for some time: its
+  only consumer had been a dense-grass pass that was later removed. It is wired to
+  the scatter cull now.
 
 Both are compute + indirect draw, which wgpu supports on every backend.
 
 ## Phase C — with shadows
 
-- **Light frustum culling** — cull per cascade against the light's frustum, not
-  the camera's. An object outside the camera can still cast into it.
+- **Light frustum culling** — *done for the terrain*, against the union of the
+  cascades rather than per cascade: a caster only has to be in *some* cascade to
+  matter, and the union needs one visible set instead of three. **Not done for
+  scatter**, which still casts from the camera-culled set, so foliage entering from
+  an off-screen edge casts no shadow until it is on screen.
 - Cascade fitting is the bigger win here and is not culling: sizing each cascade
   to the visible depth range beats culling more objects out of a badly-fit one.
 

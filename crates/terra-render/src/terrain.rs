@@ -8,6 +8,7 @@
 use crate::camera::{Camera, CameraUniform};
 use crate::cdlod::{self, Cdlod, PATCH_QUADS};
 use crate::context::{DEPTH_FORMAT, RenderContext};
+use crate::frustum::{Frustum, FrustumUnion};
 use crate::lighting::Lighting;
 use crate::material::{MAX_LAYERS, Materials};
 use bytemuck::{Pod, Zeroable};
@@ -184,6 +185,14 @@ pub struct Terrain {
     patch_buf: wgpu::Buffer,
     /// Instances in `patch_buf`, i.e. how many patches the last selection chose.
     patch_count: u32,
+    /// The shadow passes' own patch set and bind group.
+    ///
+    /// Separate because the two passes are culled against different volumes: the colour
+    /// pass wants what the camera sees, the shadow passes want what the light sees. A
+    /// ridge behind the camera casts into the view and must survive the camera's cull.
+    shadow_patch_buf: wgpu::Buffer,
+    shadow_patch_count: u32,
+    shadow_terrain_bg: wgpu::BindGroup,
     /// Min and max of `heights`, for the altitude term in LOD selection.
     ///
     /// Cached rather than scanned: selection runs every frame and the heightfield is
@@ -462,6 +471,13 @@ impl Terrain {
             ],
         });
 
+        let shadow_patch_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cdlod-shadow-patches"),
+            size: cdlod.buffer_bytes(),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let camera_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("camera-bg"),
             layout: &camera_bgl,
@@ -469,6 +485,37 @@ impl Terrain {
                 binding: 0,
                 resource: camera_ub.as_entire_binding(),
             }],
+        });
+
+        // The shadow pass gets its own bind group, differing from the colour pass's only
+        // in which patch buffer sits at binding 9. Everything else -- heights, flow,
+        // splats -- is shared, so the caster is shaded from exactly the same data as the
+        // surface. Written out rather than built by a closure because a closure returning
+        // borrows of these locals cannot be given a lifetime the compiler accepts.
+        let shadow_terrain_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain-shadow-bg"),
+            layout: &terrain_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: terrain_ub.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: height_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: flow_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: deposit_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: road_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: rut_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&splat_views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&splat_views[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&splat_sampler),
+                },
+                wgpu::BindGroupEntry { binding: 9, resource: shadow_patch_buf.as_entire_binding() },
+            ],
         });
 
         let terrain_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -683,6 +730,9 @@ impl Terrain {
             cdlod,
             patch_buf,
             patch_count,
+            shadow_patch_buf,
+            shadow_patch_count: patch_count,
+            shadow_terrain_bg,
             height_range: (0.0, 0.0),
             index_buf,
             index_count,
@@ -778,11 +828,34 @@ impl Terrain {
     /// camera's matrix -- which looks like the terrain tearing along level
     /// boundaries as you move.
     pub fn upload_camera(&mut self, queue: &wgpu::Queue, cam: &Camera, aspect: f32) {
+        self.upload_camera_culled(queue, cam, aspect, &FrustumUnion::default());
+    }
+
+    /// The same, with the light volumes the shadow set should be culled against.
+    ///
+    /// An empty union means "cull nothing for shadows", which is the safe reading: a
+    /// caller that has not said where the light is gets every caster rather than none.
+    pub fn upload_camera_culled(
+        &mut self,
+        queue: &wgpu::Queue,
+        cam: &Camera,
+        aspect: f32,
+        lights: &FrustumUnion,
+    ) {
         queue.write_buffer(&self.camera_ub, 0, bytemuck::bytes_of(&cam.uniform(aspect)));
 
-        let patches = self.cdlod.select(cam.pos, self.height_range, self.extent_m);
+        // Frustum and quadtree culling. The camera set drops everything outside the view
+        // -- on a world centred on the camera that is most of the quadtree, since half of
+        // it is simply behind you.
+        let frustum = Frustum::new(&(cam.projection(aspect) * cam.look_at()));
+        self.cdlod.select_culled(cam.pos, self.height_range, self.extent_m, Some(&frustum), lights);
+        let patches = self.cdlod.patches();
         self.patch_count = patches.len() as u32;
         queue.write_buffer(&self.patch_buf, 0, bytemuck::cast_slice(patches));
+
+        let shadow = self.cdlod.shadow_patches();
+        self.shadow_patch_count = shadow.len() as u32;
+        queue.write_buffer(&self.shadow_patch_buf, 0, bytemuck::cast_slice(shadow));
 
         // The shader morphs from the same eye and the same slab gap the selection
         // above used, so the two cannot disagree about where a level ends.
@@ -1129,12 +1202,13 @@ impl Terrain {
     ) {
         pass.set_pipeline(&self.shadow_pipeline);
         pass.set_bind_group(0, &lighting.cascade_bind_group, &[Lighting::cascade_offset(cascade)]);
-        pass.set_bind_group(1, &self.terrain_bg, &[]);
-        // The same patches the colour pass draws, morphed from the same camera. A
-        // caster that disagreed with the shaded surface would put a band of acne
-        // along every level boundary.
+        pass.set_bind_group(1, &self.shadow_terrain_bg, &[]);
+        // The light's patch set, morphed from the same camera as the colour pass. The set
+        // differs -- it keeps casters the camera cannot see -- but the morph does not, and
+        // that is the half that matters: a caster morphed from a different eye than the
+        // surface it shades puts a band of acne along every level boundary.
         pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..self.index_count, 0, 0..self.patch_count);
+        pass.draw_indexed(0..self.index_count, 0, 0..self.shadow_patch_count);
     }
 
     /// Which view mode subsequent draws use.

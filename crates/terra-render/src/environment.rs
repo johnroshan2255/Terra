@@ -336,8 +336,43 @@ pub struct VolumetricClouds {
     /// Metres per repeat of the shape noise.
     pub feature_scale_m: f32,
     /// Wind, in metres per second, which advects the layer.
+    ///
+    /// Kept as a vector rather than as a speed and a heading because that is what the
+    /// shader wants and what is already on disk in every saved world. The panel edits
+    /// it through [`VolumetricClouds::wind_speed`] and
+    /// [`VolumetricClouds::wind_deg`], which is the pair a person actually thinks in.
     pub wind: Vec3,
     pub quality: CloudQuality,
+}
+
+impl VolumetricClouds {
+    /// Horizontal wind speed in m/s.
+    ///
+    /// Horizontal only. Vertical wind on a cloud layer is not what makes clouds move
+    /// across a sky, and exposing it would mostly offer a way to make the layer drift
+    /// out of its own altitude band.
+    pub fn wind_speed(&self) -> f32 {
+        glam::Vec2::new(self.wind.x, self.wind.z).length()
+    }
+
+    /// Wind heading in degrees, `atan2(z, x)` -- the same convention `Camera::yaw`,
+    /// `Vehicle::heading` and the water's wind all use.
+    pub fn wind_deg(&self) -> f32 {
+        self.wind.z.atan2(self.wind.x).to_degrees()
+    }
+
+    /// Set the horizontal wind from a speed and a heading, leaving the vertical
+    /// component alone.
+    ///
+    /// A speed of zero would lose the heading entirely -- `atan2(0, 0)` is not the angle
+    /// that was set -- so the direction is preserved by writing a vector along the
+    /// heading whatever the speed. That means dragging speed to zero and back does not
+    /// silently rotate the sky.
+    pub fn set_wind(&mut self, speed_ms: f32, heading_deg: f32) {
+        let r = heading_deg.to_radians();
+        self.wind.x = r.cos() * speed_ms;
+        self.wind.z = r.sin() * speed_ms;
+    }
 }
 
 impl Default for VolumetricClouds {
@@ -1612,5 +1647,82 @@ mod twilight_tests {
         let mut edited = e;
         edited.fog.density += 0.01;
         assert!(edited.differs_for_saving(&saved), "fog edited during a running cycle");
+    }
+}
+
+#[cfg(test)]
+mod cloud_drift_tests {
+    use super::*;
+
+    #[test]
+    fn cloud_wind_round_trips_through_speed_and_heading() {
+        // The panel edits a speed and a heading; the shader advects by a vector. If
+        // these disagree, dragging a slider moves the sky somewhere other than where the
+        // number says it should go.
+        let mut c = VolumetricClouds::default();
+        for (speed, deg) in [(0.0f32, 0.0f32), (6.0, 45.0), (12.5, -120.0), (60.0, 179.0)] {
+            c.set_wind(speed, deg);
+            assert!((c.wind_speed() - speed).abs() < 1e-3, "speed {speed} -> {}", c.wind_speed());
+            if speed > 0.0 {
+                let got = c.wind_deg();
+                let delta = (got - deg).abs() % 360.0;
+                assert!(delta < 0.1 || (360.0 - delta) < 0.1, "heading {deg} -> {got}");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_speed_keeps_the_heading_it_was_given() {
+        // `atan2(0, 0)` is not the angle that was set, so a naive round trip would
+        // rotate the sky when the speed was dragged to zero and back up.
+        let mut c = VolumetricClouds::default();
+        c.set_wind(10.0, 135.0);
+        c.set_wind(0.0, 135.0);
+        assert_eq!(c.wind_speed(), 0.0);
+        c.set_wind(10.0, 135.0);
+        let got = c.wind_deg();
+        assert!((got - 135.0).abs() < 0.1, "heading came back {got} after a stop");
+    }
+
+    #[test]
+    fn cloud_wind_uses_the_projects_heading_convention() {
+        // `atan2(z, x)`, matching `Camera::yaw`, `Vehicle::heading` and the water's wind.
+        // A different convention here would make one number mean two things.
+        let mut c = VolumetricClouds::default();
+        c.set_wind(1.0, 0.0);
+        assert!((c.wind.x - 1.0).abs() < 1e-5 && c.wind.z.abs() < 1e-5, "{:?}", c.wind);
+        c.set_wind(1.0, 90.0);
+        assert!(c.wind.x.abs() < 1e-5 && (c.wind.z - 1.0).abs() < 1e-5, "{:?}", c.wind);
+    }
+
+    #[test]
+    fn setting_the_wind_leaves_the_vertical_component_alone() {
+        // Only the horizontal is exposed. Vertical wind is not what moves clouds across a
+        // sky, and writing it from a heading slider would drift the layer out of its own
+        // altitude band.
+        let mut c = VolumetricClouds::default();
+        c.wind.y = 0.75;
+        c.set_wind(20.0, 30.0);
+        assert_eq!(c.wind.y, 0.75);
+    }
+
+    #[test]
+    fn the_default_drift_is_a_real_weather_speed() {
+        // A fair-weather cumulus layer moves at roughly 5-15 m/s. Zero would read as a
+        // painted backdrop; far more reads as a conveyor belt.
+        let s = VolumetricClouds::default().wind_speed();
+        assert!((3.0..=20.0).contains(&s), "the default drift is {s} m/s");
+    }
+
+    #[test]
+    fn the_drift_survives_a_save_and_load() {
+        // It is part of the authored sky, so it has to come back with the rest of it.
+        let mut e = Environment::daylight();
+        e.clouds.set_wind(18.0, -75.0);
+        let text = ron::ser::to_string_pretty(&e, ron::ser::PrettyConfig::new().struct_names(true))
+            .unwrap();
+        let got: Environment = ron::from_str(&text).unwrap();
+        assert!((got.clouds.wind_speed() - 18.0).abs() < 1e-3);
+        assert!((got.clouds.wind_deg() + 75.0).abs() < 0.1);
     }
 }

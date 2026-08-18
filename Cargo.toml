@@ -44,7 +44,11 @@ ron         = "0.12"
 directories = "6.0"
 memmap2     = "0.9"
 zstd        = "0.13"
-image       = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image       = { version = "0.25", default-features = false, features = ["png", "jpeg", "exr", "tiff"] }
+# Direct, in addition to being image's EXR backend. `image` can only decode EXRs
+# that carry RGB channels, and Poly Haven ships roughness and AO as *single
+# channel* -- which is a valid EXR that `image::open` refuses outright.
+exr         = "1.74"
 gltf        = { version = "1", default-features = false, features = ["import", "utils"] }
 rfd         = "0.17"
 uuid        = { version = "1.24", features = ["v4", "serde"] }
