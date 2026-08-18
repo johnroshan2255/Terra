@@ -161,8 +161,19 @@ fn build(
 
 impl Clouds {
     pub fn new(ctx: &RenderContext, env: &EnvironmentGpu) -> Self {
-        let device = &ctx.device;
+        let (w, h) = target_size(ctx);
+        Self::new_headless(&ctx.device, env, w, h)
+    }
 
+    /// The same, without a surface, so the terrain can be rendered in a test.
+    ///
+    /// See `Terrain::new_headless` for why that matters.
+    pub fn new_headless(
+        device: &wgpu::Device,
+        env: &EnvironmentGpu,
+        width: u32,
+        height: u32,
+    ) -> Self {
         let camera_ub = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("clouds-camera"),
             size: std::mem::size_of::<crate::camera::CameraUniform>() as u64,
@@ -448,7 +459,9 @@ impl Clouds {
             ],
         });
 
-        let size = target_size(ctx);
+        // The half-resolution target the march runs at, computed by the caller so this
+        // needs no surface.
+        let size = (width.max(1), height.max(1));
         let (views, history_bgs, sample_bgs) =
             build(device, &history_layout, &sample_layout, &reproject_ub, &sampler, size);
 

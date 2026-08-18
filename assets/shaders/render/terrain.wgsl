@@ -770,11 +770,36 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     surf.albedo *= mix(1.0, 0.45, soak);
     surf.rough = mix(surf.rough, 0.12, soak);
 
-    // Break up the tiling. Even a well-made texture repeats visibly across a
-    // kilometre of ground; a very low frequency wobble in brightness costs one
-    // noise evaluation and hides the grid without touching the detail.
+    // --- variation that survives minification ---
+    //
+    // The problem this solves, measured: at a normal editing altitude a pixel covers
+    // about 185 texels of a 3.5 m-repeat material. That is not a filtering bug -- it is
+    // correct minification, and *any* texture collapses to its average colour at that
+    // ratio. Rendered offscreen, the terrain came out a smooth green wash with a local
+    // contrast of 0.16 out of 255, which is what "it looks like a flat image" measures as.
+    //
+    // The fix cannot come from the albedo map, because the albedo map is physically
+    // unshowable there. It has to come from features large enough to survive: the 250 m
+    // wobble below was the only one, and at plus or minus 12 per cent it carried the whole
+    // appearance of the ground at distance.
+    //
+    // So there are now three octaves spanning the gap between the texture's repeat and the
+    // landform's scale. Three noise evaluations, against the twelve extra texture fetches
+    // a second tiling scale would cost -- and unlike a coarser repeat, this costs nothing
+    // up close, where the albedo is doing the work properly.
     let macro_v = noise2(in.world.xz * 0.004) * 0.5 + 0.5;
-    surf.albedo *= mix(0.88, 1.12, macro_v);
+    let meso_v = noise2(in.world.xz * 0.03 + vec2f(17.0, 5.0)) * 0.5 + 0.5;
+    let fine_v = noise2(in.world.xz * 0.11 + vec2f(-9.0, 23.0)) * 0.5 + 0.5;
+    // Brightness, not hue: tinting by noise reads as coloured blotches, where a value
+    // wobble reads as ground. Amplitudes fall with frequency, so the coarse term leads and
+    // the finer ones only break up its edges.
+    surf.albedo *= mix(0.86, 1.14, macro_v);
+    surf.albedo *= mix(0.90, 1.10, meso_v);
+    surf.albedo *= mix(0.95, 1.05, fine_v);
+    // And a matching roughness wobble, so the variation shows in the specular response
+    // rather than only in albedo -- flat roughness over varying albedo still reads as a
+    // painted surface.
+    surf.rough = clamp(surf.rough * mix(0.85, 1.15, meso_v), 0.03, 1.0);
 
     // Contact shadow under the grass.
     //

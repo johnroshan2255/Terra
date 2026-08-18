@@ -231,7 +231,34 @@ impl Terrain {
         lighting: &Lighting,
         clouds: &crate::clouds::Clouds,
     ) -> Self {
-        let device = &ctx.device;
+        Self::new_headless(
+            &ctx.device,
+            &ctx.queue,
+            ctx.supports_polygon_line(),
+            size,
+            materials,
+            lighting,
+            clouds,
+        )
+    }
+
+    /// The same, without a surface.
+    ///
+    /// A [`RenderContext`] cannot exist without a window, which made the terrain
+    /// impossible to render in a test -- and that is why a mis-tuned slope band survived
+    /// as long as it did: every check available was a check of the source rather than of
+    /// the pixels. This takes what the constructor actually needs, which is a device, a
+    /// queue and one capability flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_headless(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        supports_polygon_line: bool,
+        size: WorldSize,
+        materials: &Materials,
+        lighting: &Lighting,
+        clouds: &crate::clouds::Clouds,
+    ) -> Self {
         let res = size.tier0_res();
         let extent_m = size.extent_m() as f32;
 
@@ -348,7 +375,7 @@ impl Terrain {
         });
         // Seeded here so the first frame draws even if it renders before any camera
         // upload -- an empty instance range would be a blank viewport, not a stall.
-        ctx.queue.write_buffer(&patch_buf, 0, bytemuck::cast_slice(&patches));
+        queue.write_buffer(&patch_buf, 0, bytemuck::cast_slice(&patches));
         let patch_count = patches.len() as u32;
 
         let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -619,7 +646,7 @@ impl Terrain {
         // does not, a line-list buffer over the grid edges is drawn instead --
         // exact, and no optional feature. See `cdlod::grid_wire_indices` for why this
         // is not the usual barycentric trick.
-        let line_mode = ctx.supports_polygon_line();
+        let line_mode = supports_polygon_line;
         let wire_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("terrain-wireframe"),
             layout: Some(&layout),
